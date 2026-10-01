@@ -1,7 +1,9 @@
 import { AssetDocument } from '../domain/model';
 
-const STORAGE_KEY = '3d-asset-forge.current-project';
-const AUTOSAVE_KEY = '3d-asset-forge.autosave-project';
+const STORAGE_KEY = 'twinaxis.current-project';
+const AUTOSAVE_KEY = 'twinaxis.autosave-project';
+const LEGACY_STORAGE_KEY = '3d-asset-forge.current-project';
+const LEGACY_AUTOSAVE_KEY = '3d-asset-forge.autosave-project';
 
 const documentForBrowserStorage = (document: AssetDocument): AssetDocument => ({
   ...document,
@@ -27,7 +29,7 @@ export const saveProjectToBrowser = (document: AssetDocument) => {
 };
 
 export const loadProjectFromBrowser = (): AssetDocument | null => {
-  const stored = localStorage.getItem(STORAGE_KEY);
+  const stored = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(LEGACY_STORAGE_KEY);
   if (!stored) return null;
 
   const parsed = JSON.parse(stored) as AssetDocument;
@@ -60,7 +62,7 @@ export const saveProjectAutosave = (assetDocument: AssetDocument) => {
 };
 
 export const loadProjectAutosave = (): AssetDocument | null => {
-  const stored = localStorage.getItem(AUTOSAVE_KEY);
+  const stored = localStorage.getItem(AUTOSAVE_KEY) ?? localStorage.getItem(LEGACY_AUTOSAVE_KEY);
   if (!stored) return null;
 
   const parsed = JSON.parse(stored) as AssetDocument;
@@ -76,7 +78,7 @@ export const downloadProjectFile = (assetDocument: AssetDocument) => {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = `${assetDocument.metadata.name.replace(/\s+/g, '-').toLowerCase()}.forge.json`;
+  link.download = `${assetDocument.metadata.name.replace(/\s+/g, '-').toLowerCase()}.twin.json`;
   link.click();
   URL.revokeObjectURL(url);
 };

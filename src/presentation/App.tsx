@@ -74,7 +74,7 @@ import {
 } from '../domain/model';
 import type { KinematicGraph, KinematicMotionClip } from '../domain/kinematics';
 import type { KinematicJoint, MechanicalPart } from '../domain/kinematics';
-import type { FunctionalComponent, FunctionalComponentMotionDefinition } from '../domain/mechanics';
+import type { AssemblyConnection, FunctionalComponent, FunctionalComponentMotionDefinition, MechanicalInterfaceKind } from '../domain/mechanics';
 import {
   acceptJointCandidate,
   createHomeKinematicState,
@@ -112,7 +112,17 @@ import {
   type VirtualPlcInputs,
   type VirtualPlcRuntime,
 } from '../application/twin/virtualPlcRuntime';
-import type { TwinProject } from '../domain/twin';
+import type { ConnectionHealth, ConnectionProfile, ProtocolKind, TwinProject } from '../domain/twin';
+import { createTwinProjectFromAssetDocument } from '../application/twin/twinFoundation';
+import { ProtocolAdapterRegistry } from '../application/twin/protocolAdapter';
+import { TwinAxisConnectionManager } from '../application/twin/connectionManager';
+import { MqttAdapter } from '../infrastructure/protocols/mqtt/MqttAdapter';
+import { OpcUaGatewayAdapter } from '../infrastructure/protocols/opcua/OpcUaGatewayAdapter';
+import { createTwinPackage, parseTwinPackage, serializeTwinPackage } from '../application/twin/twinPackage';
+import { deterministicReplayHash, replayRecords, type HistorianRecord } from '../application/twin/historianReplay';
+import { IndexedDbTwinHistorian } from '../infrastructure/twinHistorianRepository';
+import { acknowledgeAlarm, evaluateAlarmRules, shelveAlarm, type AlarmInstance, type AlarmPriority, type AlarmRule } from '../application/twin/alarmEngine';
+import { runSimulationScenario, validateSimulationScenario, type SimulationScenario } from '../application/twin/simulationScenario';
 import {
   isDesktopRuntime,
   openProjectNative,
@@ -154,7 +164,7 @@ import {
   ViewportStats,
 } from './components/ThreeViewport';
 import { AdvancedRigWorkspace } from './components/AdvancedRigWorkspace';
-import { buildFunctionalAssembly, buildFunctionalComponent } from '../application/mechanics/functionalModel';
+import { buildFunctionalAssembly, buildFunctionalComponent, validateFunctionalAssembly } from '../application/mechanics/functionalModel';
 import { solveRobotArmCursorTarget } from '../application/kinematics/robotCursorGuidance';
 
 const makeStarterProject = () => {
@@ -172,6 +182,15 @@ const loadInitialProject = () => {
     return loadProjectFromBrowser() ?? makeStarterProject();
   } catch {
     return makeStarterProject();
+  }
+};
+
+const loadProjectRuntimeCollection = <T,>(projectId: string, name: string): T[] => {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(`twinaxis.${name}.${projectId}`) ?? '[]');
+    return Array.isArray(parsed) ? parsed as T[] : [];
+  } catch {
+    return [];
   }
 };
 
@@ -666,6 +685,16 @@ type WorkspaceContextMenu = ViewportContextMenuEvent & {
   mode?: 'joint' | 'part' | 'object';
 };
 
+type JointRangeEditor = {
+  nodeId: string;
+  jointId: string;
+  lower: string;
+  upper: string;
+  error?: string;
+};
+
+type InspectorFocus = 'object' | 'mechanics' | 'parts' | 'twin' | 'export';
+
 type ViewportJointTestMode = 'movement' | 'full-range';
 type ViewportInspectionPhase = 'idle' | 'testing' | 'awaiting-confirmation' | 'repairing' | 'complete' | 'stopped';
 type ViewportRepairMode = 'root' | 'axis' | 'pivot' | 'type' | 'limits' | 'parent-child' | 'coupling';
@@ -767,8 +796,14 @@ type PlcDashboardState = {
     forwardedAt?: string;
   };
   openPlc: {
+    endpointProfile: 'openplc' | 's7-1200-robot-holding';
+    autoReconnect: boolean;
+    connectionAuthorized: boolean;
+    controlledNodeId?: string;
     enabled: boolean;
     online: boolean;
+    runtimeRunning?: boolean;
+    runtimeIssue?: string;
     host: string;
     port: number;
     unitId: number;
@@ -805,9 +840,50 @@ type InternalRegisterDefinition = {
   role: 'system' | 'joint' | 'custom';
   robotNodeId?: string;
   jointId?: string;
+  connectionId?: string;
+  protocol?: 'modbus' | 'mqtt' | 'opcua';
+  topic?: string;
+  valuePath?: string;
+  qos?: 0 | 1 | 2;
+  opcUaNodeId?: string;
+  opcUaBrowsePath?: string;
+  scale?: number;
+  offset?: number;
+  unit?: string;
+  pollingMs?: number;
 };
 
-const REGISTER_CONFIGURATION_KEY = 'assetForge.internalRegisterConfiguration.v1';
+const REGISTER_CONFIGURATION_KEY = 'twinaxis.signalMapping.v1';
+const LEGACY_REGISTER_CONFIGURATION_KEY = 'assetForge.internalRegisterConfiguration.v1';
+const CONNECTION_PROFILES_KEY = 'twinaxis.connectionProfiles.v1';
+const PLC_ENDPOINT_KEY = 'twinaxis.plcEndpoint.v1';
+
+type PersistedPlcEndpoint = Pick<PlcDashboardState['openPlc'], 'endpointProfile' | 'host' | 'port' | 'unitId' | 'address' | 'quantity' | 'dataFormat' | 'pollMs' | 'autoReconnect' | 'connectionAuthorized' | 'controlledNodeId'>;
+
+const loadPlcEndpoint = (): Partial<PersistedPlcEndpoint> => {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(PLC_ENDPOINT_KEY) ?? '{}') as Partial<PersistedPlcEndpoint>;
+    if (!parsed || typeof parsed !== 'object') return {};
+    if (parsed.endpointProfile !== 'openplc' && parsed.endpointProfile !== 's7-1200-robot-holding') return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+};
+
+const defaultConnectionProfiles = (): ConnectionProfile[] => [
+  { id: 'openplc-main', name: 'OpenPLC Runtime', protocol: 'modbus', endpoint: '127.0.0.1:502', enabled: true, autoReconnect: true, reconnectDelayMs: 1500, metadata: { managedBy: 'openplc-dashboard', unitId: 1 } },
+  { id: 'mqtt-main', name: 'MQTT Broker', protocol: 'mqtt', endpoint: 'ws://127.0.0.1:9001', enabled: false, autoReconnect: true, reconnectDelayMs: 1500, metadata: { clientIdPrefix: 'twinaxis' } },
+  { id: 'opcua-main', name: 'OPC UA Gateway', protocol: 'opcua', endpoint: 'http://127.0.0.1:8088', enabled: false, autoReconnect: true, reconnectDelayMs: 2000, metadata: { endpointUrl: 'opc.tcp://127.0.0.1:4840', securityPolicy: 'None' } },
+];
+
+const loadConnectionProfiles = (): ConnectionProfile[] => {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(CONNECTION_PROFILES_KEY) ?? '[]') as ConnectionProfile[];
+    if (Array.isArray(parsed) && parsed.length) return parsed;
+  } catch { /* Invalid user configuration falls back to documented profiles. */ }
+  return defaultConnectionProfiles();
+};
 const systemRegisterDefinitions = (): InternalRegisterDefinition[] => [
   { id: 'system-command', wire: 90, semantic: 'Robot command', encoding: 'uint16', access: 'platform-to-plc', enabled: true, role: 'system' },
   { id: 'system-status', wire: 91, semantic: 'PLC status', encoding: 'uint16', access: 'plc-to-platform', enabled: true, role: 'system' },
@@ -828,7 +904,8 @@ const systemRegisterDefinitions = (): InternalRegisterDefinition[] => [
 
 const loadRegisterConfiguration = (): InternalRegisterDefinition[] => {
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(REGISTER_CONFIGURATION_KEY) ?? '[]') as InternalRegisterDefinition[];
+    const stored = window.localStorage.getItem(REGISTER_CONFIGURATION_KEY) ?? window.localStorage.getItem(LEGACY_REGISTER_CONFIGURATION_KEY);
+    const parsed = JSON.parse(stored ?? '[]') as InternalRegisterDefinition[];
     if (Array.isArray(parsed) && parsed.length) return parsed.filter((item) => Number.isInteger(item.wire) && item.wire >= 0 && item.wire <= 65534);
   } catch { /* Invalid user configuration falls back to the documented map. */ }
   return systemRegisterDefinitions();
@@ -836,6 +913,9 @@ const loadRegisterConfiguration = (): InternalRegisterDefinition[] => {
 
 const registerWordCount = (encoding: RegisterEncoding) => encoding === 'float32-be' ? 2 : 1;
 const registerHr = (wire: number) => 40001 + wire;
+const mappingScale = (entry: InternalRegisterDefinition) => entry.scale ?? (entry.encoding === 'int16-rad-x10000' ? 0.0001 : 1);
+const mappingOffset = (entry: InternalRegisterDefinition) => entry.offset ?? 0;
+const mappingPollingMs = (entry: InternalRegisterDefinition) => entry.pollingMs ?? 250;
 
 const defaultModbusBridgeUrl = () => {
   try {
@@ -883,9 +963,34 @@ export const App = () => {
   const [selectedParts, setSelectedParts] = useState<ImportedPartSelection[]>([]);
   const [warehouseMenu, setWarehouseMenu] = useState<{ itemId: string; x: number; y: number } | undefined>();
   const [workspaceMenu, setWorkspaceMenu] = useState<WorkspaceContextMenu | undefined>();
+  const [jointRangeEditor, setJointRangeEditor] = useState<JointRangeEditor | undefined>();
+  const [inspectorFocus, setInspectorFocus] = useState<InspectorFocus>('object');
   const [activeView, setActiveView] = useState<'workspace' | 'warehouse'>('workspace');
+  const [warehouseQuery, setWarehouseQuery] = useState('');
+  const [warehouseTypeFilter, setWarehouseTypeFilter] = useState<'all' | 'part' | 'assembly'>('all');
   const [pendingWorkspaceNodeIds, setPendingWorkspaceNodeIds] = useState<string[]>([]);
   const [snapEnabled, setSnapEnabled] = useState(false);
+  const [visualStateOverlayEnabled, setVisualStateOverlayEnabled] = useState(true);
+  const [historianRecording, setHistorianRecording] = useState(false);
+  const [historianRecords, setHistorianRecords] = useState<HistorianRecord[]>([]);
+  const [replayFrameIndex, setReplayFrameIndex] = useState(-1);
+  const [historianBusy, setHistorianBusy] = useState(false);
+  const [alarmRules, setAlarmRules] = useState<AlarmRule[]>(() => loadProjectRuntimeCollection<AlarmRule>(document.metadata.id, 'alarmRules'));
+  const [alarmInstances, setAlarmInstances] = useState<AlarmInstance[]>([]);
+  const [alarmEvents, setAlarmEvents] = useState<TwinProject['events']>([]);
+  const [simulationScenarios, setSimulationScenarios] = useState<SimulationScenario[]>(() => loadProjectRuntimeCollection<SimulationScenario>(document.metadata.id, 'scenarios'));
+  const [activeScenarioId, setActiveScenarioId] = useState<string>();
+  const [scenarioElapsedMs, setScenarioElapsedMs] = useState(0);
+  const [scenarioRunning, setScenarioRunning] = useState(false);
+  const scenarioStartedAtRef = useRef<string>();
+
+  useEffect(() => {
+    window.localStorage.setItem(`twinaxis.alarmRules.${document.metadata.id}`, JSON.stringify(alarmRules));
+  }, [alarmRules, document.metadata.id]);
+
+  useEffect(() => {
+    window.localStorage.setItem(`twinaxis.scenarios.${document.metadata.id}`, JSON.stringify(simulationScenarios));
+  }, [simulationScenarios, document.metadata.id]);
   const [issues, setIssues] = useState<ValidationIssue[]>(() => validateProject(document));
   const [status, setStatus] = useState('Ready');
   const [modbusControllerLaunching, setModbusControllerLaunching] = useState(false);
@@ -893,6 +998,10 @@ export const App = () => {
   const [traceAuditDrawerOpen, setTraceAuditDrawerOpen] = useState(false);
   const [internalSettingsOpen, setInternalSettingsOpen] = useState(false);
   const [registerConfiguration, setRegisterConfiguration] = useState<InternalRegisterDefinition[]>(loadRegisterConfiguration);
+  const [connectionProfiles, setConnectionProfiles] = useState<ConnectionProfile[]>(loadConnectionProfiles);
+  const [connectionHealth, setConnectionHealth] = useState<Record<string, ConnectionHealth>>({});
+  const protocolRegistryRef = useRef(new ProtocolAdapterRegistry());
+  const connectionManagerRef = useRef(new TwinAxisConnectionManager(protocolRegistryRef.current));
   const [modbusControllerDrawerWidth, setModbusControllerDrawerWidth] = useState(860);
   const [traceAuditDrawerWidth, setTraceAuditDrawerWidth] = useState(1040);
   const drawerResizeRef = useRef<{ kind: 'iot' | 'audit'; pointerId: number; startX: number; startWidth: number }>();
@@ -905,6 +1014,10 @@ export const App = () => {
   const [desktopRuntime] = useState(isDesktopRuntime);
   const [nativeProjectPath, setNativeProjectPath] = useState<string | undefined>();
   const [demoMotionNodeId, setDemoMotionNodeId] = useState<string | undefined>();
+  const [externalPlcRuntimePose, setExternalPlcRuntimePose] = useState<{
+    nodeId: string;
+    jointValues: Record<string, number>;
+  }>();
   const [industrialCellDemoActive, setIndustrialCellDemoActive] = useState(false);
   const [motionTrainer, setMotionTrainer] = useState<MotionTrainerState | undefined>();
   const [pieceAnalysis, setPieceAnalysis] = useState<PieceAnalysisState | undefined>();
@@ -927,6 +1040,9 @@ export const App = () => {
     localManualActive: false,
     plc: createVirtualPlcRuntime(),
     openPlc: {
+      endpointProfile: 'openplc',
+      autoReconnect: false,
+      connectionAuthorized: false,
       enabled: false,
       online: false,
       host: '127.0.0.1',
@@ -953,23 +1069,51 @@ export const App = () => {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const glbInputRef = useRef<HTMLInputElement | null>(null);
   const warehouseInputRef = useRef<HTMLInputElement | null>(null);
+  const twinPackageInputRef = useRef<HTMLInputElement | null>(null);
   const viewportTestTimerRef = useRef<number | undefined>();
   const viewportNoticeTimerRef = useRef<number | undefined>();
   const kinematicEditSnapshotRef = useRef<{ nodeId: string; jointId: string; joint: KinematicJoint } | undefined>();
   const plcDashboardRef = useRef<PlcDashboardState>(plcDashboard);
+  const openPlcExecutionProbeRef = useRef<{ command?: number; elapsedMs?: number; lastProgressAt: number }>({ lastProgressAt: Date.now() });
+  const pollOpenPlcRef = useRef<() => Promise<void>>(async () => undefined);
+  const openPlcPollInFlightRef = useRef(false);
+  const iotPlcForwardInFlightRef = useRef(false);
+  const physicalPlcIoQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const openPlcFailureCountRef = useRef(0);
+  const physicalPlcDemoTimerRef = useRef<number | undefined>();
+  const physicalPlcDemoWriteInFlightRef = useRef(false);
+  const physicalPlcDemoRunIdRef = useRef(0);
+  const physicalPlcJogOriginRef = useRef<number[]>();
+  const [physicalPlcDemoActive, setPhysicalPlcDemoActive] = useState(false);
+  const historianRef = useRef(new IndexedDbTwinHistorian());
+  const historianRecordKeysRef = useRef(new Set<string>());
   const plcBridgeDisconnectLockRef = useRef(false);
+  const plcBridgeReconnectArmedRef = useRef(false);
 
   const selectedNode = useMemo(
     () => document.nodes.find((node) => node.id === document.selectedNodeId),
     [document.nodes, document.selectedNodeId],
   );
+  useEffect(() => {
+    if (!selectedNode) return;
+    setInspectorFocus(graphFromGeometry(selectedNode.geometry) ? 'mechanics' : 'object');
+  }, [selectedNode?.id]);
   const selectedWarehouseItem = useMemo(
     () => document.partWarehouse?.find((item) => item.id === document.selectedWarehouseItemId),
     [document.partWarehouse, document.selectedWarehouseItemId],
   );
+  const enqueuePhysicalPlcIo = useCallback(<T,>(operation: () => Promise<T>): Promise<T> => {
+    const result = physicalPlcIoQueueRef.current.then(operation, operation);
+    physicalPlcIoQueueRef.current = result.then(() => undefined, () => undefined);
+    return result;
+  }, []);
   const warehouseGroups = useMemo(() => {
     const groups = new Map<string, Map<string, PartWarehouseItem[]>>();
-    (document.partWarehouse ?? []).forEach((item) => {
+    const query = warehouseQuery.trim().toLowerCase();
+    (document.partWarehouse ?? []).filter((item) => {
+      if (warehouseTypeFilter !== 'all' && item.itemType !== warehouseTypeFilter) return false;
+      return !query || `${item.code} ${item.name} ${item.category} ${item.className} ${item.sourceAssetName}`.toLowerCase().includes(query);
+    }).forEach((item) => {
       const classes = groups.get(item.category) ?? new Map<string, PartWarehouseItem[]>();
       const items = classes.get(item.className) ?? [];
       items.push(item);
@@ -980,7 +1124,7 @@ export const App = () => {
       category,
       classes: [...classes.entries()].map(([className, items]) => ({ className, items })),
     }));
-  }, [document.partWarehouse]);
+  }, [document.partWarehouse, warehouseQuery, warehouseTypeFilter]);
   const selectedPartsForSelectedNode = useMemo(
     () => (selectedNode ? selectedParts.filter((part) => part.nodeId === selectedNode.id) : []),
     [selectedNode, selectedParts],
@@ -1031,6 +1175,7 @@ export const App = () => {
     return {
       ...kinematicEditTarget,
       origin: joint.origin.position,
+      orientation: joint.jointFrame?.orientation ?? joint.origin.rotation,
       axis: joint.axis,
       parentObjectNames: objectNamesForParts([joint.parentPartId]),
       childObjectNames: objectNamesForParts([joint.childPartId]),
@@ -1819,6 +1964,61 @@ export const App = () => {
   const selectWarehouseItem = (itemId: string) => {
     setDocument((current) => ({ ...current, selectedWarehouseItemId: itemId }));
     setStatus('Warehouse part selected');
+  };
+
+  const replaceWarehouseItem = (itemId: string, updater: (item: PartWarehouseItem) => PartWarehouseItem, message: string) => {
+    const next = touch({
+      ...document,
+      partWarehouse: (document.partWarehouse ?? []).map((item) => item.id === itemId ? updater(item) : item),
+    });
+    setPast((items) => [...items, document]);
+    setFuture([]);
+    setDocument(next);
+    setIssues(validateProject(next));
+    setStatus(message);
+  };
+
+  const updateSelectedFunctionalComponent = (patch: Partial<FunctionalComponent>) => {
+    if (!selectedWarehouseItem || selectedWarehouseItem.itemType !== 'part' || !selectedWarehouseItem.functionalComponent) return;
+    replaceWarehouseItem(selectedWarehouseItem.id, (item) => item.itemType !== 'part' || !item.functionalComponent ? item : {
+      ...item,
+      name: typeof patch.name === 'string' ? patch.name : item.name,
+      category: typeof patch.category === 'string' ? patch.category : item.category,
+      className: typeof patch.className === 'string' ? patch.className : item.className,
+      functionalComponent: { ...item.functionalComponent, ...patch, metadata: { ...item.functionalComponent.metadata, updatedAt: new Date().toISOString() } },
+      metadata: { ...item.metadata, updatedAt: new Date().toISOString() },
+    }, 'Functional component updated');
+  };
+
+  const updateSelectedMechanicalInterface = (interfaceId: string, patch: Partial<FunctionalComponent['interfaces'][number]>) => {
+    if (!selectedWarehouseItem || selectedWarehouseItem.itemType !== 'part' || !selectedWarehouseItem.functionalComponent) return;
+    updateSelectedFunctionalComponent({
+      interfaces: selectedWarehouseItem.functionalComponent.interfaces.map((item) => item.id === interfaceId ? { ...item, ...patch } : item),
+    });
+  };
+
+  const updateSelectedAssemblyConnection = (connectionId: string, updater: (connection: AssemblyConnection) => AssemblyConnection) => {
+    if (!selectedWarehouseItem || selectedWarehouseItem.itemType !== 'assembly' || !selectedWarehouseItem.functionalAssembly) return;
+    replaceWarehouseItem(selectedWarehouseItem.id, (item) => {
+      if (item.itemType !== 'assembly' || !item.functionalAssembly) return item;
+      const connections = item.functionalAssembly.connections.map((connection) => connection.id === connectionId ? updater(connection) : connection);
+      const kinematicGraph = { ...item.functionalAssembly.kinematicGraph, joints: connections.filter((connection) => connection.status !== 'rejected').map((connection) => connection.joint) };
+      const draft = { ...item.functionalAssembly, connections, kinematicGraph };
+      const validation = validateFunctionalAssembly(draft);
+      return {
+        ...item,
+        functionalAssembly: {
+          ...draft,
+          metadata: {
+            ...draft.metadata,
+            updatedAt: new Date().toISOString(),
+            validationStatus: validation.some((issue) => issue.severity === 'error') ? 'invalid' : validation.some((issue) => issue.severity === 'warning') ? 'warning' : 'valid',
+            validationMessages: validation.map((issue) => `${issue.code}: ${issue.message}`),
+          },
+        },
+        metadata: { ...item.metadata, updatedAt: new Date().toISOString() },
+      };
+    }, 'Assembly connection updated');
   };
 
   const loadPermanentWarehouseIntoProject = async () => {
@@ -2794,6 +2994,57 @@ export const App = () => {
     event.target.value = '';
   };
 
+  const exportTwinPackage = async () => {
+    try {
+      const project = selectedNode && graphFromGeometry(selectedNode.geometry)
+        ? createPlcTwinProjectForNode(selectedNode, { timestampUtc: new Date().toISOString() })
+        : createTwinProjectFromAssetDocument(document, { mode: 'simulation', timestampUtc: new Date().toISOString(), includeSimulatedBindings: true });
+      const pkg = createTwinPackage({ project, sourceDocument: document, includeRuntime: true, historian: historianRecords, alarmRules, alarmInstances, scenarios: simulationScenarios, connectionProfiles, signalMappings: registerConfiguration });
+      const filename = `${document.metadata.name.replace(/\s+/g, '-').toLowerCase()}.twin`;
+      if (desktopRuntime) {
+        const path = await saveJsonNative(pkg, filename);
+        setStatus(path ? `Twin Package saved: ${path}` : 'Twin Package export cancelled');
+      } else {
+        downloadBlob(new Blob([serializeTwinPackage(pkg)], { type: 'application/vnd.twinaxis.twin+json' }), filename);
+        setStatus(`Twin Package exported: ${filename}`);
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Twin Package export failed');
+    }
+  };
+
+  const importTwinPackage = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const pkg = parseTwinPackage(String(reader.result));
+        if (!pkg.sourceDocument) throw new Error('Twin Package has no source document to restore in the workspace.');
+        setPast((items) => [...items, document]);
+        setFuture([]);
+        setDocument(pkg.sourceDocument);
+        setHistorianRecords(pkg.runtime?.historian ?? []);
+        setAlarmRules(pkg.runtime?.alarmRules ?? []);
+        setAlarmInstances(pkg.runtime?.alarmInstances ?? []);
+        setSimulationScenarios(pkg.runtime?.scenarios ?? []);
+        setConnectionProfiles(pkg.configuration?.connectionProfiles.length ? pkg.configuration.connectionProfiles : defaultConnectionProfiles());
+        setRegisterConfiguration(pkg.configuration?.signalMappings.length ? pkg.configuration.signalMappings as InternalRegisterDefinition[] : systemRegisterDefinitions());
+        setActiveScenarioId(undefined);
+        setScenarioRunning(false);
+        setReplayFrameIndex(-1);
+        historianRecordKeysRef.current = new Set((pkg.runtime?.historian ?? []).map((record) => `${record.kind}|${record.sourceTimestampUtc}|${record.sequence}`));
+        setIssues(validateProject(pkg.sourceDocument));
+        saveProjectToBrowser(pkg.sourceDocument);
+        setStatus(`Twin Package loaded: ${pkg.manifest.name} v${pkg.manifest.version}`);
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : 'Twin Package import failed');
+      }
+    };
+    reader.readAsText(file);
+    event.target.value = '';
+  };
+
   const importModelFile = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -3187,11 +3438,57 @@ export const App = () => {
     plcDashboardRef.current = plcDashboard;
   }, [plcDashboard]);
 
-  const selectedKinematicNode = selectedNode && graphFromGeometry(selectedNode.geometry) ? selectedNode : undefined;
+  useEffect(() => {
+    const saved = loadPlcEndpoint();
+    if (!saved.endpointProfile) return;
+    setPlcDashboard((current) => ({
+      ...current,
+      openPlc: {
+        ...current.openPlc,
+        ...saved,
+        enabled: Boolean(saved.autoReconnect && saved.connectionAuthorized && saved.controlledNodeId),
+        online: false,
+        diagnostics: saved.autoReconnect && saved.connectionAuthorized && saved.controlledNodeId
+          ? `Automatic reconnect armed for ${saved.host}:${saved.port}. Waiting for PLC network...`
+          : saved.autoReconnect && saved.connectionAuthorized
+            ? 'Automatic reconnect paused: select the robot and connect once to bind PLC authority safely.'
+            : current.openPlc.diagnostics,
+      },
+    }));
+  }, []);
+
+  useEffect(() => {
+    const config = plcDashboard.openPlc;
+    const persisted: PersistedPlcEndpoint = {
+      endpointProfile: config.endpointProfile,
+      host: config.host,
+      port: config.port,
+      unitId: config.unitId,
+      address: config.address,
+      quantity: config.quantity,
+      dataFormat: config.dataFormat,
+      pollMs: config.pollMs,
+      autoReconnect: config.autoReconnect,
+      connectionAuthorized: config.connectionAuthorized,
+      controlledNodeId: config.controlledNodeId,
+    };
+    window.localStorage.setItem(PLC_ENDPOINT_KEY, JSON.stringify(persisted));
+  }, [plcDashboard.openPlc.endpointProfile, plcDashboard.openPlc.host, plcDashboard.openPlc.port, plcDashboard.openPlc.unitId, plcDashboard.openPlc.address, plcDashboard.openPlc.quantity, plcDashboard.openPlc.dataFormat, plcDashboard.openPlc.pollMs, plcDashboard.openPlc.autoReconnect, plcDashboard.openPlc.connectionAuthorized, plcDashboard.openPlc.controlledNodeId]);
+
+  const selectedKinematicNode = selectedNode && graphFromGeometry(selectedNode.geometry)
+    ? selectedNode
+    : document.nodes.find((node) => node.visible && Boolean(graphFromGeometry(node.geometry)));
+  const plcControlledKinematicNode = plcDashboard.openPlc.enabled
+    ? document.nodes.find((node) => node.id === plcDashboard.openPlc.controlledNodeId && Boolean(graphFromGeometry(node.geometry)))
+    : undefined;
 
   useEffect(() => {
     window.localStorage.setItem(REGISTER_CONFIGURATION_KEY, JSON.stringify(registerConfiguration));
   }, [registerConfiguration]);
+
+  useEffect(() => {
+    window.localStorage.setItem(CONNECTION_PROFILES_KEY, JSON.stringify(connectionProfiles));
+  }, [connectionProfiles]);
 
   useEffect(() => {
     if (!selectedKinematicNode) return;
@@ -3218,26 +3515,50 @@ export const App = () => {
   const configurePlcProject = useCallback((node: SceneNode, project: TwinProject) => {
     const signalById = new Map(project.signals.map((signal) => [signal.id, signal]));
     const configured = registerConfiguration.filter((entry) => entry.enabled && entry.role === 'joint' && entry.robotNodeId === node.id && entry.jointId);
+    const bindings = project.bindings.map((binding) => {
+      if (binding.protocol !== 'modbus' || binding.mapping.kind !== 'modbus') return binding;
+      const signal = signalById.get(binding.signalId);
+      const jointId = String(signal?.metadata.jointId ?? binding.metadata.jointId ?? '');
+      const entry = configured.find((item) => item.jointId === jointId);
+      if (!entry) return binding;
+      return {
+        ...binding,
+        connectionId: entry.connectionId ?? binding.connectionId,
+        mapping: {
+          ...binding.mapping,
+          address: entry.wire,
+          displayAddress: String(registerHr(entry.wire)),
+          quantity: registerWordCount(entry.encoding),
+          dataType: entry.encoding === 'float32-be' ? 'f32' as const : entry.encoding === 'uint16' ? 'u16' as const : 'i16' as const,
+          byteOrder: 'be' as const,
+          wordOrder: 'high-low' as const,
+        },
+        metadata: { ...binding.metadata, registerConfigurationId: entry.id, encoding: entry.encoding, pollingMs: mappingPollingMs(entry) },
+      };
+    });
+    const bindingById = new Map(bindings.map((binding) => [binding.id, binding]));
     return {
       ...project,
-      bindings: project.bindings.map((binding) => {
-        if (binding.protocol !== 'modbus' || binding.mapping.kind !== 'modbus') return binding;
-        const signal = signalById.get(binding.signalId);
-        const jointId = String(signal?.metadata.jointId ?? binding.metadata.jointId ?? '');
-        const entry = configured.find((item) => item.jointId === jointId);
-        if (!entry) return binding;
+      bindings,
+      signalBindings: project.signalBindings.map((binding) => {
+        const legacy = bindingById.get(binding.id);
+        if (!legacy) return binding;
+        const entry = configured.find((item) => item.jointId === legacy.metadata.jointId);
+        if (!entry) return { ...binding, connectionId: legacy.connectionId, source: legacy.mapping, pollingMs: Number(legacy.metadata.pollingMs ?? binding.pollingMs ?? 250) };
+        const protocol = entry.protocol ?? 'modbus';
+        const source = protocol === 'mqtt'
+          ? { kind: 'mqtt' as const, topic: entry.topic ?? `twinaxis/${node.id}/${entry.jointId}`, payload: 'json' as const, valuePath: entry.valuePath || 'value', qos: entry.qos ?? 0 }
+          : protocol === 'opcua'
+            ? { kind: 'opcua' as const, nodeId: entry.opcUaNodeId ?? `ns=2;s=${node.name}.${entry.jointId}`, browsePath: entry.opcUaBrowsePath || undefined }
+            : legacy.mapping;
         return {
           ...binding,
-          mapping: {
-            ...binding.mapping,
-            address: entry.wire,
-            displayAddress: String(registerHr(entry.wire)),
-            quantity: registerWordCount(entry.encoding),
-            dataType: entry.encoding === 'float32-be' ? 'f32' as const : entry.encoding === 'uint16' ? 'u16' as const : 'i16' as const,
-            byteOrder: 'be' as const,
-            wordOrder: 'high-low' as const,
-          },
-          metadata: { ...binding.metadata, registerConfigurationId: entry.id, encoding: entry.encoding },
+          protocol,
+          connectionId: entry.connectionId ?? (protocol === 'mqtt' ? 'mqtt-main' : protocol === 'opcua' ? 'opcua-main' : legacy.connectionId),
+          source,
+          transform: { scale: mappingScale(entry), offset: mappingOffset(entry), unitOut: entry.unit },
+          pollingMs: mappingPollingMs(entry),
+          metadata: { ...binding.metadata, registerConfigurationId: entry.id },
         };
       }),
     };
@@ -3248,7 +3569,7 @@ export const App = () => {
 
   useEffect(() => {
     if (!selectedKinematicNode) return;
-    setPlcDashboard((current) => current.frameNodeId === selectedKinematicNode.id ? current : ({
+    setPlcDashboard((current) => current.openPlc.enabled || current.frameNodeId === selectedKinematicNode.id ? current : ({
       ...current,
       localManualActive: false,
       frameNodeId: selectedKinematicNode.id,
@@ -3260,7 +3581,7 @@ export const App = () => {
   }, [selectedKinematicNode?.id]);
 
   const runPlcDashboardFrame = useCallback(
-    (node: SceneNode, elapsedSeconds: number, sequence: number, project?: TwinProject, registerOverrides?: Record<string, number>) => {
+    (node: SceneNode, elapsedSeconds: number, sequence: number, project?: TwinProject, registerOverrides?: Record<string, number>, persistPose = true) => {
       const frame = runPlcModbusSimulationFrame(node, {
         project: project ? configurePlcProject(node, project) : createConfiguredPlcProject(node),
         elapsedSeconds,
@@ -3268,7 +3589,7 @@ export const App = () => {
         nowMs: Date.now(),
         registerOverrides,
       });
-      setKinematicJointValuesForNode(node.id, frame.jointValues);
+      if (persistPose) setKinematicJointValuesForNode(node.id, frame.jointValues);
       setPlcDashboard((current) => ({
         ...current,
         project: frame.project,
@@ -3281,6 +3602,12 @@ export const App = () => {
     },
     [configurePlcProject, createConfiguredPlcProject, setKinematicJointValuesForNode],
   );
+
+  useEffect(() => {
+    if (!plcDashboard.openPlc.enabled && !plcDashboard.externalBridgeEnabled) {
+      setExternalPlcRuntimePose(undefined);
+    }
+  }, [plcDashboard.openPlc.enabled, plcDashboard.externalBridgeEnabled]);
 
   const startPlcDashboard = () => {
     if (!selectedKinematicNode) {
@@ -3420,12 +3747,48 @@ export const App = () => {
     setPlcDashboard((current) => ({ ...current, plc: setVirtualPlcScanTarget(current.plc, targetMs) }));
   };
 
-  const updateOpenPlcConfig = (field: 'host' | 'port' | 'unitId' | 'address' | 'pollMs' | 'dataFormat', value: string | number) => {
+  const physicalPlcWire: Record<string, number> = {
+    'system-command': 0, 'system-status': 1, 'system-step': 2, 'system-time': 3,
+    'system-alarm': 4, 'system-condition': 5, 'system-speed': 6,
+    'iot-temperature': 13, 'iot-humidity': 14, 'iot-gyro': 15, 'iot-age': 16,
+    'iot-valid': 17, 'iot-sequence': 18, 'iot-quality': 19, 'iot-policy': 20,
+  };
+  const documentedOpenPlcWire: Record<string, number> = {
+    'system-command': 90, 'system-status': 91, 'system-step': 92, 'system-time': 93,
+    'system-alarm': 94, 'system-condition': 95, 'system-speed': 96,
+    'iot-temperature': 120, 'iot-humidity': 121, 'iot-gyro': 122, 'iot-age': 123,
+    'iot-valid': 124, 'iot-sequence': 125, 'iot-quality': 126, 'iot-policy': 127,
+  };
+
+  const configuredPlcWire = (config: PlcDashboardState['openPlc'], id: string, fallback: number) =>
+    config.endpointProfile === 's7-1200-robot-holding'
+      ? physicalPlcWire[id] ?? fallback
+      : documentedOpenPlcWire[id] ?? fallback;
+
+  const updateOpenPlcConfig = (field: 'endpointProfile' | 'host' | 'port' | 'unitId' | 'address' | 'pollMs' | 'dataFormat' | 'autoReconnect', value: string | number | boolean) => {
     setPlcDashboard((current) => ({
       ...current,
       openPlc: {
         ...current.openPlc,
-        [field]: field === 'host' || field === 'dataFormat' ? String(value) : Number(value),
+        [field]: field === 'autoReconnect' ? Boolean(value) : field === 'host' || field === 'dataFormat' || field === 'endpointProfile' ? String(value) : Number(value),
+        ...(field === 'endpointProfile' ? {
+          address: value === 's7-1200-robot-holding' ? 7 : 100,
+          host: value === 's7-1200-robot-holding'
+            ? (current.openPlc.host === '127.0.0.1' ? '192.168.0.20' : current.openPlc.host)
+            : (current.openPlc.host === '192.168.0.20' ? '127.0.0.1' : current.openPlc.host),
+          quantity: 6,
+          dataFormat: 'int16-rad-x10000' as const,
+          connectionAuthorized: false,
+          autoReconnect: false,
+          online: false,
+          runtimeRunning: undefined,
+          runtimeIssue: undefined,
+          rawRegisters: undefined,
+          received: 0,
+          diagnostics: value === 's7-1200-robot-holding'
+            ? 'S7-1200 RobotHolding selected: HR0..20, joints HR7..12.'
+            : 'OpenPLC %QW profile selected: control %QW90..96, joints %QW100..105.',
+        } : {}),
         quantity: field === 'dataFormat' ? (value === 'int16-rad-x10000' ? 6 : 12) : current.openPlc.quantity,
         error: undefined,
       },
@@ -3435,39 +3798,250 @@ export const App = () => {
   const toggleOpenPlc = () => {
     setPlcDashboard((current) => {
       const enabled = !current.openPlc.enabled;
+      let connectionAuthorized = current.openPlc.connectionAuthorized;
+      if (enabled && current.openPlc.endpointProfile === 's7-1200-robot-holding' && !connectionAuthorized) {
+        const confirmed = window.confirm(`Connect to physical PLC ${current.openPlc.host}:${current.openPlc.port} Unit ${current.openPlc.unitId}? Commands, IoT telemetry and policies can write real holding registers HR0 and HR13..20.`);
+        if (!confirmed) return current;
+        connectionAuthorized = true;
+      }
       if (enabled) plcBridgeDisconnectLockRef.current = true;
+      const endpointName = current.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'physical S7-1200 PLC' : 'OpenPLC';
       return {
         ...current,
         running: false,
         localManualActive: false,
         externalBridgeEnabled: enabled ? false : current.externalBridgeEnabled,
-        openPlc: { ...current.openPlc, enabled, online: false, error: undefined },
-        message: enabled ? `Connecting to OpenPLC ${current.openPlc.host}:${current.openPlc.port}...` : 'OpenPLC disconnected. Internal PLC authority is available.',
+        openPlc: { ...current.openPlc, enabled, online: false, autoReconnect: enabled, connectionAuthorized, controlledNodeId: enabled ? selectedKinematicNode?.id : current.openPlc.controlledNodeId, runtimeRunning: undefined, runtimeIssue: undefined, rawRegisters: enabled ? undefined : current.openPlc.rawRegisters, received: enabled ? 0 : current.openPlc.received, error: undefined },
+        message: enabled ? `Connecting to ${endpointName} ${current.openPlc.host}:${current.openPlc.port}...` : `${endpointName} disconnected. Internal PLC authority is available.`,
       };
     });
   };
 
   const probeOpenPlc = async () => {
     const config = plcDashboardRef.current.openPlc;
-    setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: true, error: undefined, diagnostics: 'Scanning ports, Unit IDs and %QW registers...' } }));
-    const query = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId) });
+    const physical = config.endpointProfile === 's7-1200-robot-holding';
+    setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: true, error: undefined, diagnostics: physical ? 'Reading S7-1200 RobotHolding HR0..20...' : 'Scanning ports, Unit IDs and %QW registers...' } }));
+    const query = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), profile: config.endpointProfile });
     try {
       const response = await fetch(`/__openplc/probe?${query.toString()}`, { cache: 'no-store' });
       const payload = await response.json() as { ok?: boolean; port?: number; unitId?: number; address?: number; quantity?: number; dataFormat?: 'int16-rad-x10000'; registers?: number[]; attempts?: Array<{ port: number; unitId: number; result: string }>; error?: string };
       if (!response.ok || !payload.ok) throw new Error(`${payload.error ?? 'OpenPLC probe failed'} (${payload.attempts?.map((item) => `${item.port}/U${item.unitId}: ${item.result}`).join(' | ') ?? 'no response'})`);
+      const connectPhysical = physical && window.confirm(`S7-1200 RobotHolding detected at ${config.host}:${payload.port ?? config.port}, Unit ${payload.unitId ?? config.unitId}. Connect now and keep automatic reconnect armed? TwinAxis may write HR0 and HR13..20.`);
       setPlcDashboard((current) => ({
         ...current,
-        openPlc: { ...current.openPlc, probing: false, port: payload.port ?? current.openPlc.port, unitId: payload.unitId ?? current.openPlc.unitId, address: payload.address ?? 100, quantity: payload.quantity ?? 6, dataFormat: payload.dataFormat ?? 'int16-rad-x10000', command: payload.registers?.[0] === 1 || payload.registers?.[0] === 2 ? payload.registers[0] : 0, rawRegisters: payload.registers, diagnostics: `Detected %QW90..105. J1-J6 start at wire ${payload.address ?? 100}.` },
-        message: 'OpenPLC cobot register map detected. Press Connect OpenPLC.',
+        externalBridgeEnabled: connectPhysical ? false : current.externalBridgeEnabled,
+        localManualActive: connectPhysical ? false : current.localManualActive,
+        openPlc: { ...current.openPlc, probing: false, enabled: connectPhysical || current.openPlc.enabled, online: false, autoReconnect: connectPhysical || current.openPlc.autoReconnect, connectionAuthorized: connectPhysical || current.openPlc.connectionAuthorized, controlledNodeId: connectPhysical ? selectedKinematicNode?.id : current.openPlc.controlledNodeId, port: payload.port ?? current.openPlc.port, unitId: payload.unitId ?? current.openPlc.unitId, address: payload.address ?? (physical ? 7 : 100), quantity: payload.quantity ?? 6, dataFormat: payload.dataFormat ?? 'int16-rad-x10000', command: payload.registers?.[0] === 1 || payload.registers?.[0] === 2 ? payload.registers[0] : 0, rawRegisters: payload.registers, diagnostics: physical ? (connectPhysical ? 'S7-1200 detected. Continuous FC03 polling and automatic reconnect are active.' : 'Detected S7-1200 RobotHolding HR0..20. Connection was not authorized.') : `Detected %QW90..105. J1-J6 start at wire ${payload.address ?? 100}.` },
+        message: physical ? (connectPhysical ? 'Physical S7-1200 connected. HR7..12 now drive both robot views.' : 'Physical PLC detected, but continuous connection was not authorized.') : 'OpenPLC cobot register map detected. Press Connect OpenPLC.',
       }));
     } catch (error) {
-      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: false, error: error instanceof Error ? error.message : 'OpenPLC probe failed', diagnostics: 'No valid cobot register signature was received.' } }));
+      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: false, error: error instanceof Error ? error.message : 'PLC probe failed', diagnostics: physical ? 'No valid S7-1200 RobotHolding signature was received at HR0..20.' : 'No valid cobot register signature was received.' } }));
+    }
+  };
+
+  const testPhysicalPlcConnection = async () => {
+    const config = plcDashboardRef.current.openPlc;
+    setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: true, online: false, error: undefined, diagnostics: `Testing FC03 ${config.host}:${config.port} Unit ${config.unitId}, HR0..HR20...` } }));
+    try {
+      const query = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), address: '0', quantity: '21', profile: 's7-1200-robot-holding' });
+      const response = await fetch(`/__openplc/read?${query.toString()}`, { cache: 'no-store' });
+      const payload = await response.json() as { ok?: boolean; registers?: number[]; transactionId?: number; functionCode?: number; receivedAt?: string; error?: string };
+      if (!response.ok || !payload.ok || payload.registers?.length !== 21) throw new Error(payload.error ?? `Expected 21 holding registers, received ${payload.registers?.length ?? 0}`);
+      setPlcDashboard((current) => ({
+        ...current,
+        openPlc: {
+          ...current.openPlc,
+          probing: false,
+          online: true,
+          rawRegisters: payload.registers,
+          received: current.openPlc.received + 1,
+          error: undefined,
+          diagnostics: `CONNECTED · FC${payload.functionCode ?? 3} · TID ${payload.transactionId ?? '--'} · HR0..HR20 read at ${payload.receivedAt ?? new Date().toISOString()}`,
+        },
+        message: `Physical PLC connected at ${config.host}:${config.port}, Unit ${config.unitId}.`,
+      }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Physical PLC connection test failed';
+      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: false, online: false, error: detail, diagnostics: `DISCONNECTED · ${detail}` }, message: detail }));
+    }
+  };
+
+  const testPhysicalPlcHomeReaction = async () => {
+    const config = plcDashboardRef.current.openPlc;
+    if (!window.confirm(`TEST REAL PLC ${config.host}:${config.port}\n\nThis writes HOME to HR0 and can move a connected robot. Confirm the real cell is safe, guarded and ready. Continue?`)) return;
+    const write = async (address: number, values: number[]) => {
+      const response = await fetch('/__openplc/write', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ host: config.host, port: config.port, unitId: config.unitId, address, values }) });
+      const payload = await response.json() as { ok?: boolean; error?: string };
+      if (!response.ok || !payload.ok) throw new Error(payload.error ?? `Write HR${address} failed`);
+    };
+    try {
+      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: true, error: undefined, diagnostics: 'REACTION TEST · writing HR0=2 (HOME)...' } }));
+      await write(0, [2]);
+      await new Promise((resolve) => window.setTimeout(resolve, 350));
+      const query = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), address: '0', quantity: '21', profile: 's7-1200-robot-holding' });
+      const response = await fetch(`/__openplc/read?${query.toString()}`, { cache: 'no-store' });
+      const payload = await response.json() as { ok?: boolean; registers?: number[]; transactionId?: number; error?: string };
+      if (!response.ok || !payload.ok || payload.registers?.length !== 21) throw new Error(payload.error ?? 'PLC reaction read failed');
+      const [command, status, step] = payload.registers;
+      if (command !== 2 || status !== 2 || step !== 0) throw new Error(`HOME not acknowledged: HR0=${command}, HR1=${status}, HR2=${step}`);
+      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: false, online: true, rawRegisters: payload.registers, received: current.openPlc.received + 1, error: undefined, diagnostics: `REACTION PASS · HR0=2 → HR1=2, HR2=0 · TID ${payload.transactionId ?? '--'} · returning to HOLD` }, message: 'Physical PLC HOME reaction verified. Command returned to HOLD.' }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Physical PLC reaction test failed';
+      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: false, online: false, error: detail, diagnostics: `REACTION FAIL · ${detail}` }, message: detail }));
+    } finally {
+      try { await write(0, [0]); } catch { /* The visible failure state already requires operator review. */ }
+    }
+  };
+
+  const testPhysicalPlcJog = async (direction: 'forward' | 'return') => {
+    const config = plcDashboardRef.current.openPlc;
+    if (!window.confirm(direction === 'forward'
+      ? `STEP REAL PLC ${config.host}:${config.port}\n\nThis writes a small manual increment to HR7..HR12. Confirm the real cell is safe. Continue?`
+      : `RETURN REAL PLC ${config.host}:${config.port}\n\nThis restores the exact HR7..HR12 vector captured before the first step. Continue?`)) return;
+    const request = async (path: string, options?: RequestInit) => {
+      const response = await fetch(path, options);
+      const payload = await response.json() as { ok?: boolean; registers?: number[]; error?: string };
+      if (!response.ok || !payload.ok) throw new Error(payload.error ?? 'Physical PLC jog request failed');
+      return payload;
+    };
+    const write = (address: number, values: number[]) => request('/__openplc/write', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ host: config.host, port: config.port, unitId: config.unitId, address, values }) });
+    try {
+      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: true, error: undefined, diagnostics: direction === 'forward' ? 'STEP · reading HR7..HR12...' : 'RETURN · restoring captured HR7..HR12...' } }));
+      const query = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), address: '0', quantity: '21', profile: 's7-1200-robot-holding' });
+      const before = await request(`/__openplc/read?${query.toString()}`, { cache: 'no-store' });
+      const currentWords = before.registers!.slice(7, 13);
+      if (direction === 'forward' && !physicalPlcJogOriginRef.current) physicalPlcJogOriginRef.current = [...currentWords];
+      const signed = (word: number) => (word & 0x8000 ? word - 0x10000 : word);
+      const word = (value: number) => Math.max(-32768, Math.min(32767, Math.round(value))) & 0xffff;
+      const increments = [175, -120, 140, -100, 90, 120];
+      const target = direction === 'return'
+        ? physicalPlcJogOriginRef.current
+        : currentWords.map((value, index) => word(signed(value) + increments[index]));
+      if (!target) throw new Error('No initial PLC joint vector has been captured. Run Step Forward first.');
+      await write(0, [0]);
+      await write(7, target);
+      await new Promise((resolve) => window.setTimeout(resolve, 180));
+      const after = await request(`/__openplc/read?${query.toString()}`, { cache: 'no-store' });
+      const actual = after.registers!.slice(7, 13);
+      if (actual.some((value, index) => value !== target[index])) throw new Error(`PLC did not retain the requested joint vector. Expected [${target.join(', ')}], read [${actual.join(', ')}].`);
+      if (direction === 'return') physicalPlcJogOriginRef.current = undefined;
+      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: false, online: true, rawRegisters: after.registers, received: current.openPlc.received + 1, diagnostics: `${direction === 'forward' ? 'STEP PASS' : 'RETURN PASS'} · HR7..HR12 [${actual.join(', ')}] · HR0=0 manual hold`, error: undefined }, message: direction === 'forward' ? 'Small PLC joint step verified. Use Return to Start to restore the captured vector.' : 'PLC joints returned to the captured start vector.' }));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Physical PLC jog failed';
+      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: false, error: detail, diagnostics: `JOG FAIL · ${detail}` }, message: detail }));
+    }
+  };
+
+  const togglePhysicalPlcStartDemo = async () => {
+    if (physicalPlcDemoTimerRef.current !== undefined) {
+      window.clearTimeout(physicalPlcDemoTimerRef.current);
+      physicalPlcDemoTimerRef.current = undefined;
+      physicalPlcDemoRunIdRef.current += 1;
+      physicalPlcDemoWriteInFlightRef.current = false;
+      setPhysicalPlcDemoActive(false);
+      setPlcDashboard((current) => ({ ...current, message: 'Physical PLC Start Demo stopped. HR0 remains in manual hold.' }));
+      return;
+    }
+
+    const config = plcDashboardRef.current.openPlc;
+    const node = document.nodes.find((candidate) => candidate.id === config.controlledNodeId) ?? selectedKinematicNode;
+    const graph = node ? graphFromGeometry(node.geometry) : undefined;
+    const clip = graph?.motionClips?.find((candidate) => /pick|place|ciclo/i.test(candidate.name)) ?? graph?.motionClips?.[0];
+    const joints = graph?.joints.filter((joint) => joint.type !== 'fixed').slice(0, 6) ?? [];
+    if (config.endpointProfile !== 's7-1200-robot-holding' || !config.enabled || !config.online) {
+      setPlcDashboard((current) => ({ ...current, message: 'Connect the Physical S7-1200 profile before running Start Demo.' }));
+      return;
+    }
+    if (!node || !graph || !clip || joints.length === 0) {
+      setPlcDashboard((current) => ({ ...current, message: 'The controlled robot has no kinematic Start Demo clip.' }));
+      return;
+    }
+    if (!window.confirm(`RUN START DEMO ON REAL PLC ${config.host}:${config.port}\n\nTwinAxis will blend from the current PLC pose and stream the robot clip to HR7..HR12 at up to 20 Hz. Confirm the physical cell is clear, guarded and ready.`)) return;
+
+    const write = async (address: number, values: number[]) => enqueuePhysicalPlcIo(async () => {
+      const response = await fetch('/__openplc/write', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host: config.host, port: config.port, unitId: config.unitId, address, values }),
+      });
+      const payload = await response.json() as { ok?: boolean; error?: string };
+      if (!response.ok || !payload.ok) throw new Error(payload.error ?? `Write HR${address} failed`);
+    });
+    const encode = (value: number) => Math.max(-32768, Math.min(32767, Math.round(value * 10000))) & 0xffff;
+    const homeValues = createHomeKinematicState(graph).homeJointValues;
+    const initialValues = Object.fromEntries(joints.map((joint, index) => [
+      joint.id,
+      config.rawRegisters?.[index] !== undefined ? decodeOpenPlcInt16(config.rawRegisters[index]) / 10000 : homeValues[joint.id] ?? 0,
+    ]));
+    const runId = physicalPlcDemoRunIdRef.current + 1;
+    physicalPlcDemoRunIdRef.current = runId;
+    const frameStepSeconds = 0.05;
+    const leadInSeconds = 1.2;
+    let trajectoryElapsed = 0;
+
+    try {
+      await write(0, [0]);
+      setPhysicalPlcDemoActive(true);
+      setPlcDashboard((current) => ({
+        ...current,
+        openPlc: { ...current.openPlc, command: 0, diagnostics: `START DEMO · ${clip.name} · ${joints.length} joints · HR7..HR${6 + joints.length}` },
+        message: `Physical PLC is reproducing the same ${clip.name} clip used by Start Demo.`,
+      }));
+      const sendFrame = async () => {
+        if (runId !== physicalPlcDemoRunIdRef.current || physicalPlcDemoWriteInFlightRef.current) return;
+        physicalPlcDemoWriteInFlightRef.current = true;
+        try {
+          const clipElapsed = Math.max(0, trajectoryElapsed - leadInSeconds);
+          const sampled = sampleKinematicMotionClip(clip, clipElapsed);
+          const leadInTarget = sampleKinematicMotionClip(clip, 0);
+          const leadInProgress = Math.min(1, trajectoryElapsed / leadInSeconds);
+          const smoothLeadIn = leadInProgress * leadInProgress * (3 - 2 * leadInProgress);
+          const jointValues = Object.fromEntries(joints.map((joint) => {
+            const clipValue = sampled[joint.id] ?? homeValues[joint.id] ?? 0;
+            const requested = trajectoryElapsed < leadInSeconds
+              ? (initialValues[joint.id] ?? 0) + ((leadInTarget[joint.id] ?? homeValues[joint.id] ?? 0) - (initialValues[joint.id] ?? 0)) * smoothLeadIn
+              : clipValue;
+            const bounded = joint.limits
+              ? Math.max(joint.limits.lower ?? -Infinity, Math.min(joint.limits.upper ?? Infinity, requested))
+              : requested;
+            return [joint.id, bounded];
+          }));
+          const words = joints.map((joint) => {
+            return encode(jointValues[joint.id] ?? 0);
+          });
+          await write(7, words);
+          if (runId !== physicalPlcDemoRunIdRef.current) return;
+          setExternalPlcRuntimePose({ nodeId: node.id, jointValues });
+          trajectoryElapsed += frameStepSeconds;
+          if (!clip.loop && clipElapsed >= clip.duration) {
+            if (physicalPlcDemoTimerRef.current !== undefined) window.clearTimeout(physicalPlcDemoTimerRef.current);
+            physicalPlcDemoTimerRef.current = undefined;
+            setPhysicalPlcDemoActive(false);
+            setPlcDashboard((current) => ({ ...current, message: `Physical PLC completed ${clip.name}. Final pose is held in HR7..HR12.` }));
+          } else {
+            physicalPlcDemoTimerRef.current = window.setTimeout(() => void sendFrame(), 50);
+          }
+        } catch (error) {
+          if (physicalPlcDemoTimerRef.current !== undefined) window.clearTimeout(physicalPlcDemoTimerRef.current);
+          physicalPlcDemoTimerRef.current = undefined;
+          setPhysicalPlcDemoActive(false);
+          const detail = error instanceof Error ? error.message : 'Physical PLC Start Demo write failed';
+          setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, diagnostics: `START DEMO FAILED · ${detail}` }, message: detail }));
+        } finally {
+          physicalPlcDemoWriteInFlightRef.current = false;
+        }
+      };
+      await sendFrame();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Physical PLC Start Demo could not start';
+      setPhysicalPlcDemoActive(false);
+      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, diagnostics: `START DEMO FAILED · ${detail}` }, message: detail }));
     }
   };
 
   const writeOpenPlcCommand = async (command: 0 | 1 | 2) => {
     const config = plcDashboardRef.current.openPlc;
-    const commandWire = registerConfiguration.find((entry) => entry.id === 'system-command' && entry.enabled)?.wire ?? 90;
+    const commandWire = configuredPlcWire(config, 'system-command', 90);
     if (!config.enabled) {
       setPlcDashboard((current) => ({ ...current, message: 'Connect OpenPLC before selecting a robot operating mode.' }));
       return;
@@ -3542,7 +4116,8 @@ export const App = () => {
 
   const writeOpenPlcSensorPolicy = async (sensorPolicy: 0 | 1) => {
     const config = plcDashboardRef.current.openPlc;
-    const policyWire = registerConfiguration.find((entry) => entry.id === 'iot-policy' && entry.enabled)?.wire ?? 127;
+    const policyWire = configuredPlcWire(config, 'iot-policy', 127);
+    const commandWire = configuredPlcWire(config, 'system-command', 90);
     if (!config.enabled) {
       setPlcDashboard((current) => ({ ...current, message: 'Connect OpenPLC before changing the IoT policy.' }));
       return;
@@ -3555,11 +4130,24 @@ export const App = () => {
       });
       const payload = await response.json() as { ok?: boolean; error?: string };
       if (!response.ok || !payload.ok) throw new Error(payload.error ?? 'IoT policy write failed');
+      {
+        const commandResponse = await fetch('/__openplc/write', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ host: config.host, port: config.port, unitId: config.unitId, address: commandWire, values: [1] }),
+        });
+        const commandPayload = await commandResponse.json() as { ok?: boolean; error?: string };
+        if (!commandResponse.ok || !commandPayload.ok) throw new Error(commandPayload.error ?? 'AUTO command write failed');
+      }
       setPlcDashboard((current) => ({
         ...current,
-        openPlc: { ...current.openPlc, sensorPolicy },
-        message: sensorPolicy === 1 ? 'PLC motion-permit policy enabled: inactivity requests HOLD.' : 'PLC condition-monitoring policy enabled.',
+        localManualActive: sensorPolicy === 1 ? false : current.localManualActive,
+        openPlc: { ...current.openPlc, sensorPolicy, command: 1 },
+        message: sensorPolicy === 1
+          ? `Motion permit active: ${config.endpointProfile === 's7-1200-robot-holding' ? 'HR20' : '%QW127'}=1 and AUTO ${config.endpointProfile === 's7-1200-robot-holding' ? `HR${commandWire}` : `%QW${commandWire}`}=1. Move the IoT sensor to release HOLD.`
+          : `Condition monitor active: ${config.endpointProfile === 's7-1200-robot-holding' ? 'HR20' : '%QW127'}=0 and AUTO=1. The robot cycle is independent of IoT motion unless telemetry reaches warning/trip limits.`,
       }));
+      setStatus(sensorPolicy === 1 ? 'IoT motion permit armed in AUTO' : 'IoT condition monitor enabled');
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'IoT policy write failed';
       setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, error: detail }, message: detail }));
@@ -3568,11 +4156,60 @@ export const App = () => {
 
   const pollOpenPlc = useCallback(async () => {
     const current = plcDashboardRef.current;
-    if (!current.openPlc.enabled || !selectedKinematicNode) return;
+    if (!current.openPlc.enabled || openPlcPollInFlightRef.current) return;
+    const plcNode = document.nodes.find((node) => node.id === current.openPlc.controlledNodeId && Boolean(graphFromGeometry(node.geometry)));
+    if (!plcNode) return;
+    openPlcPollInFlightRef.current = true;
     const config = current.openPlc;
+    const physicalEndpoint = config.endpointProfile === 's7-1200-robot-holding';
     const configuredJointCapacity = config.dataFormat === 'float32-be' ? Math.max(1, Math.floor(config.quantity / 2)) : Math.max(1, config.quantity);
-    const jointDefinitions = registerConfiguration
-      .filter((entry) => entry.enabled && entry.role === 'joint' && entry.robotNodeId === selectedKinematicNode.id && entry.jointId)
+    const selectedJointIds = new Set(graphFromGeometry(plcNode.geometry)?.joints.map((joint) => joint.id) ?? []);
+    const enabledJointDefinitions = registerConfiguration.filter((entry) => entry.enabled && entry.role === 'joint' && entry.jointId);
+    const registerWindowEnd = config.address + config.quantity;
+    const fitsOpenPlcWindow = (entry: InternalRegisterDefinition) =>
+      entry.wire >= config.address && entry.wire + registerWordCount(entry.encoding) <= registerWindowEnd;
+    const movableJoints = graphFromGeometry(plcNode.geometry)?.joints.filter((joint) => joint.type !== 'fixed') ?? [];
+    const requiredJointCount = Math.min(configuredJointCapacity, movableJoints.length);
+    const allNodeJointDefinitions = enabledJointDefinitions
+      .filter((entry) => entry.robotNodeId === plcNode.id)
+      .sort((a, b) => a.wire - b.wire);
+    const allPersistentJointDefinitions = enabledJointDefinitions
+      .filter((entry) => entry.jointId && selectedJointIds.has(entry.jointId))
+      .sort((a, b) => a.wire - b.wire);
+    const rebasePhysicalDefinitions = (definitions: InternalRegisterDefinition[]) => definitions
+      .slice(0, configuredJointCapacity)
+      .map((entry, index) => ({
+        ...entry,
+        wire: config.address + index,
+        encoding: 'int16-rad-x10000' as RegisterEncoding,
+      }));
+    const nodeJointDefinitions = config.endpointProfile === 's7-1200-robot-holding'
+      ? rebasePhysicalDefinitions(allNodeJointDefinitions)
+      : allNodeJointDefinitions.filter(fitsOpenPlcWindow);
+    const persistentJointDefinitions = config.endpointProfile === 's7-1200-robot-holding'
+      ? rebasePhysicalDefinitions(allPersistentJointDefinitions)
+      : allPersistentJointDefinitions.filter(fitsOpenPlcWindow);
+    // Several robots can reuse one physical PLC profile. Ignore stale per-robot
+    // addresses outside the active OpenPLC block instead of reading static HRs.
+    const storedJointDefinitions = nodeJointDefinitions.length >= requiredJointCount
+      ? nodeJointDefinitions
+      : persistentJointDefinitions.length >= requiredJointCount
+        ? persistentJointDefinitions
+        : [];
+    const generatedJointDefinitions: InternalRegisterDefinition[] = storedJointDefinitions.length
+      ? []
+      : movableJoints.map((joint, index) => ({
+          id: `runtime-${plcNode.id}-${joint.id}`,
+          wire: config.address + index * (config.dataFormat === 'float32-be' ? 2 : 1),
+          semantic: `${plcNode.name} / ${joint.name}`,
+          encoding: config.dataFormat,
+          access: 'plc-to-platform',
+          enabled: true,
+          role: 'joint',
+          robotNodeId: plcNode.id,
+          jointId: joint.id,
+        }));
+    const jointDefinitions = [...storedJointDefinitions, ...generatedJointDefinitions]
       .sort((a, b) => a.wire - b.wire)
       .slice(0, configuredJointCapacity);
     const jointStart = jointDefinitions.length ? Math.min(...jointDefinitions.map((entry) => entry.wire)) : config.address;
@@ -3581,31 +4218,50 @@ export const App = () => {
       host: config.host,
       port: String(config.port),
       unitId: String(config.unitId),
-      address: String(jointStart),
-      quantity: String(Math.max(1, jointEnd - jointStart)),
+      address: String(physicalEndpoint ? 0 : jointStart),
+      quantity: String(physicalEndpoint ? 21 : Math.max(1, jointEnd - jointStart)),
+      profile: config.endpointProfile,
     });
     try {
-      const statusDefinitions = registerConfiguration.filter((entry) => entry.enabled && ['system-command', 'system-status', 'system-step', 'system-time', 'system-alarm', 'system-condition', 'system-speed'].includes(entry.id));
+      const statusIds = ['system-command', 'system-status', 'system-step', 'system-time', 'system-alarm', 'system-condition', 'system-speed'];
+      const statusWireMap = config.endpointProfile === 's7-1200-robot-holding' ? physicalPlcWire : documentedOpenPlcWire;
+      const statusDefinitions = statusIds.map((id) => ({ id, wire: statusWireMap[id], encoding: 'uint16' as RegisterEncoding }));
       const statusStart = statusDefinitions.length ? Math.min(...statusDefinitions.map((entry) => entry.wire)) : 90;
       const statusEnd = statusDefinitions.length ? Math.max(...statusDefinitions.map((entry) => entry.wire + registerWordCount(entry.encoding))) : 97;
-      const policyWire = registerConfiguration.find((entry) => entry.id === 'iot-policy' && entry.enabled)?.wire ?? 127;
-      const statusQuery = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), address: String(statusStart), quantity: String(statusEnd - statusStart) });
-      const policyQuery = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), address: String(policyWire), quantity: '1' });
-      const [response, statusResponse, policyResponse] = await Promise.all([
-        fetch(`/__openplc/read?${query.toString()}`, { cache: 'no-store' }),
-        fetch(`/__openplc/read?${statusQuery.toString()}`, { cache: 'no-store' }),
-        fetch(`/__openplc/read?${policyQuery.toString()}`, { cache: 'no-store' }),
-      ]);
-      const payload = await response.json() as { ok?: boolean; registers?: number[]; receivedAt?: string; error?: string };
-      const statusPayload = await statusResponse.json() as { ok?: boolean; registers?: number[] };
-      const policyPayload = await policyResponse.json() as { ok?: boolean; registers?: number[] };
-      if (!response.ok || !payload.ok || !payload.registers) throw new Error(payload.error ?? 'OpenPLC read failed');
+      const policyWire = configuredPlcWire(config, 'iot-policy', 127);
+      const statusQuery = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), address: String(statusStart), quantity: String(statusEnd - statusStart), profile: config.endpointProfile });
+      const policyQuery = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), address: String(policyWire), quantity: '1', profile: config.endpointProfile });
+      type ReadPayload = { ok?: boolean; registers?: number[]; receivedAt?: string; error?: string };
+      const readRegisters = async (requestQuery: URLSearchParams) => {
+        const response = await fetch(`/__openplc/read?${requestQuery.toString()}`, { cache: 'no-store' });
+        const payload = await response.json() as ReadPayload;
+        if (!response.ok || !payload.ok || !payload.registers) throw new Error(payload.error ?? 'Modbus read failed');
+        return payload;
+      };
+      let payload: ReadPayload;
+      let statusPayload: ReadPayload;
+      let policyPayload: ReadPayload;
+      if (physicalEndpoint) {
+        const processImage = await enqueuePhysicalPlcIo(() => readRegisters(query));
+        const registers = processImage.registers!;
+        payload = { ...processImage, registers: registers.slice(jointStart, jointEnd) };
+        statusPayload = { ...processImage, registers: registers.slice(statusStart, statusEnd) };
+        policyPayload = { ...processImage, registers: [registers[policyWire] ?? 0] };
+      } else {
+        [payload, statusPayload, policyPayload] = await Promise.all([
+          readRegisters(query),
+          readRegisters(statusQuery),
+          readRegisters(policyQuery),
+        ]);
+      }
       if (!plcDashboardRef.current.openPlc.enabled || plcDashboardRef.current.localManualActive) return;
-      const rawRegisters = payload.registers;
-      const project = current.frameNodeId === selectedKinematicNode.id && current.project
+      const rawRegisters = payload.registers!;
+      const project = current.frameNodeId === plcNode.id && current.project
         ? current.project
-        : createConfiguredPlcProject(selectedKinematicNode);
-      const template = current.frame ?? runPlcModbusSimulationFrame(selectedKinematicNode, { project, elapsedSeconds: 0, sequence: current.sequence + 1, nowMs: Date.now() });
+        : createConfiguredPlcProject(plcNode);
+      const template = current.frameNodeId === plcNode.id && current.frame
+        ? current.frame
+        : runPlcModbusSimulationFrame(plcNode, { project, elapsedSeconds: 0, sequence: current.sequence + 1, nowMs: Date.now() });
       const overrides = Object.fromEntries(template.physicalRegisters.map((register) => {
         const definition = jointDefinitions.find((entry) => entry.jointId === register.jointId);
         const wire = definition?.wire ?? register.address;
@@ -3624,10 +4280,34 @@ export const App = () => {
         const definition = statusDefinitions.find((entry) => entry.id === id);
         return definition ? statusPayload.registers?.[definition.wire - statusStart] : undefined;
       };
-      const frame = runPlcDashboardFrame(selectedKinematicNode, 0, current.sequence + 1, project, overrides);
+      const commandValue = statusValue('system-command') === 1 || statusValue('system-command') === 2 ? statusValue('system-command') as 1 | 2 : 0;
+      const statusCode = statusValue('system-status');
+      const elapsedMs = statusValue('system-time');
+      const conditionCode = statusValue('system-condition');
+      const nowMs = Date.now();
+      const probe = openPlcExecutionProbeRef.current;
+      if (probe.command !== commandValue) {
+        probe.command = commandValue;
+        probe.elapsedMs = elapsedMs;
+        probe.lastProgressAt = nowMs;
+      }
+      const expectedStaticState = (commandValue === 0 && statusCode === 0) || (commandValue === 2 && statusCode === 2) || (commandValue === 1 && (conditionCode ?? 0) >= 2 && statusCode === 3);
+      const scanProgressed = expectedStaticState || (commandValue === 1 && elapsedMs !== undefined && elapsedMs !== probe.elapsedMs);
+      if (scanProgressed) probe.lastProgressAt = nowMs;
+      probe.elapsedMs = elapsedMs;
+      const runtimeGraceMs = Math.max(2000, config.pollMs * 6);
+      // RobotHolding has no dedicated scan heartbeat. A static ElapsedMs or pose
+      // is a valid process state and cannot be used to declare a physical CPU stopped.
+      const runtimeRunning = physicalEndpoint || scanProgressed || nowMs - probe.lastProgressAt < runtimeGraceMs;
+      const runtimeIssue = runtimeRunning
+        ? undefined
+        : `Modbus responds, but the OpenPLC scan is not advancing. Command=${commandValue}, Status=${statusCode ?? '--'}, ElapsedMs=${elapsedMs ?? '--'}. Upload the POU and press Start PLC.`;
+      const frame = runPlcDashboardFrame(plcNode, 0, current.sequence + 1, project, overrides, false);
+      openPlcFailureCountRef.current = 0;
+      setExternalPlcRuntimePose({ nodeId: plcNode.id, jointValues: { ...frame.jointValues } });
       setPlcDashboard((state) => ({
         ...state,
-        running: false,
+        running: commandValue === 1 && (conditionCode ?? 0) < 2 && runtimeRunning,
         registerOverrides: overrides,
         project: frame.project,
         frame,
@@ -3635,36 +4315,66 @@ export const App = () => {
         openPlc: {
           ...state.openPlc,
           online: true,
+          runtimeRunning,
+          runtimeIssue,
           received: state.openPlc.received + 1,
           lastReceivedAt: payload.receivedAt ?? new Date().toISOString(),
           rawRegisters,
-          command: statusValue('system-command') === 1 || statusValue('system-command') === 2 ? statusValue('system-command') as 1 | 2 : 0,
-          status: statusValue('system-status'), activeStep: statusValue('system-step'), elapsedMs: statusValue('system-time'),
-          alarmCode: statusValue('system-alarm'), conditionState: statusValue('system-condition'), speedPermille: statusValue('system-speed'),
+          command: commandValue,
+          status: statusCode, activeStep: statusValue('system-step'), elapsedMs,
+          alarmCode: statusValue('system-alarm'), conditionState: conditionCode, speedPermille: statusValue('system-speed'),
           sensorPolicy: policyPayload.registers?.[0] === 1 ? 1 : 0,
-          diagnostics: `FC03 configured wires ${jointStart}-${jointEnd - 1}, ${rawRegisters.length} words received.`, error: undefined,
+          diagnostics: runtimeIssue ?? (physicalEndpoint
+            ? `Physical Modbus FC03 online. HR ${jointStart}-${jointEnd - 1}, ${rawRegisters.length} words received. RobotHolding does not expose a dedicated CPU-scan heartbeat.`
+            : `Modbus FC03 and OpenPLC scan active. Wires ${jointStart}-${jointEnd - 1}, ${rawRegisters.length} words received.`), error: undefined,
         },
-        frameNodeId: selectedKinematicNode.id,
-        message: `OpenPLC ONLINE: ${payload.registers!.length} holding registers reflected in the digital twin.`,
+        frameNodeId: plcNode.id,
+        message: runtimeIssue ?? `${physicalEndpoint ? 'Physical PLC ONLINE' : 'OpenPLC RUNNING'}: ${payload.registers!.length} holding registers reflected in the digital twin.`,
       }));
     } catch (error) {
       if (!plcDashboardRef.current.openPlc.enabled || plcDashboardRef.current.localManualActive) return;
       const detail = error instanceof Error ? error.message : 'OpenPLC read failed';
+      const physicalEndpoint = config.endpointProfile === 's7-1200-robot-holding';
       const message = /ECONNREFUSED|connect failed|socket/i.test(detail)
-        ? `OpenPLC Modbus port ${config.host}:${config.port} is closed. Upload the PLC program, set Runtime to RUNNING and verify the Modbus Slave plugin.`
+        ? physicalEndpoint
+          ? `Physical PLC ${config.host}:${config.port} is unreachable. Keep reconnect armed and verify the OT network, S7-1200 IP and MB_SERVER.`
+          : `OpenPLC Modbus port ${config.host}:${config.port} is closed. Upload the PLC program, set Runtime to RUNNING and verify the Modbus Slave plugin.`
         : /exception 2|illegal data address/i.test(detail)
-          ? `OpenPLC answered, but configured wire ${jointStart} is not mapped. Review Internal Configuration Center and the OpenPLC program.`
-          : `OpenPLC communication failed: ${detail}`;
-      setPlcDashboard((state) => ({ ...state, openPlc: { ...state.openPlc, online: false, error: detail, diagnostics: message }, message }));
+          ? `${physicalEndpoint ? 'Physical PLC' : 'OpenPLC'} answered, but configured register ${jointStart} is not mapped. Review the active RobotHolding map.`
+          : `${physicalEndpoint ? 'Physical PLC' : 'OpenPLC'} communication failed: ${detail}`;
+      const consecutiveFailures = openPlcFailureCountRef.current + 1;
+      openPlcFailureCountRef.current = consecutiveFailures;
+      if (physicalEndpoint && consecutiveFailures < 12) {
+        // Keep the last confirmed process image and layout stable while the
+        // S7-1200 recovers from short single-port Modbus interruptions.
+        return;
+      }
+      setPlcDashboard((state) => ({ ...state, openPlc: { ...state.openPlc, online: false, runtimeRunning: false, runtimeIssue: message, rawRegisters: undefined, error: undefined, diagnostics: message }, message }));
+    } finally {
+      openPlcPollInFlightRef.current = false;
     }
-  }, [createConfiguredPlcProject, registerConfiguration, runPlcDashboardFrame, selectedKinematicNode]);
+  }, [createConfiguredPlcProject, document.nodes, enqueuePhysicalPlcIo, registerConfiguration, runPlcDashboardFrame]);
 
   useEffect(() => {
-    if ((!plcDashboard.open && !traceAuditDrawerOpen) || !plcDashboard.openPlc.enabled) return undefined;
-    void pollOpenPlc();
-    const timer = window.setInterval(() => void pollOpenPlc(), Math.max(100, plcDashboard.openPlc.pollMs));
+    pollOpenPlcRef.current = pollOpenPlc;
+  }, [pollOpenPlc]);
+
+  useEffect(() => {
+    if (!plcDashboard.openPlc.enabled) return undefined;
+    void pollOpenPlcRef.current();
+    const timer = window.setInterval(() => void pollOpenPlcRef.current(), Math.max(100, plcDashboard.openPlc.pollMs));
     return () => window.clearInterval(timer);
-  }, [plcDashboard.open, traceAuditDrawerOpen, plcDashboard.openPlc.enabled, plcDashboard.openPlc.pollMs, pollOpenPlc]);
+  }, [plcDashboard.openPlc.enabled, plcDashboard.openPlc.pollMs]);
+
+  useEffect(() => {
+    if (plcDashboard.openPlc.enabled) return undefined;
+    if (physicalPlcDemoTimerRef.current !== undefined) window.clearTimeout(physicalPlcDemoTimerRef.current);
+    physicalPlcDemoTimerRef.current = undefined;
+    physicalPlcDemoRunIdRef.current += 1;
+    physicalPlcDemoWriteInFlightRef.current = false;
+    setPhysicalPlcDemoActive(false);
+    return undefined;
+  }, [plcDashboard.openPlc.enabled]);
 
   const togglePlcDashboardAdvanced = () => {
     setPlcDashboard((current) => ({ ...current, advanced: !current.advanced }));
@@ -3700,6 +4410,63 @@ export const App = () => {
     setRegisterConfiguration(definitions);
     setPlcDashboard((current) => ({ ...current, running: false, project: undefined, frame: undefined, message: 'Confirmed register map saved. PLC bindings will be rebuilt from the approved configuration.' }));
     setStatus('Internal PLC configuration confirmed and saved');
+  };
+
+  const applyConnectionProfiles = (profiles: ConnectionProfile[]) => {
+    setConnectionProfiles(profiles);
+    setStatus('Industrial connection profiles confirmed and saved');
+  };
+
+  const connectIndustrialProfile = async (profile: ConnectionProfile) => {
+    if (profile.protocol === 'modbus') {
+      setStatus('Modbus is managed by the OpenPLC panel. Use Connect OpenPLC to establish the transport.');
+      return;
+    }
+    const manager = connectionManagerRef.current;
+    const adapter = profile.protocol === 'mqtt'
+      ? new MqttAdapter({ connectionId: profile.id, endpoint: profile.endpoint })
+      : profile.protocol === 'opcua'
+        ? new OpcUaGatewayAdapter({
+          connectionId: profile.id,
+          gatewayUrl: profile.endpoint,
+          endpointUrl: String(profile.metadata.endpointUrl ?? 'opc.tcp://127.0.0.1:4840'),
+          securityPolicy: String(profile.metadata.securityPolicy ?? 'None'),
+        })
+        : undefined;
+    if (!adapter) {
+      setStatus(`${profile.protocol.toUpperCase()} does not have a browser adapter in this release.`);
+      return;
+    }
+    try {
+      const existing = manager.get(profile.id);
+      if (existing && existing.health.state === 'ONLINE') await manager.disconnect(profile.id);
+      if (existing) manager.remove(profile.id);
+      manager.add(profile, adapter);
+      setConnectionHealth((current) => ({ ...current, [profile.id]: { connectionId: profile.id, protocol: profile.protocol, state: 'CONNECTING', quality: 'UNCERTAIN', updatedAtUtc: new Date().toISOString(), message: 'Connection test in progress' } }));
+      const result = await manager.connect(profile.id);
+      setConnectionHealth((current) => ({ ...current, [profile.id]: result.health }));
+      setStatus(`${profile.name}: ${result.health.state}${result.health.message ? ` - ${result.health.message}` : ''}`);
+    } catch (error) {
+      const health: ConnectionHealth = { connectionId: profile.id, protocol: profile.protocol, state: 'FAILED', quality: 'BAD', updatedAtUtc: new Date().toISOString(), message: error instanceof Error ? error.message : String(error) };
+      setConnectionHealth((current) => ({ ...current, [profile.id]: health }));
+      setStatus(`${profile.name}: ${health.message}`);
+    }
+  };
+
+  const disconnectIndustrialProfile = async (profile: ConnectionProfile) => {
+    if (profile.protocol === 'modbus') {
+      setStatus('Disconnect Modbus from the OpenPLC panel.');
+      return;
+    }
+    try {
+      const manager = connectionManagerRef.current;
+      const result = manager.get(profile.id) ? await manager.disconnect(profile.id) : undefined;
+      const health = result?.health ?? { connectionId: profile.id, protocol: profile.protocol, state: 'DISCONNECTED' as const, quality: 'COMM_LOST' as const, updatedAtUtc: new Date().toISOString(), message: 'Disconnected' };
+      setConnectionHealth((current) => ({ ...current, [profile.id]: health }));
+      setStatus(`${profile.name}: disconnected`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : String(error));
+    }
   };
 
   type TerminalModbusPayload = {
@@ -3809,7 +4576,8 @@ export const App = () => {
       const project = current.frameNodeId === selectedKinematicNode.id && current.project
         ? current.project
         : createConfiguredPlcProject(selectedKinematicNode, payload.timestampUtc ?? new Date().toISOString());
-      const frame = runPlcDashboardFrame(selectedKinematicNode, 0, Number(payload.sequence ?? current.sequence + 1), project, overrides);
+      const frame = runPlcDashboardFrame(selectedKinematicNode, 0, Number(payload.sequence ?? current.sequence + 1), project, overrides, false);
+      setExternalPlcRuntimePose({ nodeId: selectedKinematicNode.id, jointValues: { ...frame.jointValues } });
       const byDisplayAddress = new Map((payload.registers ?? []).map((register) => [register.displayAddress, register]));
       const byIndex = payload.registers ?? [];
       const physicalRegisters = frame.physicalRegisters.map((register, index) => {
@@ -3829,7 +4597,6 @@ export const App = () => {
         physicalRegisters,
         modbusPackets: payload.modbusPackets?.length ? payload.modbusPackets : frame.modbusPackets,
       };
-      setKinematicJointValuesForNode(selectedKinematicNode.id, frame.jointValues);
       setPlcDashboard((state) => ({
         ...state,
         open: true,
@@ -3852,44 +4619,65 @@ export const App = () => {
         message: `Visual Modbus controller online: ${(payload.registers ?? []).length} HR values reflected in digital twin.`,
       }));
     },
-    [runPlcDashboardFrame, selectedKinematicNode, setKinematicJointValuesForNode],
+    [runPlcDashboardFrame, selectedKinematicNode],
   );
 
   const applyTerminalBridgeHealth = useCallback((payload: TerminalModbusPayload, bridgeUrl: string) => {
     const endpoint = parseModbusBridgeEndpoint(bridgeUrl);
     const activeClient = payload.connectedClients?.[0];
     const activeReader = payload.stateReaders?.[0];
-    const manualReconnect = plcBridgeDisconnectLockRef.current && Boolean(activeClient);
-    if (plcBridgeDisconnectLockRef.current && !manualReconnect) {
-      setPlcDashboard((current) => ({ ...current, externalBridgeServerOnline: true }));
+    if (plcBridgeDisconnectLockRef.current) {
+      setPlcDashboard((current) => {
+        if (!activeClient) {
+          if (current.externalBridgeDisconnectedByUser) plcBridgeReconnectArmedRef.current = true;
+          return {
+            ...current,
+            externalBridgeServerOnline: true,
+            externalBridgeOnline: false,
+            externalBridgeClientConnected: false,
+            externalBridgeClientId: undefined,
+            externalBridgeClientIp: undefined,
+            externalBridgeClientPort: undefined,
+          };
+        }
+        if (!current.externalBridgeDisconnectedByUser || !plcBridgeReconnectArmedRef.current) {
+          return { ...current, externalBridgeServerOnline: true };
+        }
+        plcBridgeDisconnectLockRef.current = false;
+        plcBridgeReconnectArmedRef.current = false;
+        return {
+          ...current,
+          externalBridgeEnabled: true,
+          externalBridgeDisconnectedByUser: false,
+          externalBridgeServerOnline: true,
+          externalBridgeClientConnected: true,
+          externalBridgeClientId: activeClient.id,
+          externalBridgeClientIp: activeClient.ip ?? endpoint.host,
+          externalBridgeClientPort: activeClient.port ?? endpoint.port,
+          message: `Visual Modbus controller reconnected manually from ${activeClient.ip ?? endpoint.host}. RX resumed.`,
+        };
+      });
       return;
     }
-    if (manualReconnect) plcBridgeDisconnectLockRef.current = false;
     setPlcDashboard((current) => ({
       ...current,
-      externalBridgeEnabled: manualReconnect ? true : current.externalBridgeEnabled,
-      externalBridgeDisconnectedByUser: manualReconnect ? false : current.externalBridgeDisconnectedByUser,
+      externalBridgeEnabled: current.externalBridgeEnabled,
+      externalBridgeDisconnectedByUser: current.externalBridgeDisconnectedByUser,
       externalBridgeServerOnline: true,
-      externalBridgeClientConnected: manualReconnect ? true : current.externalBridgeDisconnectedByUser ? false : current.externalBridgeEnabled ? Boolean(activeClient || activeReader) : Boolean(activeClient),
+      externalBridgeClientConnected: current.externalBridgeDisconnectedByUser ? false : current.externalBridgeEnabled ? Boolean(activeClient || activeReader) : Boolean(activeClient),
       externalBridgeClientId: activeClient?.id,
-      externalBridgeClientIp: manualReconnect
-        ? activeClient?.ip ?? endpoint.host
-        : current.externalBridgeDisconnectedByUser
+      externalBridgeClientIp: current.externalBridgeDisconnectedByUser
         ? undefined
         : current.externalBridgeEnabled
           ? activeClient?.ip ?? activeReader?.ip ?? payload.client?.ip ?? endpoint.host
           : activeClient?.ip ?? payload.client?.ip ?? endpoint.host,
-      externalBridgeClientPort: manualReconnect
-        ? activeClient?.port ?? endpoint.port
-        : current.externalBridgeDisconnectedByUser
+      externalBridgeClientPort: current.externalBridgeDisconnectedByUser
         ? undefined
         : current.externalBridgeEnabled
           ? activeClient?.port ?? activeReader?.port ?? payload.client?.port ?? endpoint.port
           : activeClient?.port ?? payload.client?.port ?? endpoint.port,
       message:
-        manualReconnect
-          ? `Visual Modbus controller reconnected manually from ${activeClient?.ip ?? endpoint.host}. RX resumed.`
-          : !current.externalBridgeDisconnectedByUser && !current.externalBridgeEnabled && activeClient
+        !current.externalBridgeDisconnectedByUser && !current.externalBridgeEnabled && activeClient
           ? `Visual Modbus controller detected on ${bridgeUrl}. Press Visual Controller to start RX.`
           : current.message,
     }));
@@ -3964,7 +4752,9 @@ export const App = () => {
           ['iot-age', telemetry.ageMs], ['iot-valid', telemetry.valid ? 1 : 0],
           ['iot-sequence', Number(telemetry.sequence ?? 0) & 0xffff], ['iot-quality', qualityBits],
         ]);
-        const iotEntries = registerConfiguration.filter((entry) => entry.enabled && iotValues.has(entry.id)).sort((a, b) => a.wire - b.wire);
+        const iotEntries = current.openPlc.endpointProfile === 's7-1200-robot-holding'
+          ? [...iotValues.keys()].map((id) => ({ id, wire: physicalPlcWire[id] })).sort((a, b) => a.wire - b.wire)
+          : registerConfiguration.filter((entry) => entry.enabled && iotValues.has(entry.id)).sort((a, b) => a.wire - b.wire);
         const writeBlocks = iotEntries.reduce<Array<{ address: number; values: number[] }>>((blocks, entry) => {
           const last = blocks[blocks.length - 1];
           const value = iotValues.get(entry.id) ?? 0;
@@ -3972,11 +4762,37 @@ export const App = () => {
           else blocks.push({ address: entry.wire, values: [value] });
           return blocks;
         }, []);
-        const writes = writeBlocks.map((block) => fetch('/__openplc/write', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ host: current.openPlc.host, port: current.openPlc.port, unitId: current.openPlc.unitId, address: block.address, values: block.values }),
-          }));
-        await Promise.all(writes);
+        if (!iotPlcForwardInFlightRef.current) {
+          iotPlcForwardInFlightRef.current = true;
+          try {
+            const forwardTelemetry = async () => {
+              for (const block of writeBlocks) {
+                const response = await fetch('/__openplc/write', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ host: current.openPlc.host, port: current.openPlc.port, unitId: current.openPlc.unitId, address: block.address, values: block.values }),
+                });
+                if (!response.ok) {
+                  const result = await response.json() as { error?: string };
+                  throw new Error(result.error ?? `IoT Modbus write failed with HTTP ${response.status}`);
+                }
+              }
+            };
+            if (current.openPlc.endpointProfile === 's7-1200-robot-holding') await enqueuePhysicalPlcIo(forwardTelemetry);
+            else await forwardTelemetry();
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : 'IoT Modbus write failed';
+            setPlcDashboard((state) => ({
+              ...state,
+              openPlc: {
+                ...state.openPlc,
+                runtimeIssue: `IoT remains connected, but physical PLC telemetry forwarding failed: ${detail}`,
+                diagnostics: `Physical PLC telemetry forwarding failed: ${detail}`,
+              },
+            }));
+          } finally {
+            iotPlcForwardInFlightRef.current = false;
+          }
+        }
         setPlcDashboard((state) => ({ ...state, iotTelemetry: telemetry, externalBridgeServerOnline: true, externalBridgeLastReceivedAt: payload.timestampUtc ?? new Date().toISOString() }));
         return;
       }
@@ -3994,12 +4810,15 @@ export const App = () => {
         message: `Visual Modbus controller offline. Run: npm.cmd run modbus:controller`,
       }));
     }
-  }, [applyTerminalModbusPayload, registerConfiguration]);
+  }, [applyTerminalModbusPayload, enqueuePhysicalPlcIo, registerConfiguration]);
 
   const toggleTerminalModbusBridge = () => {
     setPlcDashboard((current) => {
       const enabled = !current.externalBridgeEnabled;
-      if (enabled) plcBridgeDisconnectLockRef.current = false;
+      if (enabled) {
+        plcBridgeDisconnectLockRef.current = false;
+        plcBridgeReconnectArmedRef.current = false;
+      }
       return {
         ...current,
         open: true,
@@ -4018,15 +4837,23 @@ export const App = () => {
     });
   };
 
-  const disconnectTerminalModbusClient = () => {
+  const disconnectTerminalModbusClient = async () => {
     plcBridgeDisconnectLockRef.current = true;
+    plcBridgeReconnectArmedRef.current = false;
     const current = plcDashboardRef.current;
     if (current.externalBridgeClientId) {
-      void fetch(`${current.externalBridgeUrl}/client-session`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id: current.externalBridgeClientId, status: 'disconnected', endpoint: current.externalBridgeUrl }),
-      }).catch(() => undefined);
+      try {
+        const response = await fetch(`${current.externalBridgeUrl}/client-session`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: current.externalBridgeClientId, status: 'disconnected', endpoint: current.externalBridgeUrl }),
+        });
+        if (response.ok) plcBridgeReconnectArmedRef.current = true;
+      } catch {
+        // Keep the local disconnect lock until health confirms that the client disappeared.
+      }
+    } else {
+      plcBridgeReconnectArmedRef.current = true;
     }
     setPlcDashboard((state) => ({
       ...state,
@@ -4045,6 +4872,7 @@ export const App = () => {
 
   const updateModbusBridgeEndpoint = (field: 'host' | 'port', value: string) => {
     plcBridgeDisconnectLockRef.current = false;
+    plcBridgeReconnectArmedRef.current = false;
     setPlcDashboard((current) => {
       const endpoint = parseModbusBridgeEndpoint(current.externalBridgeUrl);
       const nextUrl = normalizeModbusBridgeUrl(field === 'host' ? value : endpoint.host, field === 'port' ? value : endpoint.port);
@@ -4222,7 +5050,14 @@ export const App = () => {
   };
 
   const updateKinematicJointForNode = (nodeId: string, jointId: string, patch: Partial<KinematicJoint>) => {
-    updateKinematicGraphForNode(nodeId, (graph) => updateJoint(graph, jointId, patch), 'Kinematic joint updated', true);
+    updateKinematicGraphForNode(nodeId, (graph) => {
+      const joint = graph.joints.find((candidate) => candidate.id === jointId);
+      if (!joint || !patch.origin) return updateJoint(graph, jointId, patch);
+      const evidence = joint.evidence.length
+        ? joint.evidence.map((item, index) => index === 0 ? { ...item, metadata: { ...item.metadata, manualOriginOverride: true } } : item)
+        : [{ type: 'manual' as const, message: 'Joint pivot edited manually.', metadata: { manualOriginOverride: true } }];
+      return updateJoint(graph, jointId, { ...patch, evidence });
+    }, 'Kinematic joint updated', true);
     showViewportNotice('Joint definition updated. Press Test Movement to move the piece with the new definition.', 5200);
   };
 
@@ -4342,6 +5177,10 @@ export const App = () => {
             ? 'Pick moving point in viewport'
           : mode === 'axis-gizmo'
             ? 'Drag axis gizmo in viewport'
+            : mode === 'ring-translate'
+              ? 'Move joint ring in 3D'
+              : mode === 'ring-rotate'
+                ? 'Rotate joint ring in 3D'
             : 'Pick axis point in viewport',
     );
     showViewportNotice(
@@ -4353,6 +5192,10 @@ export const App = () => {
             ? 'Pick the moving end of the piece.'
             : mode === 'axis-gizmo'
               ? 'Drag the yellow handle. X red, Y green and Z blue are the reference axes.'
+              : mode === 'ring-translate'
+                ? 'Drag the XYZ gizmo to place the ring at the physical joint center.'
+                : mode === 'ring-rotate'
+                  ? 'Drag the rotation arcs to orient the ring freely in 3D.'
               : mode === 'pick-axis-a'
                 ? 'Pick point A on the model. Then pick point B to define the movement axis.'
                 : 'Pick point B. Axis will be normalized from A to B.',
@@ -4366,6 +5209,39 @@ export const App = () => {
       const graph = node ? graphFromGeometry(node.geometry) : undefined;
       const joint = graph?.joints.find((item) => item.id === event.jointId);
       const candidate = event.candidate;
+      if (pieceAnalysis?.nodeId === event.nodeId) {
+        const position = candidate?.frame.origin ?? event.point;
+        persistManualPieceReferenceCenter(event.nodeId, position);
+        updateKinematicGraphForNode(
+          event.nodeId,
+          (currentGraph) =>
+            updateJoint(currentGraph, event.jointId, {
+              origin: {
+                position,
+                rotation: candidate?.frame.orientation ?? currentGraph.joints.find((item) => item.id === event.jointId)?.origin.rotation ?? [0, 0, 0, 1],
+              },
+              axis: candidate?.frame.axis ?? currentGraph.joints.find((item) => item.id === event.jointId)?.axis ?? [0, 1, 0],
+              jointFrame: candidate?.frame,
+              inferredCandidate: candidate,
+              source: 'manual',
+              evidence: [
+                ...(currentGraph.joints.find((item) => item.id === event.jointId)?.evidence ?? []),
+                { type: 'manual', score: 1, message: candidate ? 'Piece reference corrected from a user-seeded mechanical frame.' : 'Piece reference corrected from the selected surface point.' },
+              ],
+            }),
+          'Manual piece reference applied',
+        );
+        setKinematicEditTarget({
+          nodeId: event.nodeId,
+          jointId: event.jointId,
+          mode: 'show-joint',
+          origin: position,
+          axis: candidate?.frame.axis ?? joint?.axis ?? [0, 1, 0],
+          focusKey: `piece-reference-${event.jointId}-${Date.now()}`,
+        });
+        kinematicEditSnapshotRef.current = undefined;
+        return;
+      }
       if (!candidate) {
         setStatus('No reliable mechanical feature detected at this click');
         showViewportNotice('No reliable cylinder or circular interface was detected. The clicked point was not used as a pivot.', 6200);
@@ -4388,20 +5264,8 @@ export const App = () => {
           }),
         'Mechanical joint frame fitted',
       );
-      if (pieceAnalysis?.nodeId === event.nodeId) {
-        setKinematicEditTarget({
-          nodeId: event.nodeId,
-          jointId: event.jointId,
-          mode: 'show-joint',
-          origin: candidate.frame.origin,
-          axis: candidate.frame.axis,
-          focusKey: `piece-reference-${event.jointId}-${Date.now()}`,
-        });
-        kinematicEditSnapshotRef.current = undefined;
-      } else {
-        setKinematicEditTarget(undefined);
-        kinematicEditSnapshotRef.current = undefined;
-      }
+      setKinematicEditTarget(undefined);
+      kinematicEditSnapshotRef.current = undefined;
       return;
     }
 
@@ -4439,7 +5303,7 @@ export const App = () => {
           axis,
           evidence: [
             ...(graph.joints.find((joint) => joint.id === event.jointId)?.evidence ?? []),
-            { type: 'manual', score: 1, message: 'Axis calculated from two picked points.' },
+            { type: 'manual', score: 1, message: 'Axis calculated from two picked points.', metadata: { useJointAxisVector: true } },
           ],
         }),
       'Two-point axis applied',
@@ -4451,8 +5315,34 @@ export const App = () => {
   const handleKinematicAxisChange = (event: KinematicAxisChangeEvent) => {
     updateKinematicGraphForNode(
       event.nodeId,
-      (graph) => updateJoint(graph, event.jointId, { axis: event.axis }),
-      'Axis gizmo adjusted',
+      (graph) => {
+        const joint = graph.joints.find((item) => item.id === event.jointId);
+        if (!joint) return graph;
+        const dominantAxisIndex = event.axis.map((value) => Math.abs(value)).indexOf(Math.max(...event.axis.map((value) => Math.abs(value))));
+        const rigAxis = dominantAxisIndex === 1 ? 'Y' : dominantAxisIndex === 2 ? 'Z' : 'X';
+        return updateJoint(graph, event.jointId, {
+          axis: event.axis,
+          origin: event.origin || event.orientation
+            ? { position: event.origin ?? joint.origin.position, rotation: event.orientation ?? joint.origin.rotation }
+            : joint.origin,
+          jointFrame: event.origin || event.orientation
+            ? {
+                origin: event.origin ?? joint.origin.position,
+                axis: event.axis,
+                orientation: event.orientation ?? joint.jointFrame?.orientation ?? joint.origin.rotation,
+                source: 'manual',
+                status: 'manual',
+                axisSignConvention: 'user-defined',
+                evidence: joint.jointFrame?.evidence ?? { evidenceLevel: 'high', messages: ['Ring frame positioned manually in the 3D viewport.'] },
+              }
+            : joint.jointFrame,
+          evidence: [
+            { type: 'manual', score: 1, message: 'Joint frame adjusted with the viewport ring.', metadata: { rigAxis, useJointAxisVector: true, manualOriginOverride: Boolean(event.origin), ringFrame3d: Boolean(event.orientation) } },
+            ...joint.evidence.filter((item) => item.metadata?.useJointAxisVector !== true),
+          ],
+        });
+      },
+      event.origin || event.orientation ? '3D ring frame adjusted' : 'Axis gizmo adjusted',
     );
   };
 
@@ -4474,10 +5364,66 @@ export const App = () => {
       const amplitude = fullRange ? Math.min(Math.max(Math.abs(lower), Math.abs(upper)), 2) : Math.min((upper - lower) * 0.25, 0.35);
       return { min: Math.max(lower, -Math.abs(amplitude)), max: Math.min(upper, Math.abs(amplitude)) };
     }
-    const lower = joint.type === 'continuous' ? -Math.PI * 2 : (joint.limits?.lower ?? -Math.PI);
-    const upper = joint.type === 'continuous' ? Math.PI * 2 : (joint.limits?.upper ?? Math.PI);
+    const lower = joint.limits?.lower ?? (joint.type === 'continuous' ? -Math.PI * 2 : -Math.PI);
+    const upper = joint.limits?.upper ?? (joint.type === 'continuous' ? Math.PI * 2 : Math.PI);
     const amplitude = fullRange ? Math.min(Math.max(Math.abs(lower), Math.abs(upper)), Math.PI * 0.9) : Math.min((upper - lower) * 0.25, Math.PI / 4);
     return { min: Math.max(lower, -Math.abs(amplitude)), max: Math.min(upper, Math.abs(amplitude)) };
+  };
+
+  const openJointRangeEditor = (nodeId: string, joint: KinematicJoint) => {
+    const rotational = joint.type !== 'prismatic';
+    const defaultLower = rotational ? (joint.type === 'continuous' ? -Math.PI * 2 : -Math.PI) : -1;
+    const defaultUpper = rotational ? (joint.type === 'continuous' ? Math.PI * 2 : Math.PI) : 1;
+    const toDisplay = (value: number) => rotational ? THREE.MathUtils.radToDeg(value) : value;
+    setJointRangeEditor({
+      nodeId,
+      jointId: joint.id,
+      lower: String(Number(toDisplay(joint.limits?.lower ?? defaultLower).toFixed(4))),
+      upper: String(Number(toDisplay(joint.limits?.upper ?? defaultUpper).toFixed(4))),
+    });
+  };
+
+  const saveJointRange = () => {
+    if (!jointRangeEditor) return;
+    const node = document.nodes.find((item) => item.id === jointRangeEditor.nodeId);
+    const graph = node ? graphFromGeometry(node.geometry) : undefined;
+    const joint = graph?.joints.find((item) => item.id === jointRangeEditor.jointId);
+    if (!joint || joint.type === 'fixed') {
+      setJointRangeEditor((current) => current ? { ...current, error: 'This joint has no configurable movement.' } : current);
+      return;
+    }
+
+    const lowerDisplay = Number(jointRangeEditor.lower);
+    const upperDisplay = Number(jointRangeEditor.upper);
+    if (!jointRangeEditor.lower.trim() || !jointRangeEditor.upper.trim() || !Number.isFinite(lowerDisplay) || !Number.isFinite(upperDisplay)) {
+      setJointRangeEditor((current) => current ? { ...current, error: 'Enter two finite numeric values.' } : current);
+      return;
+    }
+    if (lowerDisplay >= upperDisplay) {
+      setJointRangeEditor((current) => current ? { ...current, error: 'Minimum must be lower than maximum.' } : current);
+      return;
+    }
+
+    const rotational = joint.type !== 'prismatic';
+    const lower = rotational ? THREE.MathUtils.degToRad(lowerDisplay) : lowerDisplay;
+    const upper = rotational ? THREE.MathUtils.degToRad(upperDisplay) : upperDisplay;
+    const unit = rotational ? 'deg' : 'model units';
+    updateKinematicGraphForNode(
+      jointRangeEditor.nodeId,
+      (currentGraph) => updateJoint(currentGraph, joint.id, {
+        limits: { ...joint.limits, lower, upper },
+        status: 'candidate',
+        validation: undefined,
+        evidence: [
+          ...joint.evidence,
+          { type: 'manual', score: 1, message: `Movement range set manually: ${lowerDisplay} to ${upperDisplay} ${unit}.` },
+        ],
+      }),
+      'Joint movement range saved',
+      true,
+    );
+    setJointRangeEditor(undefined);
+    showViewportNotice('Movement range saved with the model. Test the joint and validate it again.', 5200);
   };
 
   const startViewportJointTest = (nodeId: string, jointId: string, mode: ViewportJointTestMode = 'movement') => {
@@ -4676,6 +5622,61 @@ export const App = () => {
 
   const acceptKinematicJointForNode = (nodeId: string, jointId: string) => {
     updateKinematicGraphForNode(nodeId, (graph) => acceptJointCandidate(graph, jointId), 'Kinematic joint accepted');
+  };
+
+  const commitKinematicJointFrameForNode = (nodeId: string, jointId: string) => {
+    setDemoMotionNodeId((current) => (current === nodeId ? undefined : current));
+    setDocument((current) => {
+      const nextDocument = touch({
+        ...current,
+        selectedNodeId: nodeId,
+        nodes: current.nodes.map((node) => {
+          if (node.id !== nodeId || !kinematicGeometryWithGraph(node.geometry)) return node;
+          const sourceGraph = graphFromGeometry(node.geometry);
+          if (!sourceGraph || !sourceGraph.joints.some((joint) => joint.id === jointId)) return node;
+          const sourceJoint = sourceGraph.joints.find((joint) => joint.id === jointId)!;
+          const dominantAxisIndex = sourceJoint.axis.map((value) => Math.abs(value)).indexOf(Math.max(...sourceJoint.axis.map((value) => Math.abs(value))));
+          const rigAxis = dominantAxisIndex === 1 ? 'Y' : dominantAxisIndex === 2 ? 'Z' : 'X';
+          const manualEvidence = sourceJoint.evidence.find((item) => item.metadata?.useJointAxisVector === true);
+          const graphWithOperationalAxis = manualEvidence
+            ? updateJoint(sourceGraph, jointId, {
+                evidence: [
+                  { ...manualEvidence, metadata: { ...manualEvidence.metadata, rigAxis, useJointAxisVector: true } },
+                  ...sourceJoint.evidence.filter((item) => item !== manualEvidence),
+                ],
+              })
+            : sourceGraph;
+          const graph = acceptJointCandidate(graphWithOperationalAxis, jointId);
+          const homeState = createHomeKinematicState(graph);
+          return {
+            ...node,
+            geometry: {
+              ...node.geometry,
+              kinematicGraph: graph,
+              kinematicState: homeState,
+              functionalComponent: syncComponentMotionFromGraph(node.geometry.functionalComponent, graph),
+            },
+          };
+        }),
+      });
+      const saved = saveProjectToBrowser(nextDocument);
+      saveProjectAutosave(saved);
+      setAutosaveAvailable(true);
+      setIssues(validateProject(saved));
+      return saved;
+    });
+    kinematicEditSnapshotRef.current = undefined;
+    setKinematicEditTarget(undefined);
+    setTool('select');
+    setViewportInspection((current) => ({
+      ...current,
+      phase: current.phase === 'repairing' ? 'awaiting-confirmation' : current.phase,
+      repairMode: undefined,
+      message: 'Joint frame adopted. The viewport returned to selection mode.',
+    }));
+    clearPendingWorkspaceNodes([nodeId]);
+    setStatus('Joint frame adopted and saved');
+    showViewportNotice('Ring orientation and reference adopted as the definitive joint movement.', 5200);
   };
 
   const rejectKinematicJointForNode = (nodeId: string, jointId: string) => {
@@ -4896,13 +5897,261 @@ export const App = () => {
     const node = document.nodes.find((item) => item.id === viewportInspection.nodeId);
     return node && kinematicGeometryWithGraph(node.geometry) ? node.geometry.pieceReferenceCenter : undefined;
   })();
+  const selectedInspectorGraph = selectedNode ? graphFromGeometry(selectedNode.geometry) : undefined;
+  const inspectorValidatedJointCount = selectedInspectorGraph?.joints.filter((joint) => joint.status === 'validated').length ?? 0;
+  const inspectorNeedsReviewCount = selectedInspectorGraph?.joints.filter((joint) => joint.status !== 'validated' && joint.status !== 'rejected').length ?? 0;
+  const inspectorGuide = !selectedNode
+    ? { title: 'Selecciona un objeto', message: 'Haz clic en un objeto del escenario para mostrar las acciones que se pueden aplicar.', action: undefined }
+    : inspectorFocus === 'object'
+      ? { title: 'Apariencia y colocacion', message: 'Si quieres mover, rotar, escalar o cambiar el color del objeto, utiliza los controles de esta etapa.', action: 'mechanics' as InspectorFocus }
+      : inspectorFocus === 'mechanics'
+        ? !selectedInspectorGraph
+          ? { title: 'El objeto no tiene articulaciones', message: 'Importa o selecciona un modelo articulado. Si el modelo tiene piezas, abre Piezas para desmontarlo o almacenarlo.', action: 'parts' as InspectorFocus }
+          : inspectorNeedsReviewCount > 0
+            ? { title: `${inspectorNeedsReviewCount} joints necesitan revision`, message: 'Pulsa Show Joint, prueba el movimiento y usa Movement correct o Movement incorrect antes de guardar.', action: undefined }
+            : { title: 'Mecanica preparada', message: `${inspectorValidatedJointCount} joints validados. Puedes probar el brazo completo, volver a Home y guardar la configuracion.`, action: 'twin' as InspectorFocus }
+        : inspectorFocus === 'parts'
+          ? { title: 'Edicion por piezas', message: selectedPartsForSelectedNode.length ? `Tienes ${selectedPartsForSelectedNode.length} piezas seleccionadas. Ahora puedes moverlas, colorearlas o almacenarlas.` : 'Activa el modo de piezas y haz clic sobre una pieza. Usa Shift para seleccionar varias.', action: undefined }
+          : inspectorFocus === 'twin'
+            ? { title: 'Estado operativo', message: selectedInspectorGraph ? 'Aqui se muestran senales, conexiones, historico, alarmas y escenarios. Empieza comprobando que la conexion figure ONLINE.' : 'Primero configura la mecanica del modelo para crear sus senales de gemelo digital.', action: selectedInspectorGraph ? undefined : 'mechanics' as InspectorFocus }
+            : { title: 'Validar y exportar', message: 'Ejecuta el preflight. Si no hay errores, genera la vista previa y exporta el GLB.', action: undefined };
+  const selectedTwinProject = useMemo(() => {
+    if (!selectedNode) return undefined;
+    try {
+      return graphFromGeometry(selectedNode.geometry)
+        ? configurePlcProject(selectedNode, createPlcTwinProjectForNode(selectedNode))
+        : createTwinProjectFromAssetDocument({ ...document, nodes: [selectedNode], selectedNodeId: selectedNode.id }, { mode: 'simulation', includeSimulatedBindings: true });
+    } catch {
+      return undefined;
+    }
+  }, [selectedNode, document.metadata.id, registerConfiguration, configurePlcProject]);
+  const operationalTwinProject = plcDashboard.frameNodeId === selectedNode?.id && plcDashboard.project
+    ? plcDashboard.project
+    : selectedTwinProject;
+  const replayFrames = useMemo(
+    () => operationalTwinProject && historianRecords.length ? replayRecords(operationalTwinProject, historianRecords) : [],
+    [operationalTwinProject, historianRecords],
+  );
+  const activeReplayFrame = replayFrameIndex >= 0 ? replayFrames[replayFrameIndex] : undefined;
+  const activeScenario = simulationScenarios.find((scenario) => scenario.id === activeScenarioId);
+  const scenarioFrame = useMemo(() => operationalTwinProject && activeScenario
+    ? runSimulationScenario(operationalTwinProject, activeScenario, scenarioElapsedMs, scenarioStartedAtRef.current ?? operationalTwinProject.metadata.updatedAtUtc)
+    : undefined, [operationalTwinProject, activeScenario, scenarioElapsedMs]);
+  const inspectedTwinProject = activeReplayFrame?.project ?? scenarioFrame?.project ?? operationalTwinProject;
+  const viewportDocument = useMemo<AssetDocument>(() => {
+    let renderedDocument = document;
+    if ((activeReplayFrame || scenarioFrame) && inspectedTwinProject && selectedNode) {
+    const jointValues: Record<string, number> = {};
+    Object.values(inspectedTwinProject.state.reportedState).forEach((sample) => {
+      const signal = inspectedTwinProject.signals.find((item) => item.id === sample.signalId);
+      const jointId = typeof signal?.metadata.jointId === 'string' ? signal.metadata.jointId : undefined;
+      const numeric = typeof sample.value === 'number' ? sample.value : Number(sample.value);
+      if (jointId && Number.isFinite(numeric)) jointValues[jointId] = numeric;
+    });
+      renderedDocument = {
+      ...document,
+      nodes: document.nodes.map((node) => {
+        if (node.id !== selectedNode.id || !('kinematicGraph' in node.geometry) || !node.geometry.kinematicGraph) return node;
+        const graph = node.geometry.kinematicGraph;
+        const baseState = node.geometry.kinematicState ?? createHomeKinematicState(graph);
+        const boundedValues = Object.fromEntries(Object.entries(jointValues).map(([jointId, value]) => {
+          const joint = graph.joints.find((item) => item.id === jointId);
+          return [jointId, joint?.limits ? Math.max(joint.limits.lower ?? -Infinity, Math.min(joint.limits.upper ?? Infinity, value)) : value];
+        }));
+        return { ...node, geometry: { ...node.geometry, kinematicState: { homeJointValues: { ...baseState.homeJointValues }, jointValues: { ...baseState.jointValues, ...boundedValues } } } };
+      }),
+      };
+    }
+    if (!externalPlcRuntimePose) return renderedDocument;
+    return {
+      ...renderedDocument,
+      nodes: renderedDocument.nodes.map((node) => {
+        if (node.id !== externalPlcRuntimePose.nodeId || !kinematicGeometryWithGraph(node.geometry)) return node;
+        const graph = graphFromGeometry(node.geometry);
+        if (!graph) return node;
+        const baseState = node.geometry.kinematicState ?? createHomeKinematicState(graph);
+        const boundedValues = Object.fromEntries(Object.entries(externalPlcRuntimePose.jointValues).map(([jointId, value]) => {
+          const joint = graph.joints.find((item) => item.id === jointId);
+          return [jointId, joint?.limits ? Math.max(joint.limits.lower ?? -Infinity, Math.min(joint.limits.upper ?? Infinity, value)) : value];
+        }));
+        return {
+          ...node,
+          geometry: {
+            ...node.geometry,
+            kinematicState: {
+              homeJointValues: { ...baseState.homeJointValues },
+              jointValues: { ...baseState.jointValues, ...boundedValues },
+            },
+          },
+        };
+      }),
+    };
+  }, [document, selectedNode, inspectedTwinProject, activeReplayFrame, scenarioFrame, externalPlcRuntimePose]);
+  const plcConditionState = plcDashboard.openPlc.rawRegisters?.[5];
+  const plcAlarmCode = plcDashboard.openPlc.rawRegisters?.[4];
+  const selectedVisualState = visualStateOverlayEnabled
+    ? plcDashboard.openPlc.enabled && !plcDashboard.openPlc.online
+      ? 'disconnected' as const
+      : alarmInstances.some((alarm) => alarm.state === 'active') || (plcAlarmCode ?? 0) > 0 || (plcConditionState ?? 0) >= 2
+        ? 'alarm' as const
+        : plcConditionState === 1 || operationalTwinProject?.connectionHealth.some((connection) => connection.state === 'DEGRADED' || connection.quality !== 'GOOD')
+          ? 'warning' as const
+          : 'normal' as const
+    : undefined;
+
+  useEffect(() => {
+    if (!operationalTwinProject || activeReplayFrame || !alarmRules.length) return;
+    const evaluated = evaluateAlarmRules(operationalTwinProject, alarmRules, alarmInstances, new Date().toISOString());
+    setAlarmInstances((current) => {
+      const currentComparable = current.map(({ lastEvaluationUtc: _ignored, ...instance }) => instance);
+      const nextComparable = evaluated.instances.map(({ lastEvaluationUtc: _ignored, ...instance }) => instance);
+      return JSON.stringify(currentComparable) === JSON.stringify(nextComparable) ? current : evaluated.instances;
+    });
+    if (!evaluated.events.length) return;
+    setAlarmEvents((current) => [...current, ...evaluated.events].slice(-200));
+    if (historianRecording) {
+      const records: HistorianRecord[] = evaluated.events.map((event, index) => ({ kind: 'event', sourceTimestampUtc: event.timestampUtc, ingestTimestampUtc: event.timestampUtc, sequence: plcDashboard.sequence + index, event }));
+      setHistorianRecords((current) => [...current, ...records]);
+      void historianRef.current.append(operationalTwinProject.id, records).catch((error) => setStatus(error instanceof Error ? error.message : 'Alarm historian write failed'));
+    }
+  }, [operationalTwinProject, alarmRules, activeReplayFrame, plcDashboard.sequence]);
+
+  const addAlarmRule = () => {
+    const signal = operationalTwinProject?.signals.find((item) => item.access === 'read');
+    if (!signal) {
+      setStatus('No readable TwinSignal is available for an alarm rule.');
+      return;
+    }
+    const id = `rule-${Date.now()}`;
+    setAlarmRules((current) => [...current, { id, name: `High ${signal.path}`, priority: 'medium', kind: 'high', signalId: signal.id, limit: 1, onDelayMs: 0, offDelayMs: 0, deadband: 0, enabled: true }]);
+  };
+
+  const updateAlarmRule = (ruleId: string, patch: Partial<AlarmRule>) => setAlarmRules((current) => current.map((rule) => rule.id === ruleId ? { ...rule, ...patch } as AlarmRule : rule));
+  const deleteAlarmRule = (ruleId: string) => {
+    if (!window.confirm('Delete this alarm rule and its current runtime instance?')) return;
+    setAlarmRules((current) => current.filter((rule) => rule.id !== ruleId));
+    setAlarmInstances((current) => current.filter((instance) => instance.ruleId !== ruleId));
+  };
+
+  useEffect(() => {
+    if (!scenarioRunning || !activeScenario) return;
+    let previous = performance.now();
+    const timer = window.setInterval(() => {
+      const now = performance.now();
+      const delta = now - previous;
+      previous = now;
+      setScenarioElapsedMs((elapsed) => {
+        const next = elapsed + delta;
+        if (!activeScenario.loop && next >= activeScenario.durationMs) {
+          setScenarioRunning(false);
+          return activeScenario.durationMs;
+        }
+        return activeScenario.loop ? next % activeScenario.durationMs : next;
+      });
+    }, 50);
+    return () => window.clearInterval(timer);
+  }, [scenarioRunning, activeScenario]);
+
+  const addSimulationScenario = () => {
+    const signal = operationalTwinProject?.signals.find((item) => item.access === 'read');
+    if (!signal) {
+      setStatus('No readable TwinSignal is available for a simulation scenario.');
+      return;
+    }
+    const id = `scenario-${Date.now()}`;
+    const scenario: SimulationScenario = {
+      id,
+      name: 'Signal response scenario',
+      durationMs: 5000,
+      loop: false,
+      metadata: { createdBy: 'operator', platform: 'TwinAxis' },
+      actions: [
+        { atMs: 0, kind: 'reported', signalId: signal.id, value: 0, quality: 'SIMULATED' },
+        { atMs: 2500, kind: 'reported', signalId: signal.id, value: 1, quality: 'SIMULATED' },
+        { atMs: 5000, kind: 'reported', signalId: signal.id, value: 0, quality: 'SIMULATED' },
+      ],
+    };
+    setSimulationScenarios((current) => [...current, scenario]);
+    setActiveScenarioId(id);
+    setScenarioElapsedMs(0);
+  };
+
+  const updateSimulationScenario = (scenarioId: string, patch: Partial<SimulationScenario>) => setSimulationScenarios((current) => current.map((scenario) => scenario.id === scenarioId ? { ...scenario, ...patch } : scenario));
+  const runActiveScenario = () => {
+    if (!activeScenario) return;
+    const validation = validateSimulationScenario(activeScenario);
+    if (validation.length) {
+      setStatus(`Scenario invalid: ${validation.join(' ')}`);
+      return;
+    }
+    setHistorianRecording(false);
+    setReplayFrameIndex(-1);
+    if (scenarioElapsedMs >= activeScenario.durationMs) setScenarioElapsedMs(0);
+    scenarioStartedAtRef.current = new Date().toISOString();
+    setScenarioRunning(true);
+    setStatus(`Simulation scenario running: ${activeScenario.name}`);
+  };
+
+  useEffect(() => {
+    if (!historianRecording || !plcDashboard.frame || !operationalTwinProject) return;
+    const records: HistorianRecord[] = [
+      ...plcDashboard.frame.samples.map((sample) => ({
+        kind: 'sample' as const,
+        sourceTimestampUtc: sample.sourceTimestampUtc ?? sample.ingestTimestampUtc,
+        ingestTimestampUtc: sample.ingestTimestampUtc,
+        sequence: sample.sequence,
+        sample,
+      })),
+      ...operationalTwinProject.events.map((event, index) => ({ kind: 'event' as const, sourceTimestampUtc: event.timestampUtc, ingestTimestampUtc: event.timestampUtc, sequence: plcDashboard.sequence + index, event })),
+      ...operationalTwinProject.commands.map((command, index) => ({ kind: 'command' as const, sourceTimestampUtc: command.requestedAtUtc, ingestTimestampUtc: command.requestedAtUtc, sequence: plcDashboard.sequence + index, command })),
+    ].filter((record) => {
+      const key = `${record.kind}|${record.sourceTimestampUtc}|${record.sequence}`;
+      if (historianRecordKeysRef.current.has(key)) return false;
+      historianRecordKeysRef.current.add(key);
+      return true;
+    });
+    if (!records.length) return;
+    setHistorianRecords((current) => [...current, ...records].sort((a, b) => Date.parse(a.sourceTimestampUtc) - Date.parse(b.sourceTimestampUtc) || a.sequence - b.sequence));
+    void historianRef.current.append(operationalTwinProject.id, records).catch((error) => setStatus(error instanceof Error ? error.message : 'Historian write failed'));
+  }, [historianRecording, plcDashboard.frame, plcDashboard.sequence, operationalTwinProject]);
+
+  const loadRecentHistorian = async () => {
+    if (!operationalTwinProject) return;
+    setHistorianBusy(true);
+    try {
+      const end = new Date();
+      const records = await historianRef.current.query(operationalTwinProject.id, new Date(end.getTime() - 3_600_000).toISOString(), end.toISOString());
+      setHistorianRecords(records);
+      setReplayFrameIndex(records.length ? 0 : -1);
+      historianRecordKeysRef.current = new Set(records.map((record) => `${record.kind}|${record.sourceTimestampUtc}|${record.sequence}`));
+      setStatus(`Historian loaded: ${records.length} records.`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Historian query failed');
+    } finally {
+      setHistorianBusy(false);
+    }
+  };
+
+  const clearHistorian = async () => {
+    if (!operationalTwinProject || !window.confirm('Delete the persisted historian for this twin project?')) return;
+    setHistorianBusy(true);
+    try {
+      await historianRef.current.clear(operationalTwinProject.id);
+      historianRecordKeysRef.current.clear();
+      setHistorianRecords([]);
+      setReplayFrameIndex(-1);
+      setStatus('Historian cleared.');
+    } finally {
+      setHistorianBusy(false);
+    }
+  };
 
   return (
     <main className="app-shell">
       <header className="topbar">
         <div className="brand">
           <Hammer size={19} />
-          <span>3D Asset Forge</span>
+          <span>TwinAxis</span>
         </div>
 
         <div className="toolbar-group">
@@ -4918,7 +6167,10 @@ export const App = () => {
           <button title="Restore autosave" disabled={!autosaveAvailable} onClick={restoreAutosave}>
             <FolderOpen size={18} />
           </button>
-          <input ref={fileInputRef} type="file" accept=".json,.forge.json" hidden onChange={openProjectFile} />
+          <input ref={fileInputRef} type="file" accept=".json,.forge.json,.twin.json" hidden onChange={openProjectFile} />
+          <button title="Import Twin Package" onClick={() => twinPackageInputRef.current?.click()}><Import size={18} /></button>
+          <button title="Export Twin Package" onClick={() => void exportTwinPackage()}><FileJson size={18} /></button>
+          <input ref={twinPackageInputRef} type="file" accept=".twin,.twin.json,application/json" hidden onChange={importTwinPackage} />
         </div>
 
         <div className="toolbar-group segmented">
@@ -5178,7 +6430,7 @@ export const App = () => {
         </aside>
 
         <ThreeViewport
-          document={document}
+          document={viewportDocument}
           tool={tool}
           partEditMode={partEditMode}
           snapEnabled={snapEnabled}
@@ -5188,6 +6440,7 @@ export const App = () => {
           industrialCellDemoActive={industrialCellDemoActive}
           robotCursorGuideNodeId={robotCursorGuideNodeId}
           motionTrainingPreview={motionTrainingPreview}
+          visualState={selectedVisualState}
           onSelect={selectNode}
           onTransformCommit={updateNodeTransform}
           onImportedPartTransformsCommit={updateImportedPartTransforms}
@@ -5219,7 +6472,7 @@ export const App = () => {
 
         {plcDashboard.open && activeView === 'workspace' && (
           <PlcModbusDashboard
-            node={selectedKinematicNode}
+            node={plcControlledKinematicNode ?? selectedKinematicNode}
             state={plcDashboard}
             onStart={startPlcDashboard}
             onStop={stopPlcDashboard}
@@ -5234,10 +6487,18 @@ export const App = () => {
             onPlcScanTargetChange={changePlcScanTarget}
             onToggleOpenPlc={toggleOpenPlc}
             onProbeOpenPlc={probeOpenPlc}
+            onTestPhysicalPlcConnection={testPhysicalPlcConnection}
+            onTestPhysicalPlcReaction={testPhysicalPlcHomeReaction}
+            onTestPhysicalPlcJog={testPhysicalPlcJog}
+            physicalPlcDemoActive={physicalPlcDemoActive}
+            onTogglePhysicalPlcDemo={togglePhysicalPlcStartDemo}
             onOpenPlcCommand={writeOpenPlcCommand}
             onActivateLocalManual={activateLocalManualControl}
             onOpenPlcSensorPolicy={writeOpenPlcSensorPolicy}
             onOpenPlcConfigChange={updateOpenPlcConfig}
+            historianRecording={historianRecording}
+            historianRecordCount={historianRecords.length}
+            onToggleHistorianRecording={() => setHistorianRecording((recording) => !recording)}
             onClose={() => setPlcDashboard((current) => ({ ...current, open: false, running: false }))}
           />
         )}
@@ -5472,7 +6733,41 @@ export const App = () => {
             </button>
           </div>
 
-          <button
+          <div className="inspector-workflow" aria-label="Inspector workflow">
+            <div className="inspector-priority-nav" role="tablist" aria-label="Inspector sections">
+              {([
+                ['object', '1', 'Objeto'],
+                ['mechanics', '2', 'Mecanica'],
+                ['parts', '3', 'Piezas'],
+                ['twin', '4', 'Twin'],
+                ['export', '5', 'Exportar'],
+              ] as Array<[InspectorFocus, string, string]>).map(([focus, order, label]) => (
+                <button
+                  key={focus}
+                  type="button"
+                  role="tab"
+                  aria-selected={inspectorFocus === focus}
+                  className={inspectorFocus === focus ? 'active' : ''}
+                  onClick={() => setInspectorFocus(focus)}
+                  title={`Etapa ${order}: ${label}`}
+                >
+                  <b>{order}</b><span>{label}</span>
+                </button>
+              ))}
+            </div>
+            <div className="inspector-dynamic-guide" role="status" aria-live="polite">
+              <HelpCircle size={16} />
+              <div><strong>{inspectorGuide.title}</strong><p>{inspectorGuide.message}</p></div>
+              {inspectorGuide.action && (
+                <button type="button" onClick={() => setInspectorFocus(inspectorGuide.action!)}>
+                  Ir a {inspectorGuide.action === 'mechanics' ? 'Mecanica' : inspectorGuide.action === 'parts' ? 'Piezas' : 'Twin'}
+                  <ChevronRight size={14} />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {inspectorFocus === 'mechanics' && <button
             className="inspector-advanced-rig-launcher"
             title={selectedNode && graphFromGeometry(selectedNode.geometry) ? 'Open Advanced Rig and its guided tutorial' : 'Select an articulated model to open Advanced Rig'}
             disabled={!selectedNode || !graphFromGeometry(selectedNode.geometry)}
@@ -5481,18 +6776,18 @@ export const App = () => {
             <Settings2 size={16} />
             <span><strong>Advanced Rig</strong><small>Mechanical setup and guided help</small></span>
             <HelpCircle size={15} />
-          </button>
+          </button>}
 
           {selectedNode ? (
             <>
-              <section>
+              {inspectorFocus === 'object' && <section className="inspector-stage-section">
                 <h3>Transform</h3>
                 <VectorEditor label="Position" values={selectedNode.transform.position} onChange={(index, value) => setTransformValue('position', index, value)} />
                 <VectorEditor label="Rotation" values={selectedNode.transform.rotation} step={0.05} onChange={(index, value) => setTransformValue('rotation', index, value)} />
                 <VectorEditor label="Scale" values={selectedNode.transform.scale} step={0.05} onChange={(index, value) => setTransformValue('scale', index, value)} />
-              </section>
+              </section>}
 
-              <section>
+              {inspectorFocus === 'object' && <section className="inspector-stage-section">
                 <h3>Material</h3>
                 <label className="field-row">
                   <span>Preset</span>
@@ -5527,9 +6822,162 @@ export const App = () => {
                 </label>
                 <Slider label="Roughness" value={selectedNode.material.roughness} min={0} max={1} step={0.01} onChange={(value) => setMaterialValue('roughness', value)} />
                 <Slider label="Metalness" value={selectedNode.material.metalness} min={0} max={1} step={0.01} onChange={(value) => setMaterialValue('metalness', value)} />
-              </section>
+              </section>}
 
-              {selectedNode.geometry.kind === 'imported-model' && (
+              {inspectorFocus === 'twin' && inspectedTwinProject && (
+                <section className="twin-inspector" aria-label="Twin Inspector">
+                  <div className="section-title-row"><h3>Twin Inspector</h3><span className="twin-mode-badge">{activeReplayFrame ? 'replay' : inspectedTwinProject.mode}</span></div>
+                  <button
+                    type="button"
+                    className={visualStateOverlayEnabled ? 'wide-action active twin-overlay-toggle' : 'wide-action twin-overlay-toggle'}
+                    title="Show the selected asset operational state without modifying its geometry or materials"
+                    aria-pressed={visualStateOverlayEnabled}
+                    onClick={() => setVisualStateOverlayEnabled((enabled) => !enabled)}
+                  >
+                    {visualStateOverlayEnabled ? <Eye size={15} /> : <EyeOff size={15} />}
+                    <span>State overlay</span>
+                    <i className={`operational-state ${selectedVisualState ?? 'off'}`}>{selectedVisualState ?? 'off'}</i>
+                  </button>
+                  <div className="twin-inspector-summary">
+                    <span><b>{inspectedTwinProject.properties.length}</b> properties</span>
+                    <span><b>{inspectedTwinProject.signalBindings.length}</b> bindings</span>
+                    <span><b>{inspectedTwinProject.connectionHealth.filter((item) => item.state === 'ONLINE').length}</b> online</span>
+                  </div>
+                  <div className="twin-property-list">
+                    {inspectedTwinProject.properties.slice(0, 12).map((property) => {
+                      const binding = inspectedTwinProject.signalBindings.find((item) => item.propertyId === property.id);
+                      const replaySample = Object.values(inspectedTwinProject.state.reportedState).find((sample) => sample.signalId === binding?.propertyId || sample.signalId === property.id);
+                      const live = activeReplayFrame ? undefined : plcDashboard.frame?.digitalTwinState.find((item) => item.jointId === property.metadata.jointId);
+                      return <div className="twin-property-row" key={property.id}>
+                        <span><strong>{property.name}</strong><small>{property.path}</small></span>
+                        <code>{live?.value?.toFixed(4) ?? replaySample?.value?.toString() ?? property.value ?? '--'} {property.unit ?? ''}</code>
+                        <i className={(live?.quality ?? replaySample?.quality ?? property.quality).toLowerCase()}>{live?.quality ?? replaySample?.quality ?? property.quality}</i>
+                        <small>{binding ? `${binding.protocol.toUpperCase()} · ${binding.status}` : 'UNBOUND'}</small>
+                      </div>;
+                    })}
+                  </div>
+                  <div className="live-twin-monitor">
+                    <h4>Live Twin Monitor</h4>
+                    <div><span>Connections</span><strong>{inspectedTwinProject.connectionHealth.length}</strong></div>
+                    <div><span>Events</span><strong>{inspectedTwinProject.events.length}</strong></div>
+                    <div><span>Commands</span><strong>{inspectedTwinProject.commands.length}</strong></div>
+                    <div><span>Alarms</span><strong>{inspectedTwinProject.events.filter((event) => event.type === 'alarm').length}</strong></div>
+                  </div>
+                  <div className="historian-panel" aria-label="Historian and Replay">
+                    <div className="section-title-row"><h4>Historian &amp; Replay</h4><span>{historianRecords.length} records</span></div>
+                    <div className="historian-actions">
+                      <button type="button" className={historianRecording ? 'active' : ''} disabled={Boolean(activeReplayFrame)} onClick={() => setHistorianRecording((recording) => !recording)}>{historianRecording ? <Pause size={13} /> : <Activity size={13} />}<span>{historianRecording ? 'Stop' : 'Record'}</span></button>
+                      <button type="button" disabled={historianBusy} onClick={() => void loadRecentHistorian()}><FolderOpen size={13} /><span>Load 1h</span></button>
+                      <button type="button" disabled={historianBusy || !historianRecords.length} onClick={() => void clearHistorian()}><Trash2 size={13} /><span>Clear</span></button>
+                    </div>
+                    <input aria-label="Replay timeline" type="range" min="-1" max={Math.max(-1, replayFrames.length - 1)} value={Math.min(replayFrameIndex, replayFrames.length - 1)} disabled={!replayFrames.length || historianRecording} onChange={(event) => setReplayFrameIndex(Number(event.target.value))} />
+                    <div className="replay-readout">
+                      <span>{activeReplayFrame ? new Date(activeReplayFrame.virtualTimeUtc).toLocaleTimeString() : 'LIVE'}</span>
+                      <strong>{activeReplayFrame ? `${activeReplayFrame.record.kind} #${activeReplayFrame.sequence}` : 'read/write runtime'}</strong>
+                      <code>{replayFrames.length ? deterministicReplayHash(replayFrames) : 'no replay data'}</code>
+                    </div>
+                    {activeReplayFrame && <button type="button" className="wide-action" onClick={() => setReplayFrameIndex(-1)}><Play size={13} /><span>Return to live</span></button>}
+                  </div>
+                  <div className="alarm-center" aria-label="Twin alarm center">
+                    <div className="section-title-row"><h4>Alarm Center</h4><button type="button" title="Add alarm rule" onClick={addAlarmRule}><AlertTriangle size={13} /><span>Add rule</span></button></div>
+                    <div className="alarm-summary">
+                      <span><b>{alarmInstances.filter((alarm) => alarm.state === 'active').length}</b> active</span>
+                      <span><b>{alarmInstances.filter((alarm) => alarm.state === 'acked').length}</b> acked</span>
+                      <span><b>{alarmInstances.filter((alarm) => alarm.state === 'shelved').length}</b> shelved</span>
+                    </div>
+                    {alarmRules.map((rule) => {
+                      const instance = alarmInstances.find((item) => item.ruleId === rule.id);
+                      const thresholdRule = rule.kind === 'high' || rule.kind === 'low' ? rule : undefined;
+                      const qualityRule = rule.kind === 'quality' ? rule : undefined;
+                      return <div className="alarm-rule-row" key={rule.id}>
+                        <label><span>Name</span><input value={rule.name} onChange={(event) => updateAlarmRule(rule.id, { name: event.target.value })} /></label>
+                        <label><span>Type</span><select value={rule.kind} onChange={(event) => {
+                          const kind = event.target.value as 'high' | 'low' | 'quality';
+                          const signalId = thresholdRule?.signalId ?? qualityRule?.signalId ?? inspectedTwinProject.signals[0]?.id ?? '';
+                          setAlarmRules((current) => current.map((item) => item.id !== rule.id ? item : kind === 'quality'
+                            ? { id: item.id, name: item.name, priority: item.priority, kind, signalId, qualities: ['BAD', 'STALE', 'COMM_LOST'], enabled: item.enabled }
+                            : { id: item.id, name: item.name, priority: item.priority, kind, signalId, limit: 1, deadband: 0, enabled: item.enabled }));
+                        }}><option value="high">High</option><option value="low">Low</option><option value="quality">Quality</option></select></label>
+                        <label><span>Signal</span><select value={thresholdRule?.signalId ?? qualityRule?.signalId ?? ''} onChange={(event) => updateAlarmRule(rule.id, { signalId: event.target.value })}>{inspectedTwinProject.signals.filter((signal) => signal.access === 'read').map((signal) => <option key={signal.id} value={signal.id}>{signal.path}</option>)}</select></label>
+                        {thresholdRule && <label><span>Limit</span><input type="number" step="any" value={thresholdRule.limit} onChange={(event) => updateAlarmRule(rule.id, { limit: Number(event.target.value) })} /></label>}
+                        <label><span>Priority</span><select value={rule.priority} onChange={(event) => updateAlarmRule(rule.id, { priority: event.target.value as AlarmPriority })}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option></select></label>
+                        <button type="button" className={rule.enabled ? 'active icon' : 'icon'} title={rule.enabled ? 'Disable alarm rule' : 'Enable alarm rule'} onClick={() => updateAlarmRule(rule.id, { enabled: !rule.enabled })}><Activity size={13} /></button>
+                        <button type="button" className="icon danger" title="Delete alarm rule" onClick={() => deleteAlarmRule(rule.id)}><Trash2 size={13} /></button>
+                        <div className={`alarm-instance-state ${instance?.state ?? 'normal'}`}><strong>{instance?.state ?? 'normal'}</strong><small>{instance?.message ?? 'Waiting for evaluation'}</small></div>
+                        {instance?.state === 'active' && <button type="button" onClick={() => setAlarmInstances((current) => acknowledgeAlarm(current, instance.instanceId))}>Acknowledge</button>}
+                        {instance && !['normal', 'cleared', 'shelved'].includes(instance.state) && <button type="button" onClick={() => setAlarmInstances((current) => shelveAlarm(current, instance.instanceId, new Date(Date.now() + 600_000).toISOString()))}>Shelve 10m</button>}
+                      </div>;
+                    })}
+                    {!alarmRules.length && <p>No alarm rules configured. Add a rule and bind it to a readable TwinSignal.</p>}
+                    {alarmEvents.slice(-3).reverse().map((event) => <div className={`alarm-event ${event.severity}`} key={event.id}><span>{new Date(event.timestampUtc).toLocaleTimeString()}</span><strong>{event.message}</strong></div>)}
+                  </div>
+                  <div className="scenario-studio" aria-label="Simulation Scenario Studio">
+                    <div className="section-title-row"><h4>Scenario Studio</h4><button type="button" title="Create simulation scenario" onClick={addSimulationScenario}><Sparkles size={13} /><span>New</span></button></div>
+                    {simulationScenarios.length > 0 && <label><span>Scenario</span><select value={activeScenarioId ?? ''} onChange={(event) => { setActiveScenarioId(event.target.value || undefined); setScenarioElapsedMs(0); setScenarioRunning(false); }}><option value="">Select...</option>{simulationScenarios.map((scenario) => <option key={scenario.id} value={scenario.id}>{scenario.name}</option>)}</select></label>}
+                    {activeScenario && <>
+                      <div className="scenario-fields">
+                        <label><span>Name</span><input value={activeScenario.name} onChange={(event) => updateSimulationScenario(activeScenario.id, { name: event.target.value })} /></label>
+                        <label><span>Duration ms</span><input type="number" min="100" value={activeScenario.durationMs} onChange={(event) => updateSimulationScenario(activeScenario.id, { durationMs: Math.max(100, Number(event.target.value)) })} /></label>
+                        <label className="scenario-loop"><input type="checkbox" checked={activeScenario.loop} onChange={(event) => updateSimulationScenario(activeScenario.id, { loop: event.target.checked })} /><span>Loop</span></label>
+                      </div>
+                      <div className="scenario-actions-list">
+                        {activeScenario.actions.map((action, index) => action.kind === 'reported' ? <div key={`${activeScenario.id}-${index}`}>
+                          <input aria-label={`Action ${index + 1} time`} type="number" min="0" max={activeScenario.durationMs} value={action.atMs} onChange={(event) => updateSimulationScenario(activeScenario.id, { actions: activeScenario.actions.map((item, itemIndex) => itemIndex === index ? { ...action, atMs: Number(event.target.value) } : item) })} />
+                          <select aria-label={`Action ${index + 1} signal`} value={action.signalId} onChange={(event) => updateSimulationScenario(activeScenario.id, { actions: activeScenario.actions.map((item, itemIndex) => itemIndex === index ? { ...action, signalId: event.target.value } : item) })}>{inspectedTwinProject.signals.filter((signal) => signal.access === 'read').map((signal) => <option key={signal.id} value={signal.id}>{signal.path}</option>)}</select>
+                          <input aria-label={`Action ${index + 1} value`} type="number" step="any" value={typeof action.value === 'number' ? action.value : Number(action.value) || 0} onChange={(event) => updateSimulationScenario(activeScenario.id, { actions: activeScenario.actions.map((item, itemIndex) => itemIndex === index ? { ...action, value: Number(event.target.value) } : item) })} />
+                          <button type="button" className="icon danger" title="Delete scenario action" onClick={() => updateSimulationScenario(activeScenario.id, { actions: activeScenario.actions.filter((_, itemIndex) => itemIndex !== index) })}><Trash2 size={12} /></button>
+                        </div> : null)}
+                      </div>
+                      <button type="button" className="wide-action" onClick={() => {
+                        const signal = inspectedTwinProject.signals.find((item) => item.access === 'read');
+                        if (signal) updateSimulationScenario(activeScenario.id, { actions: [...activeScenario.actions, { atMs: Math.min(activeScenario.durationMs, scenarioElapsedMs), kind: 'reported', signalId: signal.id, value: 0, quality: 'SIMULATED' }] });
+                      }}><Activity size={13} /><span>Add signal action</span></button>
+                      <input aria-label="Scenario timeline" type="range" min="0" max={activeScenario.durationMs} value={Math.min(scenarioElapsedMs, activeScenario.durationMs)} onChange={(event) => { setScenarioRunning(false); setScenarioElapsedMs(Number(event.target.value)); }} />
+                      <div className="scenario-transport">
+                        <button type="button" className={scenarioRunning ? 'active' : ''} onClick={scenarioRunning ? () => setScenarioRunning(false) : runActiveScenario}>{scenarioRunning ? <Pause size={13} /> : <Play size={13} />}<span>{scenarioRunning ? 'Pause' : 'Run'}</span></button>
+                        <button type="button" onClick={() => { setScenarioRunning(false); setScenarioElapsedMs(0); }}><RotateCw size={13} /><span>Reset</span></button>
+                        <strong>{Math.round(scenarioElapsedMs)} / {activeScenario.durationMs} ms</strong>
+                      </div>
+                      <div className="scenario-status"><span>{scenarioFrame?.appliedActionIndexes.length ?? 0} actions applied</span><strong>{scenarioFrame?.complete ? 'COMPLETE' : scenarioRunning ? 'RUNNING' : 'READY'}</strong><code>SIMULATION ONLY | no adapter writes</code></div>
+                    </>}
+                    {!simulationScenarios.length && <p>No scenarios. Create one from a readable TwinSignal.</p>}
+                  </div>
+                  <div className="twin-operational-detail" aria-label="Operational state details">
+                    <h4>Operational State</h4>
+                    <div><span>Authority</span><strong>{plcDashboard.openPlc.enabled ? 'OpenPLC' : plcDashboard.localManualActive ? 'Local manual' : 'Internal PLC'}</strong></div>
+                    <div><span>Mode</span><strong>{['MANUAL / HOLD', 'AUTO', 'HOME'][plcDashboard.openPlc.command] ?? 'UNKNOWN'}</strong></div>
+                    <div><span>Condition</span><strong>{plcConditionState ?? '--'}</strong></div>
+                    <div><span>Alarm</span><strong>{plcAlarmCode ?? '--'}</strong></div>
+                  </div>
+                  <div className="twin-activity-list">
+                    <h4>Connections</h4>
+                    {inspectedTwinProject.connectionHealth.slice(0, 4).map((connection) => (
+                      <div key={connection.connectionId}><span>{connection.protocol.toUpperCase()}</span><strong className={connection.state.toLowerCase()}>{connection.state}</strong><small>{connection.message ?? connection.connectionId}</small></div>
+                    ))}
+                    {!inspectedTwinProject.connectionHealth.length && <p>No connection telemetry.</p>}
+                    <h4>Recent Events</h4>
+                    {inspectedTwinProject.events.slice(-4).reverse().map((event) => (
+                      <div key={event.id}><span>{event.type}</span><strong className={event.severity}>{event.severity}</strong><small>{event.message}</small></div>
+                    ))}
+                    {!inspectedTwinProject.events.length && <p>No runtime events recorded.</p>}
+                    <h4>Recent Commands</h4>
+                    {inspectedTwinProject.commands.slice(-3).reverse().map((command) => (
+                      <div key={command.id}><span>{command.signalId}</span><strong>{command.status}</strong><small>{String(command.requestedValue)}</small></div>
+                    ))}
+                    {!inspectedTwinProject.commands.length && <p>No governed commands recorded.</p>}
+                  </div>
+                </section>
+              )}
+              {inspectorFocus === 'twin' && !inspectedTwinProject && (
+                <div className="inspector-stage-empty">
+                  <Activity size={18} />
+                  <strong>Sin modelo Twin operativo</strong>
+                  <p>Abre Mecanica, analiza las articulaciones y guarda la configuracion para preparar sus senales y bindings.</p>
+                  <button type="button" onClick={() => setInspectorFocus('mechanics')}>Ir a Mecanica</button>
+                </div>
+              )}
+
+              {inspectorFocus === 'parts' && selectedNode.geometry.kind === 'imported-model' && (
                 <section>
                   <div className="section-title-row">
                     <h3>Parts Editor</h3>
@@ -5614,7 +7062,7 @@ export const App = () => {
                 </section>
               )}
 
-              {selectedNode.geometry.kind === 'serialized-object' && (
+              {inspectorFocus === 'parts' && selectedNode.geometry.kind === 'serialized-object' && (
                 <section>
                   <div className="section-title-row">
                     <h3>Stored Part</h3>
@@ -5640,8 +7088,15 @@ export const App = () => {
                   </div>
                 </section>
               )}
+              {inspectorFocus === 'parts' && !['imported-model', 'serialized-object'].includes(selectedNode.geometry.kind) && (
+                <div className="inspector-stage-empty">
+                  <Cuboid size={18} />
+                  <strong>Este objeto no contiene piezas importadas</strong>
+                  <p>Selecciona un modelo GLB, FBX u OBJ compuesto para editar, desmontar y almacenar sus piezas.</p>
+                </div>
+              )}
 
-              <GeometryInspector
+              {inspectorFocus === 'mechanics' && <GeometryInspector
                 node={selectedNode}
                 setGeometryValue={setGeometryValue}
                 setImportedJointMotion={setImportedJointMotion}
@@ -5665,6 +7120,7 @@ export const App = () => {
                 updateKinematicGraph={updateKinematicGraphForNode}
                 startKinematicEdit={startKinematicEditForNode}
                 acceptKinematicJoint={acceptKinematicJointForNode}
+                commitKinematicJointFrame={commitKinematicJointFrameForNode}
                 rejectKinematicJoint={rejectKinematicJointForNode}
                 deleteKinematicJoint={deleteKinematicJointForNode}
                 createKinematicJoint={createKinematicJointForNode}
@@ -5672,13 +7128,13 @@ export const App = () => {
                 robotCursorGuideActive={robotCursorGuideNodeId === selectedNode.id}
                 toggleRobotCursorGuide={toggleRobotCursorGuideForNode}
                 randomizeGenerator={randomizeGenerator}
-              />
+              />}
             </>
           ) : (
             <div className="empty-state">Select an object in the viewport or scene tree.</div>
           )}
 
-          <section>
+          {inspectorFocus === 'export' && <section className="inspector-stage-section">
             <div className="section-title-row">
               <h3>Export Center</h3>
               <button title="Run preflight" onClick={runPreflight}>
@@ -5742,7 +7198,7 @@ export const App = () => {
                 <span>{exportReport.visibleObjects} visible</span>
               </div>
             )}
-          </section>
+          </section>}
         </aside>
       </section>
       ) : (
@@ -5768,6 +7224,12 @@ export const App = () => {
             </div>
           </div>
           <div className="warehouse-dashboard-actions">
+            <label className="warehouse-search"><Focus size={14} /><input aria-label="Search functional library" placeholder="Search code, name, class..." value={warehouseQuery} onChange={(event) => setWarehouseQuery(event.target.value)} /></label>
+            <div className="warehouse-type-filter" aria-label="Warehouse item type filter">
+              <button type="button" className={warehouseTypeFilter === 'all' ? 'active' : ''} onClick={() => setWarehouseTypeFilter('all')}>All</button>
+              <button type="button" className={warehouseTypeFilter === 'part' ? 'active' : ''} onClick={() => setWarehouseTypeFilter('part')}>Parts</button>
+              <button type="button" className={warehouseTypeFilter === 'assembly' ? 'active' : ''} onClick={() => setWarehouseTypeFilter('assembly')}>Assemblies</button>
+            </div>
             <button title="Send selected warehouse item to scene" disabled={!selectedWarehouseItem} onClick={() => selectedWarehouseItem && addWarehouseItemToScene(selectedWarehouseItem)}>
               <Import size={16} />
               <span>To Scene</span>
@@ -5869,6 +7331,40 @@ export const App = () => {
             <div className="warehouse-empty-dashboard">No stored parts yet.</div>
           )}
         </div>
+        {selectedWarehouseItem && <aside className="functional-library-inspector" aria-label="Functional library inspector" onClick={(event) => event.stopPropagation()}>
+          <header><div><strong>{selectedWarehouseItem.name}</strong><small>{selectedWarehouseItem.code} | {selectedWarehouseItem.itemType}</small></div><button type="button" title="Close component inspector" onClick={() => setDocument((current) => ({ ...current, selectedWarehouseItemId: undefined }))}><X size={15} /></button></header>
+          {selectedWarehouseItem.itemType === 'part' && selectedWarehouseItem.functionalComponent ? <>
+            <section className="component-identity-grid">
+              <label><span>Name</span><input value={selectedWarehouseItem.functionalComponent.name} onChange={(event) => updateSelectedFunctionalComponent({ name: event.target.value })} /></label>
+              <label><span>Category</span><input value={selectedWarehouseItem.functionalComponent.category} onChange={(event) => updateSelectedFunctionalComponent({ category: event.target.value })} /></label>
+              <label><span>Class</span><input value={selectedWarehouseItem.functionalComponent.className} onChange={(event) => updateSelectedFunctionalComponent({ className: event.target.value })} /></label>
+              <label><span>Role</span><select value={selectedWarehouseItem.functionalComponent.mechanicalProperties.role} onChange={(event) => updateSelectedFunctionalComponent({ mechanicalProperties: { ...selectedWarehouseItem.functionalComponent!.mechanicalProperties, role: event.target.value as FunctionalComponent['mechanicalProperties']['role'] } })}><option value="base">Base</option><option value="link">Link</option><option value="joint">Joint</option><option value="end-effector">End effector</option><option value="drive">Drive</option><option value="panel">Panel</option><option value="generic">Generic</option></select></label>
+            </section>
+            <div className="component-metrics"><span><b>{selectedWarehouseItem.functionalComponent.interfaces.length}</b> interfaces</span><span><b>{selectedWarehouseItem.functionalComponent.twinProperties?.length ?? 0}</b> properties</span><span><b>{selectedWarehouseItem.functionalComponent.mechanicalProperties.massEstimateKg?.toFixed(3) ?? '--'}</b> kg est.</span></div>
+            <h3>Mechanical Interfaces</h3>
+            <div className="mechanical-interface-list">
+              {selectedWarehouseItem.functionalComponent.interfaces.map((item) => <div key={item.id}>
+                <input aria-label={`${item.id} name`} value={item.name} onChange={(event) => updateSelectedMechanicalInterface(item.id, { name: event.target.value, source: 'manual' })} />
+                <select aria-label={`${item.id} kind`} value={item.kind} onChange={(event) => updateSelectedMechanicalInterface(item.id, { kind: event.target.value as MechanicalInterfaceKind, source: 'manual', confidence: 1 })}>{(['axis', 'hinge', 'support', 'rail', 'shaft', 'mount', 'gripper', 'surface'] as MechanicalInterfaceKind[]).map((kind) => <option key={kind} value={kind}>{kind}</option>)}</select>
+                <code>{item.axis?.map((value) => value.toFixed(2)).join(', ') ?? 'frame'}</code><strong>{Math.round(item.confidence * 100)}%</strong>
+              </div>)}
+            </div>
+          </> : selectedWarehouseItem.itemType === 'assembly' && selectedWarehouseItem.functionalAssembly ? <>
+            <div className={`assembly-validation-banner ${selectedWarehouseItem.functionalAssembly.metadata.validationStatus}`}><ShieldCheck size={15} /><span><strong>{selectedWarehouseItem.functionalAssembly.metadata.validationStatus.toUpperCase()}</strong><small>{selectedWarehouseItem.functionalAssembly.components.length} components | {selectedWarehouseItem.functionalAssembly.connections.length} connections</small></span></div>
+            <h3>Assembly Connections</h3>
+            <div className="assembly-connection-list">
+              {selectedWarehouseItem.functionalAssembly.connections.map((connection) => <div key={connection.id} className={`assembly-connection ${connection.status}`}>
+                <header><strong>{connection.name}</strong><select value={connection.status} onChange={(event) => updateSelectedAssemblyConnection(connection.id, (current) => ({ ...current, status: event.target.value as AssemblyConnection['status'] }))}><option value="candidate">Candidate</option><option value="validated">Validated</option><option value="manual">Manual</option><option value="rejected">Rejected</option></select></header>
+                <label><span>Joint</span><select value={connection.joint.type} onChange={(event) => updateSelectedAssemblyConnection(connection.id, (current) => ({ ...current, source: 'manual', status: 'manual', joint: { ...current.joint, type: event.target.value as AssemblyConnection['joint']['type'], limits: event.target.value === 'fixed' ? undefined : current.joint.limits ?? { lower: -1, upper: 1 } } }))}><option value="fixed">Fixed</option><option value="revolute">Revolute</option><option value="continuous">Continuous</option><option value="prismatic">Prismatic</option></select></label>
+                <div className="connection-axis">{connection.joint.axis.map((value, index) => <label key={index}><span>{['X', 'Y', 'Z'][index]}</span><input type="number" step="0.1" value={value} onChange={(event) => updateSelectedAssemblyConnection(connection.id, (current) => ({ ...current, source: 'manual', status: 'manual', joint: { ...current.joint, axis: current.joint.axis.map((axisValue, axisIndex) => axisIndex === index ? Number(event.target.value) : axisValue) as [number, number, number] } }))} /></label>)}</div>
+                {connection.joint.limits && <div className="connection-limits"><label><span>Lower</span><input type="number" step="0.01" value={connection.joint.limits.lower ?? 0} onChange={(event) => updateSelectedAssemblyConnection(connection.id, (current) => ({ ...current, source: 'manual', status: 'manual', joint: { ...current.joint, limits: { ...current.joint.limits!, lower: Number(event.target.value) } } }))} /></label><label><span>Upper</span><input type="number" step="0.01" value={connection.joint.limits.upper ?? 0} onChange={(event) => updateSelectedAssemblyConnection(connection.id, (current) => ({ ...current, source: 'manual', status: 'manual', joint: { ...current.joint, limits: { ...current.joint.limits!, upper: Number(event.target.value) } } }))} /></label></div>}
+                <small>{connection.parentComponentId} {'->'} {connection.childComponentId} | confidence {Math.round(connection.confidence * 100)}%</small>
+              </div>)}
+            </div>
+            <h3>Validation</h3>
+            <div className="assembly-validation-list">{selectedWarehouseItem.functionalAssembly.metadata.validationMessages.length ? selectedWarehouseItem.functionalAssembly.metadata.validationMessages.map((message) => <div key={message}><AlertTriangle size={12} /><span>{message}</span></div>) : <div><Check size={12} /><span>No assembly issues detected.</span></div>}</div>
+          </> : <div className="empty-state compact">This legacy item has no functional metadata. Re-store it to generate a FunctionalComponent.</div>}
+        </aside>}
       </section>
       )}
 
@@ -5908,6 +7404,13 @@ export const App = () => {
               <div className="viewport-context-head">
                 <strong>{workspaceMenuJoint.name}</strong>
                 <span>{workspaceMenuJoint.type} | {workspaceMenuJoint.status === 'validated' ? 'Validated' : workspaceMenuJoint.status === 'rejected' ? 'Rejected' : 'Candidate'}</span>
+                {workspaceMenuJoint.type !== 'fixed' && (
+                  <span>
+                    Range: {workspaceMenuJoint.type === 'prismatic'
+                      ? `${workspaceMenuJoint.limits?.lower ?? -1} to ${workspaceMenuJoint.limits?.upper ?? 1} model units`
+                      : `${Number(THREE.MathUtils.radToDeg(workspaceMenuJoint.limits?.lower ?? (workspaceMenuJoint.type === 'continuous' ? -Math.PI * 2 : -Math.PI)).toFixed(2))} to ${Number(THREE.MathUtils.radToDeg(workspaceMenuJoint.limits?.upper ?? (workspaceMenuJoint.type === 'continuous' ? Math.PI * 2 : Math.PI)).toFixed(2))} deg`}
+                  </span>
+                )}
               </div>
               {workspaceMenuJointIds.length > 1 && (
                 <div className="nearby-joints">
@@ -5926,6 +7429,37 @@ export const App = () => {
                 <div className="context-note">Fixed Joint. No relative movement.</div>
               ) : (
                 <>
+                  <button title="Set the minimum and maximum movement allowed for this joint and store it with the model." onClick={() => openJointRangeEditor(workspaceMenu.nodeId, workspaceMenuJoint)}>
+                    <Settings2 size={15} />
+                    <span>Edit Movement Range</span>
+                  </button>
+                  {jointRangeEditor?.nodeId === workspaceMenu.nodeId && jointRangeEditor.jointId === workspaceMenuJoint.id && (
+                    <div className="joint-range-editor" data-testid="joint-range-editor">
+                      <div className="joint-range-editor-head">
+                        <strong>Allowed movement</strong>
+                        <span>{workspaceMenuJoint.type === 'prismatic' ? 'Model units' : 'Degrees'}</span>
+                      </div>
+                      <label>
+                        <span>Minimum</span>
+                        <input aria-label="Joint range minimum" type="number" step={workspaceMenuJoint.type === 'prismatic' ? 0.01 : 1} value={jointRangeEditor.lower} onChange={(event) => setJointRangeEditor((current) => current ? { ...current, lower: event.target.value, error: undefined } : current)} />
+                      </label>
+                      <label>
+                        <span>Maximum</span>
+                        <input aria-label="Joint range maximum" type="number" step={workspaceMenuJoint.type === 'prismatic' ? 0.01 : 1} value={jointRangeEditor.upper} onChange={(event) => setJointRangeEditor((current) => current ? { ...current, upper: event.target.value, error: undefined } : current)} />
+                      </label>
+                      {jointRangeEditor.error && <div className="joint-range-error" role="alert">{jointRangeEditor.error}</div>}
+                      <div className="joint-range-actions">
+                        <button className="primary" title="Validate and store this movement range in the model kinematic graph." onClick={saveJointRange}>
+                          <Save size={14} />
+                          <span>Save Range</span>
+                        </button>
+                        <button title="Discard the range values currently being edited." onClick={() => setJointRangeEditor(undefined)}>
+                          <X size={14} />
+                          <span>Cancel</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
                   <button title="Runs a safe movement sequence for this joint so you can visually verify whether its mechanical behavior is correct." onClick={() => startViewportJointTest(workspaceMenu.nodeId, workspaceMenuJoint.id, 'movement')}>
                     <Play size={15} />
                     <span>Test Movement</span>
@@ -6109,7 +7643,7 @@ export const App = () => {
         />
         {traceAuditDrawerOpen && (
           <TraceAuditDashboard
-            node={selectedKinematicNode}
+            node={plcControlledKinematicNode ?? selectedKinematicNode}
             state={plcDashboard}
             onClose={() => setTraceAuditDrawerOpen(false)}
           />
@@ -6154,7 +7688,12 @@ export const App = () => {
           nodes={document.nodes.filter((node) => Boolean(graphFromGeometry(node.geometry)))}
           selectedNodeId={selectedKinematicNode?.id}
           state={plcDashboard}
+          connectionProfiles={connectionProfiles}
+          connectionHealth={connectionHealth}
           onApply={applyRegisterDefinitions}
+          onApplyConnectionProfiles={applyConnectionProfiles}
+          onConnectProfile={(profile) => void connectIndustrialProfile(profile)}
+          onDisconnectProfile={(profile) => void disconnectIndustrialProfile(profile)}
           onClose={() => setInternalSettingsOpen(false)}
         />
       )}
@@ -6189,24 +7728,42 @@ type InternalConfigurationCenterProps = {
   nodes: SceneNode[];
   selectedNodeId?: string;
   state: PlcDashboardState;
+  connectionProfiles: ConnectionProfile[];
+  connectionHealth: Record<string, ConnectionHealth>;
   onApply: (definitions: InternalRegisterDefinition[]) => void;
+  onApplyConnectionProfiles: (profiles: ConnectionProfile[]) => void;
+  onConnectProfile: (profile: ConnectionProfile) => void;
+  onDisconnectProfile: (profile: ConnectionProfile) => void;
   onClose: () => void;
 };
 
-const InternalConfigurationCenter = ({ definitions, nodes, selectedNodeId, state, onApply, onClose }: InternalConfigurationCenterProps) => {
+const InternalConfigurationCenter = ({ definitions, nodes, selectedNodeId, state, connectionProfiles, connectionHealth, onApply, onApplyConnectionProfiles, onConnectProfile, onDisconnectProfile, onClose }: InternalConfigurationCenterProps) => {
   const [draftDefinitions, setDraftDefinitions] = useState<InternalRegisterDefinition[]>(definitions);
+  const [draftProfiles, setDraftProfiles] = useState<ConnectionProfile[]>(connectionProfiles);
   const [editing, setEditing] = useState(false);
   const [confirmation, setConfirmation] = useState<'save' | 'discard'>();
-  useEffect(() => { if (!editing) setDraftDefinitions(definitions); }, [definitions, editing]);
-  const dirty = JSON.stringify(draftDefinitions) !== JSON.stringify(definitions);
+  useEffect(() => {
+    if (!editing) setDraftDefinitions((current) => JSON.stringify(current) === JSON.stringify(definitions) ? current : definitions);
+  }, [definitions, editing]);
+  useEffect(() => {
+    if (!editing) setDraftProfiles((current) => JSON.stringify(current) === JSON.stringify(connectionProfiles) ? current : connectionProfiles);
+  }, [connectionProfiles, editing]);
+  const dirty = JSON.stringify(draftDefinitions) !== JSON.stringify(definitions) || JSON.stringify(draftProfiles) !== JSON.stringify(connectionProfiles);
   const updateDraft = (id: string, patch: Partial<InternalRegisterDefinition>) => setDraftDefinitions((current) => current.map((entry) => entry.id === id ? { ...entry, ...patch } : entry));
+  const updateProfile = (id: string, patch: Partial<ConnectionProfile>) => setDraftProfiles((current) => current.map((profile) => profile.id === id ? { ...profile, ...patch } : profile));
+  const addProfile = (protocol: 'mqtt' | 'opcua') => {
+    const id = `${protocol}-${Date.now()}`;
+    setDraftProfiles((current) => [...current, protocol === 'mqtt'
+      ? { id, name: 'MQTT Broker', protocol, endpoint: 'ws://127.0.0.1:9001', enabled: false, autoReconnect: true, reconnectDelayMs: 1500, metadata: {} }
+      : { id, name: 'OPC UA Gateway', protocol, endpoint: 'http://127.0.0.1:8088', enabled: false, autoReconnect: true, reconnectDelayMs: 2000, metadata: { endpointUrl: 'opc.tcp://127.0.0.1:4840', securityPolicy: 'None' } }]);
+  };
   const addDraft = () => {
     const node = nodes.find((item) => item.id === selectedNodeId);
     const graph = node ? graphFromGeometry(node.geometry) : undefined;
     const assigned = new Set(draftDefinitions.filter((entry) => entry.robotNodeId === selectedNodeId).map((entry) => entry.jointId));
     const joint = graph?.joints.find((item) => item.type !== 'fixed' && !assigned.has(item.id)) ?? graph?.joints.find((item) => item.type !== 'fixed');
     const nextWire = Math.min(65534, Math.max(99, ...draftDefinitions.map((entry) => entry.wire)) + 1);
-    setDraftDefinitions((current) => [...current, { id: `custom-${Date.now()}`, wire: nextWire, semantic: joint ? `Custom control / ${joint.name}` : 'Custom holding register', encoding: 'int16-rad-x10000', access: 'read-write', enabled: true, role: joint ? 'joint' : 'custom', robotNodeId: selectedNodeId, jointId: joint?.id }]);
+    setDraftDefinitions((current) => [...current, { id: `custom-${Date.now()}`, wire: nextWire, semantic: joint ? `Custom control / ${joint.name}` : 'Custom holding register', encoding: 'int16-rad-x10000', access: 'read-write', enabled: true, role: joint ? 'joint' : 'custom', robotNodeId: selectedNodeId, jointId: joint?.id, connectionId: 'openplc-main', protocol: 'modbus', scale: 0.0001, offset: 0, unit: joint?.type === 'prismatic' ? 'm' : 'rad', pollingMs: 250 }]);
   };
   const restoreDraft = () => {
     const node = nodes.find((item) => item.id === selectedNodeId);
@@ -6225,6 +7782,13 @@ const InternalConfigurationCenter = ({ definitions, nodes, selectedNodeId, state
   const collisions = new Set([...occupied.values()].filter((ids) => ids.length > 1).flat());
   const enabledCount = draftDefinitions.filter((entry) => entry.enabled).length;
   const boundJointCount = draftDefinitions.filter((entry) => entry.enabled && entry.jointId).length;
+  const runtimeConnections = draftProfiles.map((profile) => {
+    const persistedProfile = connectionProfiles.find((item) => item.id === profile.id);
+    const health = profile.protocol === 'modbus'
+      ? { state: state.openPlc.online && state.openPlc.runtimeRunning !== false ? 'ONLINE' : state.openPlc.online ? 'DEGRADED' : state.openPlc.enabled ? 'CONNECTING' : 'DISCONNECTED', message: state.openPlc.runtimeIssue ?? state.openPlc.error ?? state.openPlc.diagnostics ?? 'FC03 holding registers' }
+      : connectionHealth[profile.id] ?? { state: 'DISCONNECTED', message: 'Not tested' };
+    return { profile, persistedProfile, health, connection: { rx: profile.protocol === 'modbus' ? state.openPlc.received : 0, detail: health.message } };
+  });
   const liveValue = (entry: InternalRegisterDefinition) => {
     const register = state.frame?.physicalRegisters.find((item) => item.jointId === entry.jointId);
     if (register) return register.value.toFixed(5);
@@ -6250,7 +7814,7 @@ const InternalConfigurationCenter = ({ definitions, nodes, selectedNodeId, state
   return (
     <aside className="internal-settings-center" aria-label="Internal PLC configuration center">
       <header>
-        <div><Settings2 size={17} /><span><strong>Internal Configuration Center</strong><small>PLC registers, OpenPLC wires and robot joint bindings</small></span></div>
+        <div><Settings2 size={17} /><span><strong>TwinAxis Signal Mapping</strong><small>TwinProperty bindings, protocol addresses and engineering transforms</small></span></div>
         <button type="button" title="Close internal configuration" aria-label="Close internal configuration" onClick={() => dirty ? setConfirmation('discard') : onClose()}><X size={17} /></button>
       </header>
       <div className="internal-settings-summary">
@@ -6263,9 +7827,28 @@ const InternalConfigurationCenter = ({ definitions, nodes, selectedNodeId, state
         <Activity size={15} />
         <span><strong>{state.openPlc.online ? 'OpenPLC ONLINE' : state.running ? 'Internal PLC RUNNING' : 'Configuration mode'}</strong><small>Wire <code>%QWn</code> maps to conventional holding register <code>HR {40001}+n</code>. Changes rebuild the digital-twin bindings and persist in this browser.</small></span>
       </div>
+      <div className="connection-manager" aria-label="TwinAxis Connection Manager">
+        <div className="connection-manager-title"><Link2 size={14} /><span><strong>Connection Manager</strong><small>Protocol endpoints and runtime health</small></span></div>
+        <div className="connection-manager-grid">
+          {runtimeConnections.map(({ profile, persistedProfile, health, connection }) => <div className="connection-card connection-profile-card" key={profile.id}>
+            <div><input aria-label={`${profile.name} name`} disabled={!editing} value={profile.name} onChange={(event) => updateProfile(profile.id, { name: event.target.value })} /><i className={health.state.toLowerCase()}>{health.state}</i></div>
+            <span>{profile.protocol === 'opcua' ? 'OPC UA via HTTP gateway' : profile.protocol === 'mqtt' ? 'MQTT over WebSocket' : 'Modbus TCP'}</span>
+            <input aria-label={`${profile.name} endpoint`} disabled={!editing || profile.protocol === 'modbus'} value={profile.protocol === 'modbus' ? `${state.openPlc.host}:${state.openPlc.port}` : profile.endpoint} onChange={(event) => updateProfile(profile.id, { endpoint: event.target.value })} />
+            <small>RX {connection.rx} · {connection.detail}</small>
+            {profile.protocol === 'opcua' && <input aria-label="OPC UA server endpoint" disabled={!editing} value={String(profile.metadata.endpointUrl ?? '')} onChange={(event) => updateProfile(profile.id, { metadata: { ...profile.metadata, endpointUrl: event.target.value } })} />}
+            <div className="connection-profile-actions">
+              <label><input type="checkbox" disabled={!editing} checked={profile.enabled} onChange={(event) => updateProfile(profile.id, { enabled: event.target.checked })} />Enabled</label>
+              {profile.protocol !== 'modbus' && <button type="button" disabled={dirty || !persistedProfile?.enabled} onClick={() => persistedProfile && (health.state === 'ONLINE' ? onDisconnectProfile(persistedProfile) : onConnectProfile(persistedProfile))}>{health.state === 'ONLINE' ? 'Disconnect' : 'Test connection'}</button>}
+              {editing && profile.protocol !== 'modbus' && <button type="button" className="icon danger" title="Remove connection profile" onClick={() => setDraftProfiles((current) => current.filter((item) => item.id !== profile.id))}><Trash2 size={13} /></button>}
+            </div>
+          </div>)}
+        </div>
+      </div>
       <div className="internal-register-toolbar">
         <button type="button" className={`configuration-edit-toggle ${editing ? 'editing' : ''}`} onClick={() => { setEditing((active) => !active); if (editing && dirty) setConfirmation('discard'); }}><Unlock size={14} />{editing ? 'Editing enabled' : 'Enable editing'}</button>
         <button type="button" disabled={!editing} onClick={addDraft}><Link2 size={14} />Add register</button>
+        <button type="button" disabled={!editing} onClick={() => addProfile('mqtt')}>Add MQTT</button>
+        <button type="button" disabled={!editing} onClick={() => addProfile('opcua')}>Add OPC UA</button>
         <button type="button" disabled={!editing} onClick={restoreDraft}><RotateCw size={14} />Restore documented map</button>
         <button type="button" className="save-configuration" disabled={!editing || !dirty || collisions.size > 0} onClick={() => setConfirmation('save')}><Save size={14} />Save changes</button>
         <button type="button" disabled={!editing || !dirty} onClick={() => setConfirmation('discard')}><X size={14} />Cancel changes</button>
@@ -6286,13 +7869,23 @@ const InternalConfigurationCenter = ({ definitions, nodes, selectedNodeId, state
               <label className="binding-fields"><span>Robot / joint</span><select disabled={!editing} value={entry.robotNodeId ?? ''} onChange={(event) => { const nodeId = event.target.value || undefined; const joint = nodeId ? jointsByNode.get(nodeId)?.[0] : undefined; updateDraft(entry.id, { robotNodeId: nodeId, jointId: joint?.id, role: joint ? 'joint' : entry.role }); }}><option value="">System / unbound</option>{nodes.map((node) => <option value={node.id} key={node.id}>{node.name}</option>)}</select><select value={entry.jointId ?? ''} disabled={!editing || !entry.robotNodeId} onChange={(event) => updateDraft(entry.id, { jointId: event.target.value || undefined, role: event.target.value ? 'joint' : entry.role })}><option value="">No joint</option>{entryJoints.map((joint) => <option value={joint.id} key={joint.id}>{joint.name} · {joint.type}</option>)}</select></label>
               <div className="internal-live-value"><span>Current</span><strong>{liveValue(entry)}</strong><small>{state.openPlc.online ? 'OpenPLC' : state.running ? 'Internal PLC' : 'last value'}</small></div>
               <button type="button" className="icon danger" title={entry.role === 'system' ? 'System definitions cannot be removed; disable them instead' : 'Delete register definition'} disabled={!editing || entry.role === 'system'} onClick={() => setDraftDefinitions((current) => current.filter((item) => item.id !== entry.id))}><Trash2 size={14} /></button>
+              <div className="mapping-fields">
+                <label><span>Connection</span><input disabled={!editing} value={entry.connectionId ?? 'openplc-main'} onChange={(event) => updateDraft(entry.id, { connectionId: event.target.value })} /></label>
+                <label><span>Protocol</span><select disabled={!editing} value={entry.protocol ?? 'modbus'} onChange={(event) => updateDraft(entry.id, { protocol: event.target.value as 'modbus' | 'mqtt' | 'opcua', connectionId: event.target.value === 'mqtt' ? 'mqtt-main' : event.target.value === 'opcua' ? 'opcua-main' : 'openplc-main' })}><option value="modbus">Modbus TCP</option><option value="mqtt">MQTT</option><option value="opcua">OPC UA</option></select></label>
+                <label><span>Scale</span><input type="number" step="any" disabled={!editing} value={mappingScale(entry)} onChange={(event) => updateDraft(entry.id, { scale: Number(event.target.value) })} /></label>
+                <label><span>Offset</span><input type="number" step="any" disabled={!editing} value={mappingOffset(entry)} onChange={(event) => updateDraft(entry.id, { offset: Number(event.target.value) })} /></label>
+                <label><span>Engineering unit</span><input disabled={!editing} value={entry.unit ?? (entry.encoding === 'int16-rad-x10000' ? 'rad' : '')} onChange={(event) => updateDraft(entry.id, { unit: event.target.value })} /></label>
+                <label><span>Polling (ms)</span><input type="number" min="20" max="60000" disabled={!editing} value={mappingPollingMs(entry)} onChange={(event) => updateDraft(entry.id, { pollingMs: Math.max(20, Number(event.target.value)) })} /></label>
+                {entry.protocol === 'mqtt' && <><label><span>MQTT topic</span><input disabled={!editing} value={entry.topic ?? `twinaxis/${entry.robotNodeId ?? 'asset'}/${entry.jointId ?? entry.id}`} onChange={(event) => updateDraft(entry.id, { topic: event.target.value })} /></label><label><span>JSON value path</span><input disabled={!editing} placeholder="value" value={entry.valuePath ?? ''} onChange={(event) => updateDraft(entry.id, { valuePath: event.target.value })} /></label><label><span>QoS</span><select disabled={!editing} value={entry.qos ?? 0} onChange={(event) => updateDraft(entry.id, { qos: Number(event.target.value) as 0 | 1 | 2 })}><option value="0">0</option><option value="1">1</option><option value="2">2</option></select></label></>}
+                {entry.protocol === 'opcua' && <><label><span>OPC UA NodeId</span><input disabled={!editing} placeholder="ns=2;s=Robot.J1" value={entry.opcUaNodeId ?? ''} onChange={(event) => updateDraft(entry.id, { opcUaNodeId: event.target.value })} /></label><label><span>Browse path</span><input disabled={!editing} placeholder="Objects/Robot/J1" value={entry.opcUaBrowsePath ?? ''} onChange={(event) => updateDraft(entry.id, { opcUaBrowsePath: event.target.value })} /></label></>}
+              </div>
               {conflict && <div className="register-conflict-message"><AlertTriangle size={13} />Register range overlaps another enabled definition.</div>}
             </div>
           );
         })}
       </div>
       <footer><ShieldCheck size={14} /><span>{editing ? 'EDIT MODE: changes are temporary until Save changes is confirmed.' : 'READ ONLY: enable editing before changing sensitive PLC variables.'} The physical OpenPLC program must expose every configured `%QW` address.</span></footer>
-      {confirmation && <div className="configuration-confirmation" role="dialog" aria-modal="true" aria-label={confirmation === 'save' ? 'Confirm sensitive configuration changes' : 'Discard configuration changes'}><div><AlertTriangle size={22} /><h3>{confirmation === 'save' ? 'Apply sensitive PLC configuration?' : 'Discard unconfirmed changes?'}</h3><p>{confirmation === 'save' ? 'This will stop local motion, replace the active register map, rebuild digital-twin bindings and persist the configuration in this browser.' : 'The current draft has not been saved. Discarding restores the last confirmed register map.'}</p><div><button type="button" onClick={() => setConfirmation(undefined)}>Go back</button><button type="button" className={confirmation === 'save' ? 'confirm-save' : 'danger'} onClick={() => { if (confirmation === 'save') { onApply(draftDefinitions); setEditing(false); } else { setDraftDefinitions(definitions); setEditing(false); } setConfirmation(undefined); if (confirmation === 'discard' && dirty) onClose(); }}>{confirmation === 'save' ? 'Confirm and save' : 'Discard changes'}</button></div></div></div>}
+      {confirmation && <div className="configuration-confirmation" role="dialog" aria-modal="true" aria-label={confirmation === 'save' ? 'Confirm sensitive configuration changes' : 'Discard configuration changes'}><div><AlertTriangle size={22} /><h3>{confirmation === 'save' ? 'Apply sensitive PLC configuration?' : 'Discard unconfirmed changes?'}</h3><p>{confirmation === 'save' ? 'This will stop local motion, replace the active signal map and connection profiles, rebuild digital-twin bindings and persist the configuration in this browser.' : 'The current draft has not been saved. Discarding restores the last confirmed configuration.'}</p><div><button type="button" onClick={() => setConfirmation(undefined)}>Go back</button><button type="button" className={confirmation === 'save' ? 'confirm-save' : 'danger'} onClick={() => { if (confirmation === 'save') { onApply(draftDefinitions); onApplyConnectionProfiles(draftProfiles); setEditing(false); } else { setDraftDefinitions(definitions); setDraftProfiles(connectionProfiles); setEditing(false); } setConfirmation(undefined); if (confirmation === 'discard' && dirty) onClose(); }}>{confirmation === 'save' ? 'Confirm and save' : 'Discard changes'}</button></div></div></div>}
     </aside>
   );
 };
@@ -6354,10 +7947,18 @@ type PlcModbusDashboardProps = {
   onPlcScanTargetChange: (targetMs: number) => void;
   onToggleOpenPlc: () => void;
   onProbeOpenPlc: () => void;
+  onTestPhysicalPlcConnection: () => Promise<void>;
+  onTestPhysicalPlcReaction: () => Promise<void>;
+  onTestPhysicalPlcJog: (direction: 'forward' | 'return') => Promise<void>;
+  physicalPlcDemoActive: boolean;
+  onTogglePhysicalPlcDemo: () => Promise<void>;
   onOpenPlcCommand: (command: 0 | 1 | 2) => void;
   onActivateLocalManual: () => void;
   onOpenPlcSensorPolicy: (policy: 0 | 1) => void;
-  onOpenPlcConfigChange: (field: 'host' | 'port' | 'unitId' | 'address' | 'pollMs' | 'dataFormat', value: string | number) => void;
+  onOpenPlcConfigChange: (field: 'endpointProfile' | 'host' | 'port' | 'unitId' | 'address' | 'pollMs' | 'dataFormat' | 'autoReconnect', value: string | number | boolean) => void;
+  historianRecording: boolean;
+  historianRecordCount: number;
+  onToggleHistorianRecording: () => void;
   onClose: () => void;
 };
 
@@ -6722,7 +8323,7 @@ const TraceAuditDashboard = ({ node, state, onClose }: { node?: SceneNode; state
   const gyroDps = telemetry?.valid && telemetry.hasGyroscope ? telemetry.gyroDps : 0;
   const motionPermit = state.openPlc.sensorPolicy === 1;
   const sensorMoving = gyroDps >= 3;
-  const chainLive = Boolean(telemetry?.valid && state.externalBridgeServerOnline && state.openPlc.online);
+  const chainLive = Boolean(telemetry?.valid && state.externalBridgeServerOnline && state.openPlc.online && state.openPlc.runtimeRunning !== false);
 
   useEffect(() => {
     if (!telemetry?.sequence || !state.frame) return;
@@ -6810,8 +8411,8 @@ const TraceAuditDashboard = ({ node, state, onClose }: { node?: SceneNode; state
               <b className={telemetry?.valid ? 'live' : ''}>BLE GATT</b>
               <div className={`trace-stage ${state.externalBridgeServerOnline ? 'live' : 'offline'}`}><span>2</span><strong>IoT Controller</strong><code>age {telemetry?.ageMs ?? '--'} ms</code><small>127.0.0.1:8765</small></div>
               <b className={state.externalBridgeServerOnline ? 'live' : ''}>FC16</b>
-              <div className={`trace-stage ${state.openPlc.online ? 'live' : 'offline'}`}><span>3</span><strong>OpenPLC</strong><code>%QW127 = {state.openPlc.sensorPolicy ?? '--'}</code><small>{motionPermit ? 'motion permit' : 'condition monitor'}</small></div>
-              <b className={state.openPlc.online ? 'live' : ''}>ST logic</b>
+              <div className={`trace-stage ${state.openPlc.online && state.openPlc.runtimeRunning !== false ? 'live' : 'offline'}`}><span>3</span><strong>OpenPLC</strong><code>%QW127 = {state.openPlc.sensorPolicy ?? '--'}</code><small>{state.openPlc.runtimeRunning === false ? 'scan stopped' : motionPermit ? 'motion permit' : 'condition monitor'}</small></div>
+              <b className={state.openPlc.online && state.openPlc.runtimeRunning !== false ? 'live' : ''}>ST logic</b>
               <div className={`trace-stage condition-${conditionState}`}><span>4</span><strong>PLC reaction</strong><code>{conditionLabel}</code><small>alarm {alarmCode} · speed {speedPermille}</small></div>
               <b className={state.frame ? 'live' : ''}>FC03</b>
               <div className={`trace-stage ${state.frame ? 'live' : 'offline'}`}><span>5</span><strong>3D twin</strong><code>{registers.length} joints</code><small>kinematicState</small></div>
@@ -6870,10 +8471,13 @@ const TraceAuditDashboard = ({ node, state, onClose }: { node?: SceneNode; state
 
 const fixedTrace = (value: number) => Number.isFinite(value) ? value.toFixed(2) : '--';
 
-const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdvanced, onToggleTerminalBridge, onDisconnectTerminalBridge, onEndpointChange, onWriteRegister, onPlcInputChange, onPlcFaultReset, onPlcScanTargetChange, onToggleOpenPlc, onProbeOpenPlc, onOpenPlcCommand, onActivateLocalManual, onOpenPlcSensorPolicy, onOpenPlcConfigChange, onClose }: PlcModbusDashboardProps) => {
+const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdvanced, onToggleTerminalBridge, onDisconnectTerminalBridge, onEndpointChange, onWriteRegister, onPlcInputChange, onPlcFaultReset, onPlcScanTargetChange, onToggleOpenPlc, onProbeOpenPlc, onTestPhysicalPlcConnection, onTestPhysicalPlcReaction, onTestPhysicalPlcJog, physicalPlcDemoActive, onTogglePhysicalPlcDemo, onOpenPlcCommand, onActivateLocalManual, onOpenPlcSensorPolicy, onOpenPlcConfigChange, historianRecording, historianRecordCount, onToggleHistorianRecording, onClose }: PlcModbusDashboardProps) => {
   const [mirrorHeight, setMirrorHeight] = useState(330);
   const mirrorResizeRef = useRef<{ pointerId: number; startY: number; startHeight: number }>();
-  const registers = state.frame?.physicalRegisters ?? [];
+  const physicalPlcActive = state.openPlc.endpointProfile === 's7-1200-robot-holding' && state.openPlc.enabled;
+  const registers = (state.frame?.physicalRegisters ?? []).map((register, index) => physicalPlcActive
+    ? { ...register, address: 7 + index, displayAddress: String(7 + index) }
+    : register);
   const twinState = state.frame?.digitalTwinState ?? [];
   const visibleRows = Math.max(registers.length, twinState.length);
   const endpoint = parseModbusBridgeEndpoint(state.externalBridgeUrl);
@@ -6897,6 +8501,11 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
       registers: source?.registers ?? [],
     };
   });
+  const externalPlcActive = state.openPlc.enabled || state.externalBridgeEnabled;
+  const mirrorRunning = state.openPlc.enabled
+    ? Boolean(state.openPlc.online && state.openPlc.runtimeRunning !== false && state.openPlc.command === 1 && (state.openPlc.conditionState ?? 0) < 2)
+    : state.running;
+  const synchronizedTwinRows = externalPlcActive ? registers : (twinRows.length ? twinRows : registers);
 
   return (
     <div className={`plc-dashboard ${state.advanced ? 'advanced' : ''}`} style={dashboardStyle} onClick={(event) => event.stopPropagation()}>
@@ -6919,6 +8528,10 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
               <Pause size={15} />
               <span>Stop</span>
             </button>
+            <button className={historianRecording ? 'active historian-dashboard-button' : 'historian-dashboard-button'} title="Persist live samples, events and commands in the TwinAxis historian" disabled={!state.frame} onClick={onToggleHistorianRecording}>
+              {historianRecording ? <Pause size={15} /> : <Activity size={15} />}
+              <span>{historianRecording ? `Stop Record (${historianRecordCount})` : `Record History (${historianRecordCount})`}</span>
+            </button>
             <button
               className={state.externalBridgeEnabled ? 'active terminal-bridge-button' : 'terminal-bridge-button'}
               title={`Read live Modbus HR values from the visual gamepad controller on ${endpoint.host}:${endpoint.port}.`}
@@ -6927,10 +8540,6 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
             >
               <Activity size={15} />
               <span>Visual Controller</span>
-            </button>
-            <button className={state.openPlc.enabled ? 'active openplc-button' : 'openplc-button'} title="Connect directly to an OpenPLC Runtime Modbus TCP server" disabled={!node} onClick={onToggleOpenPlc}>
-              <Link2 size={15} />
-              <span>{state.openPlc.enabled ? 'Disconnect OpenPLC' : 'Connect OpenPLC'}</span>
             </button>
             <button
               className="disconnect-bridge-button"
@@ -6967,7 +8576,7 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
       </div>
 
       <div className="plc-flow">
-        <span className={state.running ? 'live' : ''}>Simulated physical entity</span>
+        <span className={mirrorRunning ? 'live' : ''}>{physicalPlcActive ? 'Physical PLC process image' : 'Simulated physical entity'}</span>
         <strong>Modbus HR</strong>
         <span>Digital twin 3D</span>
       </div>
@@ -7005,22 +8614,40 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
             {state.plc.alarms.filter((alarm) => alarm.active).map((alarm) => <span key={alarm.code}><AlertTriangle size={12} />{alarm.code}: {alarm.message}</span>)}
           </div>
         )}
-        {state.externalBridgeEnabled && <div className="virtual-plc-authority">External controller has write authority. Disconnect Client before running the internal PLC CPU.</div>}
-        <div className={`openplc-connector ${state.openPlc.online ? 'online' : state.openPlc.enabled ? 'waiting' : ''}`}>
-          <div className="openplc-title"><strong>OpenPLC Runtime</strong><span>{state.openPlc.online ? 'ONLINE' : state.openPlc.enabled ? 'CONNECTING' : 'OFFLINE'}</span></div>
+        {externalPlcActive && <div className="virtual-plc-authority">{physicalPlcActive ? `Physical PLC ${state.openPlc.host}:${state.openPlc.port} owns motion. Both 3D views use the same HR7..12 process image.` : 'External controller has write authority. Disconnect Client before running the internal PLC CPU.'}</div>}
+        <div className={`openplc-connector ${state.openPlc.online && state.openPlc.runtimeRunning === false ? 'stalled' : state.openPlc.online ? 'online' : state.openPlc.enabled ? 'waiting' : ''}`}>
+          <div className="openplc-title"><strong>{state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'Physical PLC · S7-1200' : 'OpenPLC Runtime'}</strong><span>{state.openPlc.online && state.openPlc.runtimeRunning === false ? 'MODBUS ONLINE · SCAN STOPPED' : state.openPlc.online ? 'ONLINE · SCAN ACTIVE' : state.openPlc.enabled ? 'CONNECTING' : 'OFFLINE'}</span></div>
+          <label><span>PLC profile</span><select value={state.openPlc.endpointProfile} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('endpointProfile', event.target.value)}><option value="openplc">OpenPLC %QW</option><option value="s7-1200-robot-holding">Physical S7-1200 · HR0..20</option></select></label>
           <label><span>IP / host</span><input value={state.openPlc.host} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('host', event.target.value)} /></label>
           <label><span>Port</span><input type="number" min="1" max="65535" value={state.openPlc.port} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('port', event.target.value)} /></label>
           <label><span>Unit ID</span><input type="number" min="0" max="255" value={state.openPlc.unitId} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('unitId', event.target.value)} /></label>
           <label><span>HR start</span><input type="number" min="0" max="65535" value={state.openPlc.address} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('address', event.target.value)} /></label>
           <label><span>Data</span><select value={state.openPlc.dataFormat} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('dataFormat', event.target.value)}><option value="float32-be">FLOAT32 BE</option><option value="int16-rad-x10000">INT16 rad x10000</option></select></label>
           <label><span>Poll</span><input type="number" min="100" max="5000" step="50" value={state.openPlc.pollMs} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('pollMs', event.target.value)} /><small>ms</small></label>
+          <label title="Remember this endpoint and resume polling automatically when the PLC network becomes available."><span>Reconnect</span><input type="checkbox" checked={state.openPlc.autoReconnect} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('autoReconnect', event.target.checked)} /><small>{state.openPlc.autoReconnect ? 'armed' : 'off'}</small></label>
+          <button type="button" className={state.openPlc.enabled ? 'active openplc-button' : 'openplc-button'} title="Connect the selected PLC profile over Modbus TCP" disabled={!node} onClick={onToggleOpenPlc}><Link2 size={13} />{state.openPlc.enabled ? `Disconnect ${state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'Physical PLC' : 'OpenPLC'}` : `Connect ${state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'Physical PLC' : 'OpenPLC'}`}</button>
           <button type="button" disabled={state.openPlc.enabled || state.openPlc.probing} onClick={onProbeOpenPlc}><Activity size={13} />{state.openPlc.probing ? 'Detecting...' : 'Auto Detect Map'}</button>
-          <code>FC03 · {state.openPlc.quantity} HR · Unit {state.openPlc.unitId} · RX {state.openPlc.received}</code>
+          {state.openPlc.endpointProfile === 's7-1200-robot-holding' && (
+            <div className="physical-plc-test-panel">
+              <div className={`physical-plc-link-state ${state.openPlc.online ? 'connected' : 'disconnected'}`}>
+                <i aria-hidden="true" />
+                <strong>{state.openPlc.online ? 'PLC CONNECTED' : 'PLC DISCONNECTED'}</strong>
+                <span>{state.openPlc.host}:{state.openPlc.port} · Unit {state.openPlc.unitId}</span>
+              </div>
+              <button type="button" disabled={state.openPlc.probing} onClick={() => void onTestPhysicalPlcConnection()}><Activity size={13} />{state.openPlc.probing ? 'Testing...' : 'Test Connection'}</button>
+              <button type="button" className="physical-plc-reaction-test" disabled={state.openPlc.probing || !state.openPlc.online} title="Safety-confirmed test: writes HOME to HR0, verifies HR1/HR2, then returns HR0 to HOLD" onClick={() => void onTestPhysicalPlcReaction()}><RotateCw size={13} />Test HOME Reaction</button>
+              <button type="button" disabled={state.openPlc.probing || !state.openPlc.online} title="Write a small reversible increment to HR7..HR12 while HR0 remains in manual hold" onClick={() => void onTestPhysicalPlcJog('forward')}><ChevronRight size={13} />Step Forward</button>
+              <button type="button" disabled={state.openPlc.probing || !state.openPlc.online} title="Restore the exact HR7..HR12 vector captured before Step Forward" onClick={() => void onTestPhysicalPlcJog('return')}><Redo2 size={13} />Return to Start</button>
+              <button type="button" className={physicalPlcDemoActive ? 'active' : ''} disabled={state.openPlc.probing || !state.openPlc.online} title="Stream the exact kinematic clip used by Start Demo to physical PLC HR7..HR12" onClick={() => void onTogglePhysicalPlcDemo()}>{physicalPlcDemoActive ? <Pause size={13} /> : <Play size={13} />}{physicalPlcDemoActive ? 'Stop PLC Demo' : 'Run Start Demo'}</button>
+            </div>
+          )}
+          <code>FC03 · {state.openPlc.endpointProfile === 's7-1200-robot-holding' ? '21 HR process image' : `${state.openPlc.quantity} HR`} · Unit {state.openPlc.unitId} · RX {state.openPlc.received}</code>
           {state.openPlc.diagnostics && <code>{state.openPlc.diagnostics}</code>}
+          {state.openPlc.runtimeIssue && <span className="openplc-runtime-error" role="alert">{state.openPlc.runtimeIssue}</span>}
           {state.openPlc.rawRegisters && <code>RAW [{state.openPlc.rawRegisters.join(', ')}]</code>}
           {state.openPlc.error && <span className="openplc-error">{state.openPlc.error}</span>}
-          <div className="openplc-command-control" role="group" aria-label="OpenPLC robot operating mode">
-            <span>Robot mode · %QW90</span>
+          <div className="openplc-command-control" role="group" aria-label="PLC robot operating mode">
+            <span>Robot mode · {state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'HR0' : '%QW90'}</span>
             <button type="button" className={state.localManualActive ? 'active manual' : ''} disabled={!node} title="Disconnect OpenPLC and give the local PLC manual authority over every robot joint" onClick={onActivateLocalManual}><Pause size={13} />Local Manual</button>
             <button type="button" className={state.openPlc.command === 1 ? 'active auto' : ''} disabled={!state.openPlc.enabled} title="Command 1: execute the automatic robot sequence continuously" onClick={() => onOpenPlcCommand(1)}><Play size={13} />Auto</button>
             <button type="button" className={state.openPlc.command === 2 ? 'active home' : ''} disabled={!state.openPlc.enabled} title="Command 2: move and hold the robot at its configured Home pose" onClick={() => onOpenPlcCommand(2)}><RotateCw size={13} />Home</button>
@@ -7028,20 +8655,20 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
           </div>
           <div className={`openplc-iot-reaction condition-${state.openPlc.conditionState ?? 3}`}>
             <div>
-              <span>PLC reaction · %QW94..96</span>
+              <span>PLC reaction · {state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'HR4..6' : '%QW94..96'}</span>
               <strong>{['NORMAL', 'WARNING / DERATE', 'TRIP / HOLD', 'STALE / HOLD'][state.openPlc.conditionState ?? 3] ?? 'UNKNOWN'}</strong>
               <code>alarm {state.openPlc.alarmCode ?? '--'} · speed {state.openPlc.speedPermille ?? '--'} permille · step {state.openPlc.activeStep ?? '--'}</code>
             </div>
             <button type="button" className={state.openPlc.sensorPolicy === 0 ? 'active' : ''} disabled={!state.openPlc.enabled} onClick={() => onOpenPlcSensorPolicy(0)}>Condition monitor</button>
-            <button type="button" className={state.openPlc.sensorPolicy === 1 ? 'active' : ''} disabled={!state.openPlc.enabled} onClick={() => onOpenPlcSensorPolicy(1)}>Motion permit demo</button>
-            <code>%QW127 = {state.openPlc.sensorPolicy ?? 0}</code>
+            <button type="button" className={state.openPlc.sensorPolicy === 1 ? 'active' : ''} disabled={!state.openPlc.enabled} title="Writes SensorPolicy=1 and Command=AUTO. Sensor motion releases HOLD; two seconds without motion stops the cycle." onClick={() => onOpenPlcSensorPolicy(1)}>Motion permit + Auto</button>
+            <code>{state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'HR20' : '%QW127'} = {state.openPlc.sensorPolicy ?? 0}</code>
           </div>
         </div>
         <div className={`iot-condition-strip ${state.iotTelemetry?.valid ? 'live' : 'stale'}`}>
           <div><strong>Robot-mounted IoT</strong><span>{state.iotTelemetry?.valid ? state.iotTelemetry.source : 'No live IoT telemetry'}</span></div>
-          <div><span>Temperature</span><strong>{state.iotTelemetry?.valid && state.iotTelemetry.hasEnvironment ? `${state.iotTelemetry.temperatureC.toFixed(1)} °C` : '--'}</strong><code>{state.iotTelemetry?.hasEnvironment ? '%QW120' : 'NO DATA'}</code></div>
-          <div><span>Humidity</span><strong>{state.iotTelemetry?.valid && state.iotTelemetry.hasEnvironment ? `${state.iotTelemetry.humidityPercent.toFixed(1)} %RH` : '--'}</strong><code>{state.iotTelemetry?.hasEnvironment ? '%QW121' : 'NO DATA'}</code></div>
-          <div><span>Gyro magnitude</span><strong>{state.iotTelemetry?.valid && state.iotTelemetry.hasGyroscope ? `${state.iotTelemetry.gyroDps.toFixed(1)} °/s` : '--'}</strong><code>{state.iotTelemetry?.hasGyroscope ? '%QW122' : 'NO DATA'}</code></div>
+          <div><span>Temperature</span><strong>{state.iotTelemetry?.valid && state.iotTelemetry.hasEnvironment ? `${state.iotTelemetry.temperatureC.toFixed(1)} °C` : '--'}</strong><code>{state.iotTelemetry?.hasEnvironment ? (physicalPlcActive ? 'HR13' : '%QW120') : 'NO DATA'}</code></div>
+          <div><span>Humidity</span><strong>{state.iotTelemetry?.valid && state.iotTelemetry.hasEnvironment ? `${state.iotTelemetry.humidityPercent.toFixed(1)} %RH` : '--'}</strong><code>{state.iotTelemetry?.hasEnvironment ? (physicalPlcActive ? 'HR14' : '%QW121') : 'NO DATA'}</code></div>
+          <div><span>Gyro magnitude</span><strong>{state.iotTelemetry?.valid && state.iotTelemetry.hasGyroscope ? `${state.iotTelemetry.gyroDps.toFixed(1)} °/s` : '--'}</strong><code>{state.iotTelemetry?.hasGyroscope ? (physicalPlcActive ? 'HR15' : '%QW122') : 'NO DATA'}</code></div>
           <div><span>Freshness</span><strong>{state.iotTelemetry?.valid ? `${state.iotTelemetry.ageMs} ms` : '--'}</strong><code>{state.iotTelemetry?.valid ? 'VALID' : 'NO LIVE DATA'}</code></div>
           <div className="iot-trace-cell"><span>Trace</span><strong>{state.iotTelemetry?.valid ? state.iotTelemetry.sampleId || '--' : '--'}</strong><code>{state.iotTelemetry?.valid ? `seq ${state.iotTelemetry.sequence ?? 0} · ${state.iotTelemetry.quality ?? 'GOOD'}` : 'no received sample'}</code></div>
           <div className="iot-vector-cell"><span>Accelerometer XYZ</span><strong>{state.iotTelemetry?.valid && state.iotTelemetry.hasAcceleration ? `${state.iotTelemetry.accelX.toFixed(3)} | ${state.iotTelemetry.accelY.toFixed(3)} | ${state.iotTelemetry.accelZ.toFixed(3)} g` : '--'}</strong></div>
@@ -7087,19 +8714,19 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
       <div className="plc-twin-split">
         <PlcRobotMirror
           node={node}
-          title="Entidad Fisica Simulada"
-          subtitle="Proceso fisico controlado por scan, interlocks y salidas del PLC virtual."
+          title={physicalPlcActive ? 'Entidad Física · PLC Real' : 'Entidad Fisica Simulada'}
+          subtitle={physicalPlcActive ? `Imagen de proceso recibida por FC03 desde ${state.openPlc.host}:${state.openPlc.port}, HR7..12.` : 'Proceso fisico controlado por scan, interlocks y salidas del PLC virtual.'}
           rows={registers}
           editable={state.localManualActive}
-          running={state.running}
+          running={mirrorRunning}
           onWriteRegister={onWriteRegister}
         />
         <PlcRobotMirror
           node={node}
           title="Gemelo Digital 3D"
           subtitle="Recibe datos decodificados y actualiza kinematicState."
-          rows={twinRows.length ? twinRows : registers}
-          running={state.running}
+          rows={synchronizedTwinRows}
+          running={mirrorRunning}
         />
       </div>
 
@@ -7162,6 +8789,7 @@ type KinematicGraphPanelProps = {
   updateKinematicGraph: (nodeId: string, updater: (graph: KinematicGraph) => KinematicGraph, status: string) => void;
   startKinematicEdit: (nodeId: string, jointId: string, mode: KinematicEditTarget['mode']) => void;
   acceptKinematicJoint: (nodeId: string, jointId: string) => void;
+  commitKinematicJointFrame: (nodeId: string, jointId: string) => void;
   rejectKinematicJoint: (nodeId: string, jointId: string) => void;
   deleteKinematicJoint: (nodeId: string, jointId: string) => void;
   createKinematicJoint: (nodeId: string, selectedPartNames: string[]) => void;
@@ -7226,6 +8854,7 @@ const KinematicGraphPanel = ({
   updateKinematicGraph,
   startKinematicEdit,
   acceptKinematicJoint,
+  commitKinematicJointFrame,
   rejectKinematicJoint,
   deleteKinematicJoint,
   createKinematicJoint,
@@ -7509,6 +9138,7 @@ const KinematicGraphPanel = ({
           onResetPose={() => resetKinematicPose(node.id)}
           onShowJoint={(jointId, mode) => startKinematicEdit(node.id, jointId, mode)}
           onSave={saveKinematicConfiguration}
+          onCommitJointFrame={(jointId) => commitKinematicJointFrame(node.id, jointId)}
           tutorialRequest={tutorialRequest}
         />
       )}
@@ -7861,6 +9491,7 @@ type GeometryInspectorProps = {
   updateKinematicGraph: (nodeId: string, updater: (graph: KinematicGraph) => KinematicGraph, status: string) => void;
   startKinematicEdit: (nodeId: string, jointId: string, mode: KinematicEditTarget['mode']) => void;
   acceptKinematicJoint: (nodeId: string, jointId: string) => void;
+  commitKinematicJointFrame: (nodeId: string, jointId: string) => void;
   rejectKinematicJoint: (nodeId: string, jointId: string) => void;
   deleteKinematicJoint: (nodeId: string, jointId: string) => void;
   createKinematicJoint: (nodeId: string, selectedPartNames: string[]) => void;
@@ -7894,6 +9525,7 @@ const GeometryInspector = ({
   updateKinematicGraph,
   startKinematicEdit,
   acceptKinematicJoint,
+  commitKinematicJointFrame,
   rejectKinematicJoint,
   deleteKinematicJoint,
   createKinematicJoint,
@@ -7983,6 +9615,7 @@ const GeometryInspector = ({
           updateKinematicGraph={updateKinematicGraph}
           startKinematicEdit={startKinematicEdit}
           acceptKinematicJoint={acceptKinematicJoint}
+          commitKinematicJointFrame={commitKinematicJointFrame}
           rejectKinematicJoint={rejectKinematicJoint}
           deleteKinematicJoint={deleteKinematicJoint}
           createKinematicJoint={createKinematicJoint}
@@ -8126,6 +9759,7 @@ const GeometryInspector = ({
             updateKinematicGraph={updateKinematicGraph}
             startKinematicEdit={startKinematicEdit}
             acceptKinematicJoint={acceptKinematicJoint}
+            commitKinematicJointFrame={commitKinematicJointFrame}
             rejectKinematicJoint={rejectKinematicJoint}
             deleteKinematicJoint={deleteKinematicJoint}
             createKinematicJoint={createKinematicJoint}

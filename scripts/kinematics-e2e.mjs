@@ -230,9 +230,12 @@ try {
     await configureRow(5, { parentIndex: 4, childIndex: 6, type: 'prismatic', axis: [1, 0, 0], lower: -0.35, upper: 0.35, origin: [0.45, 0.45, 0] });
 
     const rowFive = jointRows.nth(5);
-    await setSelectByIndex(rowFive.locator('select').nth(5), 5);
-    await setNumberInput(rowFive.locator('input[type="number"]').nth(8), -1);
-    await setNumberInput(rowFive.locator('input[type="number"]').nth(9), 0);
+    const gripperMimicSelect = rowFive.locator('label').filter({ hasText: 'Mimic' }).locator('select');
+    const driverOptions = await gripperMimicSelect.locator('option').count();
+    if (driverOptions < 6) throw new Error(`Mimic selector has ${driverOptions} options, expected at least 6 joints.`);
+    await gripperMimicSelect.selectOption({ index: 5 });
+    await setNumberInput(rowFive.locator('label').filter({ hasText: 'Multiplier' }).locator('input'), -1);
+    await setNumberInput(rowFive.locator('label').filter({ hasText: 'Offset' }).locator('input'), 0);
     await page.waitForTimeout(500);
 
     progress('checking visible motion and Home');
@@ -276,7 +279,7 @@ try {
     ];
     await jointRow.getByRole('button', { name: /Pick Origin/ }).click();
     await page.waitForFunction(() => document.body.innerText.includes('Pick joint origin'), undefined, { timeout: 30000 });
-    await clickUntilStatus(pickPoints, 'Joint origin picked');
+    await clickUntilStatus(pickPoints, 'Mechanical joint frame fitted');
     await jointRow.getByRole('button', { name: /Axis A/ }).click();
     await page.waitForFunction(() => document.body.innerText.includes('Pick axis point'), undefined, { timeout: 30000 });
     await clickUntilStatus(pickPoints, 'Pick second axis point');
@@ -293,11 +296,9 @@ try {
     if ((await page.locator('.mechanical-panel.simple').count()) > 0) {
       await page.getByRole('button', { name: /^Advanced$/ }).click();
     }
-    const mimicSelect = jointRow.locator('select').nth(5);
-    await mimicSelect.selectOption({ index: 1 });
-    const numericInputs = jointRow.locator('input[type="number"]');
-    await numericInputs.nth(8).fill('-1');
-    await numericInputs.nth(8).dispatchEvent('change');
+    const persistedMimicSelect = jointRow.locator('label').filter({ hasText: 'Mimic' }).locator('select');
+    await persistedMimicSelect.selectOption({ index: 1 });
+    await setNumberInput(jointRow.locator('label').filter({ hasText: 'Multiplier' }).locator('input'), -1);
     await page.waitForTimeout(500);
 
     await jointRow.locator('button[title="Accept joint"]').click();

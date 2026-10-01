@@ -42,6 +42,7 @@ type ThreeViewportProps = {
   industrialCellDemoActive?: boolean;
   robotCursorGuideNodeId?: string;
   motionTrainingPreview?: MotionTrainingPreview;
+  visualState?: 'normal' | 'warning' | 'alarm' | 'disconnected';
   onSelect: (nodeId?: string) => void;
   onTransformCommit: (nodeId: string, transform: Transform) => void;
   onImportedPartTransformsCommit: (updates: Array<{ nodeId: string; objectName: string; transform: Transform }>) => void;
@@ -88,13 +89,14 @@ export type MotionTrainingPreview = {
   amplitude: number;
 };
 
-export type KinematicEditMode = 'show-joint' | 'pick-origin' | 'pick-driven-point' | 'pick-axis-a' | 'pick-axis-b' | 'axis-gizmo';
+export type KinematicEditMode = 'show-joint' | 'pick-origin' | 'pick-driven-point' | 'pick-axis-a' | 'pick-axis-b' | 'axis-gizmo' | 'ring-translate' | 'ring-rotate';
 
 export type KinematicEditTarget = {
   nodeId: string;
   jointId: string;
   mode: KinematicEditMode;
   origin: [number, number, number];
+  orientation?: [number, number, number, number];
   axis: [number, number, number];
   axisPointA?: [number, number, number];
   drivenPoint?: [number, number, number];
@@ -117,6 +119,8 @@ export type KinematicAxisChangeEvent = {
   nodeId: string;
   jointId: string;
   axis: [number, number, number];
+  origin?: [number, number, number];
+  orientation?: [number, number, number, number];
 };
 
 export type PieceReferenceCenterEstimateEvent = {
@@ -350,6 +354,9 @@ const industrialCellGeneratorId = (node: SceneNode) => {
 
 const isIndustrialGeneratedNode = (node: SceneNode) => Boolean(industrialCellGeneratorId(node));
 
+const usesJointAxisVector = (joint: { evidence: Array<{ metadata?: Record<string, unknown> }> }) =>
+  joint.evidence.some((item) => item.metadata?.useJointAxisVector === true);
+
 const localAxisKeyFromJoint = (joint: { evidence: Array<{ metadata?: Record<string, unknown> }>; axis: [number, number, number] }) => {
   const rigAxis = joint.evidence[0]?.metadata?.rigAxis;
   if (rigAxis === 'Y') return 'y';
@@ -379,8 +386,7 @@ const configureSingleAxisEuler = (object: THREE.Object3D, axis: 'x' | 'y' | 'z',
 };
 
 const applyStaticRigRotation = (object: THREE.Object3D, joint: KinematicJoint, restQuaternion: THREE.Quaternion, value: number) => {
-  const metadata = joint.evidence.find((item) => item.metadata)?.metadata;
-  if (metadata?.useJointAxisVector === true) {
+  if (usesJointAxisVector(joint)) {
     const axis = new THREE.Vector3(...joint.axis);
     if (axis.lengthSq() > 1e-10) {
       object.quaternion.copy(restQuaternion).multiply(new THREE.Quaternion().setFromAxisAngle(axis.normalize(), value));
@@ -557,10 +563,16 @@ const applyImportedHierarchyKinematicState = (assetRoot: THREE.Group, node: Scen
     child.userData.hierarchicalKinematicRestPosition = restPosition;
     child.rotation.set(restRotation.x, restRotation.y, restRotation.z);
     child.position.copy(restPosition);
-    const axis = localAxisKeyFromJoint(joint);
     const value = state.jointValues[joint.id] ?? state.homeJointValues[joint.id] ?? 0;
-    if (joint.type === 'prismatic') child.position[axis] = restPosition[axis] + value;
-    else child.rotation[axis] = restRotation[axis] + value;
+    if (usesJointAxisVector(joint)) {
+      const axis = new THREE.Vector3(...joint.axis).normalize();
+      if (joint.type === 'prismatic') child.position.copy(restPosition).addScaledVector(axis, value);
+      else child.quaternion.copy(new THREE.Quaternion().setFromEuler(restRotation)).multiply(new THREE.Quaternion().setFromAxisAngle(axis, value));
+    } else {
+      const axis = localAxisKeyFromJoint(joint);
+      if (joint.type === 'prismatic') child.position[axis] = restPosition[axis] + value;
+      else child.rotation[axis] = restRotation[axis] + value;
+    }
     child.updateMatrixWorld(true);
   });
   applyConveyorParametricState(assetRoot, node);
@@ -589,10 +601,16 @@ const applyIndustrialContractKinematicState = (assetRoot: THREE.Group, node: Sce
     child.userData.industrialContractRestPosition = restPosition;
     child.rotation.set(restRotation.x, restRotation.y, restRotation.z);
     child.position.copy(restPosition);
-    const axis = localAxisKeyFromJoint(joint);
     const value = clampJointValue(joint, valueForJoint(joint));
-    if (joint.type === 'prismatic') child.position[axis] = restPosition[axis] + value;
-    else child.rotation[axis] = restRotation[axis] + value;
+    if (usesJointAxisVector(joint)) {
+      const axis = new THREE.Vector3(...joint.axis).normalize();
+      if (joint.type === 'prismatic') child.position.copy(restPosition).addScaledVector(axis, value);
+      else child.quaternion.copy(new THREE.Quaternion().setFromEuler(restRotation)).multiply(new THREE.Quaternion().setFromAxisAngle(axis, value));
+    } else {
+      const axis = localAxisKeyFromJoint(joint);
+      if (joint.type === 'prismatic') child.position[axis] = restPosition[axis] + value;
+      else child.rotation[axis] = restRotation[axis] + value;
+    }
     child.updateMatrixWorld(true);
   });
   applyConveyorParametricState(assetRoot, node);
@@ -646,7 +664,8 @@ const staticRigPreferredPivotObject = (joint: KinematicJoint, partObjectNames: s
 const staticRigPivotSourcePosition = (joint: KinematicJoint, partObjectNames: string[], sourceObject: THREE.Object3D) => {
   const metadata = joint.evidence.find((item) => item.metadata)?.metadata;
   const sourceSchema = typeof metadata?.sourceSchema === 'string' ? metadata.sourceSchema : '';
-  if (/^legacy-robot-rig\//i.test(sourceSchema) && joint.origin?.position?.every((value) => Number.isFinite(value))) {
+  const manualOriginOverride = joint.evidence.some((item) => item.metadata?.manualOriginOverride === true);
+  if ((manualOriginOverride || /^legacy-robot-rig\//i.test(sourceSchema)) && joint.origin?.position?.every((value) => Number.isFinite(value))) {
     return new THREE.Vector3(...joint.origin.position);
   }
   const preferred = staticRigPreferredPivotObject(joint, partObjectNames, sourceObject);
@@ -669,12 +688,29 @@ const buildStaticRigHierarchy = (assetRoot: THREE.Group, node: SceneNode) => {
   const geometry = node.geometry;
   if (!('kinematicGraph' in geometry) || !geometry.kinematicGraph) return undefined;
   const nodeObject = assetRoot.children.find((child) => child.userData.nodeId === node.id);
-  const sourceObject = node.geometry.kind === 'serialized-object' ? nodeObject : (nodeObject?.children[0] ?? nodeObject);
+  let embeddedMechanicalRoot: THREE.Object3D | undefined;
+  nodeObject?.traverse((object) => {
+    if (!embeddedMechanicalRoot && object.userData?.twinAxisKinematics?.schema === 'TwinAxis/Kinematics/1.0') embeddedMechanicalRoot = object;
+  });
+  const sourceObject = node.geometry.kind === 'serialized-object' ? nodeObject : (embeddedMechanicalRoot ?? nodeObject?.children[0] ?? nodeObject);
   if (!sourceObject) return undefined;
 
   const graph = geometry.kinematicGraph;
-  const hierarchyKey = `${node.id}:${graph.analysisVersion}:${graph.joints.length}:${graph.parts.length}`;
+  const hierarchyKey = JSON.stringify({
+    nodeId: node.id,
+    version: graph.analysisVersion,
+    parts: graph.parts.length,
+    joints: graph.joints.map((joint) => [joint.id, joint.origin.position, joint.axis, joint.source]),
+  });
   if (sourceObject.userData.staticRigHierarchyKey !== hierarchyKey) {
+    const previousPivots: THREE.Object3D[] = [];
+    sourceObject.traverse((object) => {
+      if (object.userData.staticRigPivot) previousPivots.push(object);
+    });
+    const attachedObjects = previousPivots.flatMap((pivot) => pivot.children.filter((child) => !child.userData.staticRigPivot));
+    attachedObjects.forEach((object) => sourceObject.attach(object));
+    previousPivots.reverse().forEach((pivot) => pivot.parent?.remove(pivot));
+
     const pivots = new Map<string, THREE.Group>();
     const partById = new Map(graph.parts.map((part) => [part.id, part]));
     sourceObject.updateMatrixWorld(true);
@@ -745,7 +781,8 @@ const applyStaticRigHierarchyKinematicState = (assetRoot: THREE.Group, node: Sce
     const rawValue = state.jointValues[joint.id] ?? state.homeJointValues[joint.id] ?? 0;
     const value = clampJointValue(joint, rawValue);
     if (joint.type === 'prismatic') {
-      pivot.position[axis] = restPosition[axis] + value;
+      if (usesJointAxisVector(joint)) pivot.position.copy(restPosition).addScaledVector(new THREE.Vector3(...joint.axis).normalize(), value);
+      else pivot.position[axis] = restPosition[axis] + value;
     } else {
       applyStaticRigRotation(pivot, joint, restQuaternion, value);
     }
@@ -1168,6 +1205,7 @@ export const ThreeViewport = ({
   industrialCellDemoActive = false,
   robotCursorGuideNodeId,
   motionTrainingPreview,
+  visualState,
   onSelect,
   onTransformCommit,
   onImportedPartTransformsCommit,
@@ -1191,6 +1229,7 @@ export const ThreeViewport = ({
   const industrialCellDemoActiveRef = useRef(industrialCellDemoActive);
   const robotCursorGuideNodeIdRef = useRef(robotCursorGuideNodeId);
   const motionTrainingPreviewRef = useRef(motionTrainingPreview);
+  const visualStateRef = useRef(visualState);
   const onSelectRef = useRef(onSelect);
   const onTransformCommitRef = useRef(onTransformCommit);
   const onImportedPartTransformsCommitRef = useRef(onImportedPartTransformsCommit);
@@ -1277,6 +1316,19 @@ export const ThreeViewport = ({
   } | null>(null);
 
   useEffect(() => {
+    visualStateRef.current = visualState;
+    const selectionBox = runtimeRef.current?.selectionBox;
+    if (!selectionBox) return;
+    const stateColors = {
+      normal: '#42d47b',
+      warning: '#e3a34f',
+      alarm: '#ef5350',
+      disconnected: '#77848b',
+    } as const;
+    (selectionBox.material as THREE.LineBasicMaterial).color.set(visualState ? stateColors[visualState] : '#30d6c8');
+  }, [visualState]);
+
+  useEffect(() => {
     documentRef.current = document;
     toolRef.current = tool;
     partEditModeRef.current = partEditMode;
@@ -1352,10 +1404,10 @@ export const ThreeViewport = ({
     kinematicHelperGroup.name = 'Kinematic Authoring Helpers';
     scene.add(kinematicHelperGroup);
     const kinematicAxisHandle = new THREE.Mesh(
-      new THREE.SphereGeometry(0.08, 16, 12),
+      new THREE.TorusGeometry(0.22, 0.025, 12, 64),
       new THREE.MeshBasicMaterial({ color: '#ffd23f', depthTest: false }),
     );
-    kinematicAxisHandle.name = 'Kinematic Axis Handle';
+    kinematicAxisHandle.name = 'Kinematic Ring Frame';
     kinematicAxisHandle.renderOrder = 20;
     kinematicAxisHandle.visible = false;
     scene.add(kinematicAxisHandle);
@@ -1371,6 +1423,25 @@ export const ThreeViewport = ({
     transform.addEventListener('mouseUp', () => {
       const runtime = runtimeRef.current;
       const attached = transform.object;
+      const editTarget = kinematicEditTargetRef.current;
+      if (attached === kinematicAxisHandle && editTarget && (editTarget.mode === 'ring-translate' || editTarget.mode === 'ring-rotate')) {
+        kinematicAxisHandle.updateMatrixWorld(true);
+        const worldQuaternion = new THREE.Quaternion();
+        kinematicAxisHandle.getWorldQuaternion(worldQuaternion);
+        const sourceObject = findSourceObject(editTarget.nodeId);
+        const sourceQuaternion = new THREE.Quaternion();
+        sourceObject.getWorldQuaternion(sourceQuaternion);
+        sourceQuaternion.invert().multiply(worldQuaternion).normalize();
+        const worldAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(worldQuaternion).normalize();
+        onKinematicAxisChangeRef.current({
+          nodeId: editTarget.nodeId,
+          jointId: editTarget.jointId,
+          origin: vectorTuple(sourcePointFromWorld(editTarget.nodeId, kinematicAxisHandle.position)),
+          axis: worldDirectionToSource(editTarget.nodeId, worldAxis),
+          orientation: [sourceQuaternion.x, sourceQuaternion.y, sourceQuaternion.z, sourceQuaternion.w],
+        });
+        return;
+      }
       if (runtime?.partTransformGroup && attached === runtime.partTransformGroup) {
         const updates = runtime.partTransformItems.map((item) => {
           item.originalParent?.attach(item.object);
@@ -1692,6 +1763,7 @@ export const ThreeViewport = ({
 
     const syncKinematicHelpers = () => {
       const target = kinematicEditTargetRef.current;
+      if (transform.dragging && transform.object === kinematicAxisHandle) return;
       if (!target) {
         const signature = persistentRigSignature();
         if (signature === renderer.domElement.dataset.rigControlSignature) return;
@@ -1728,6 +1800,21 @@ export const ThreeViewport = ({
       }
       if (target.mode === 'axis-gizmo') {
         kinematicAxisHandle.position.copy(frame.origin.clone().add(frame.axis.clone().multiplyScalar(frame.helperLength * 1.08)));
+        kinematicAxisHandle.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), frame.axis);
+        kinematicAxisHandle.scale.setScalar(1);
+        kinematicAxisHandle.visible = true;
+      } else if (target.mode === 'ring-translate' || target.mode === 'ring-rotate') {
+        kinematicAxisHandle.position.copy(frame.origin);
+        if (target.orientation) {
+          const sourceQuaternion = new THREE.Quaternion(...target.orientation);
+          const sourceWorldQuaternion = new THREE.Quaternion();
+          findSourceObject(target.nodeId).getWorldQuaternion(sourceWorldQuaternion);
+          kinematicAxisHandle.quaternion.copy(sourceWorldQuaternion.multiply(sourceQuaternion)).normalize();
+        } else {
+          kinematicAxisHandle.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), frame.axis);
+        }
+        const scale = Math.max(frame.helperLength * 0.7, 0.35);
+        kinematicAxisHandle.scale.setScalar(scale);
         kinematicAxisHandle.visible = true;
       }
       if (target.focusKey && target.focusKey !== renderer.domElement.dataset.kinematicFocusKey) {
@@ -2457,7 +2544,15 @@ export const ThreeViewport = ({
       __assetForgeViewportPrepareCapture?: () => boolean;
       __assetForgeViewportFrameModel?: () => boolean;
       __assetForgeViewportMechanicsDebug?: () => {
-        objects: Array<{ name: string; nodeId?: string; position: [number, number, number]; parent?: string; pivot?: boolean }>;
+        objects: Array<{
+          name: string;
+          nodeId?: string;
+          position: [number, number, number];
+          localPosition: [number, number, number];
+          localQuaternion: [number, number, number, number];
+          parent?: string;
+          pivot?: boolean;
+        }>;
       };
       __assetForgeViewportIndustrialCellDebug?: () =>
         | {
@@ -2525,6 +2620,7 @@ export const ThreeViewport = ({
       const sourceObject = findSourceObject(target.nodeId);
       const sourcePoint = vectorTuple(sourcePointFromWorld(target.nodeId, world));
       const triangles = referenceTrianglesForObject(picked, sourceObject).triangles;
+      const candidate = target.mode === 'pick-origin' ? inferJointFrameFromSeed(triangles, sourcePoint) : undefined;
       onSelectRef.current(target.nodeId);
       onKinematicPointPickRef.current({
         nodeId: target.nodeId,
@@ -2532,7 +2628,7 @@ export const ThreeViewport = ({
         mode: target.mode,
         point: sourcePoint,
         objectName: picked.name,
-        candidate: target.mode === 'pick-origin' ? inferJointFrameFromSeed(triangles, sourcePoint) : undefined,
+        candidate,
       });
       return true;
     };
@@ -2613,7 +2709,16 @@ export const ThreeViewport = ({
       return true;
     };
     runtimeWindow.__assetForgeViewportMechanicsDebug = () => {
-      const objects: Array<{ name: string; nodeId?: string; position: [number, number, number]; parent?: string; pivot?: boolean; materialColor?: string }> = [];
+      const objects: Array<{
+        name: string;
+        nodeId?: string;
+        position: [number, number, number];
+        localPosition: [number, number, number];
+        localQuaternion: [number, number, number, number];
+        parent?: string;
+        pivot?: boolean;
+        materialColor?: string;
+      }> = [];
       const interesting = /(__static_rig_pivot_|J[1-6]_|G1_finger|finger_|gripper|tool_flange|wrist|turret|shoulder|upper_arm|forearm|base_|plate|bolt|cap|ring|j[1-6]_(shell|seal|drum|cap|ring)|belt_motion_mark|P\d+_part|part_box|part_tape|R[12]_|Robot|Arm_|ARM__|BASE__|HEAD__|GRIP|Chwytak|Z_o_e|TooBig|__-_BASE_N)/i;
       assetRoot.updateMatrixWorld(true);
       assetRoot.traverse((object) => {
@@ -2634,6 +2739,8 @@ export const ThreeViewport = ({
           name: object.name,
           nodeId: object.userData.nodeId as string | undefined,
           position: [position.x, position.y, position.z],
+          localPosition: [object.position.x, object.position.y, object.position.z],
+          localQuaternion: [object.quaternion.x, object.quaternion.y, object.quaternion.z, object.quaternion.w],
           parent: object.parent?.name,
           pivot: Boolean(object.userData.staticRigPivot),
           materialColor: materialWithColor?.color ? `#${materialWithColor.color.getHexString()}` : undefined,
@@ -2888,6 +2995,18 @@ export const ThreeViewport = ({
 
       runtime.transform.enabled = true;
       runtime.transform.getHelper().visible = true;
+      runtime.transform.setSpace('world');
+
+      const frameMode = kinematicEditTarget?.mode;
+      if (frameMode === 'ring-translate' || frameMode === 'ring-rotate') {
+        runtime.transform.attach(runtime.kinematicAxisHandle);
+        runtime.transform.setMode(frameMode === 'ring-translate' ? 'translate' : 'rotate');
+        runtime.transform.setSpace(frameMode === 'ring-translate' ? 'world' : 'local');
+        runtime.transform.setTranslationSnap(snapEnabled ? 0.01 : null);
+        runtime.transform.setRotationSnap(snapEnabled ? Math.PI / 36 : null);
+        runtime.selectionBox.visible = false;
+        return;
+      }
 
       const selectedNode = document.nodes.find((node) => node.id === document.selectedNodeId);
       if (tool !== 'parts') {
@@ -2912,6 +3031,15 @@ export const ThreeViewport = ({
       runtime.transform.setScaleSnap(snapEnabled ? 0.1 : null);
 
       if (selected) {
+        const stateColors = {
+          normal: '#42d47b',
+          warning: '#e3a34f',
+          alarm: '#ef5350',
+          disconnected: '#77848b',
+        } as const;
+        const selectionMaterial = runtime.selectionBox.material as THREE.LineBasicMaterial;
+        const currentVisualState = visualStateRef.current;
+        selectionMaterial.color.set(currentVisualState ? stateColors[currentVisualState] : '#30d6c8');
         runtime.selectionBox.setFromObject(selected);
         runtime.selectionBox.visible = true;
       } else {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, Axis3D, CircleDot, Clock3, Eye, EyeOff, Gauge, HelpCircle, KeyRound, Link2, Pause, Play, Plus, RotateCcw, Save, Settings2, Trash2, X } from 'lucide-react';
+import { Activity, Axis3D, CircleDot, Clock3, Eye, EyeOff, Gauge, HelpCircle, KeyRound, Link2, Move3D, Pause, Play, Plus, Rotate3D, RotateCcw, Save, Settings2, Trash2, X } from 'lucide-react';
 import type { KinematicGraph, KinematicJoint, KinematicState } from '../../domain/kinematics';
 import {
   activeMotionClip,
@@ -35,8 +35,9 @@ type AdvancedRigWorkspaceProps = {
   onJointValueChange: (jointId: string, value: number) => void;
   onJointValuesChange: (values: Record<string, number>) => void;
   onResetPose: () => void;
-  onShowJoint: (jointId: string, mode: 'show-joint' | 'pick-origin' | 'axis-gizmo') => void;
+  onShowJoint: (jointId: string, mode: 'show-joint' | 'pick-origin' | 'axis-gizmo' | 'ring-translate' | 'ring-rotate') => void;
   onSave: () => void | Promise<void>;
+  onCommitJointFrame: (jointId: string) => void;
   tutorialRequest?: number;
 };
 
@@ -63,6 +64,12 @@ const axisName = (joint: KinematicJoint) => {
 const formatValue = (value: number, joint: KinematicJoint) =>
   joint.type === 'prismatic' ? `${value.toFixed(3)} m` : `${(value * 180 / Math.PI).toFixed(1)} deg`;
 
+const ringPlaneOptions = [
+  { plane: 'xy' as const, label: 'XY', axis: [0, 0, 1] as [number, number, number], description: 'Ring lies on XY and rotates around Z.' },
+  { plane: 'xz' as const, label: 'XZ', axis: [0, 1, 0] as [number, number, number], description: 'Ring lies on XZ and rotates around Y.' },
+  { plane: 'yz' as const, label: 'YZ', axis: [1, 0, 0] as [number, number, number], description: 'Ring lies on YZ and rotates around X.' },
+];
+
 export const AdvancedRigWorkspace = ({
   nodeId,
   graph,
@@ -76,6 +83,7 @@ export const AdvancedRigWorkspace = ({
   onResetPose,
   onShowJoint,
   onSave,
+  onCommitJointFrame,
   tutorialRequest = 0,
 }: AdvancedRigWorkspaceProps) => {
   const [tab, setTab] = useState<AdvancedRigTab>('rig');
@@ -83,11 +91,13 @@ export const AdvancedRigWorkspace = ({
   const [playing, setPlaying] = useState(false);
   const [showTutorial, setShowTutorial] = useState(false);
   const [newClipName, setNewClipName] = useState('Robot Action');
+  const [referenceStep, setReferenceStep] = useState(0.01);
   const playbackStartedAt = useRef(0);
   const playbackOffset = useRef(0);
   const settings = normalizeAnimationSettings(graph.animationSettings);
   const clip = activeMotionClip(graph);
   const selectedJoint = graph.joints.find((joint) => joint.id === selectedJointId) ?? graph.joints[0];
+  const selectedRigControl = graph.rigControls?.find((control) => control.jointId === selectedJoint?.id);
   const hierarchy = useMemo(() => flattenRigHierarchy(buildRigHierarchy(graph)), [graph]);
   const diagnostics = useMemo(() => diagnoseAdvancedRig(graph), [graph]);
   const errors = diagnostics.filter((item) => item.severity === 'error').length;
@@ -151,6 +161,21 @@ export const AdvancedRigWorkspace = ({
     setPlaying(false);
     setTime(nextTime);
     if (clip) onJointValuesChange(sampleKinematicMotionClip(clip, nextTime));
+  };
+
+  const applyRingPlane = (plane: 'xy' | 'xz' | 'yz', axis: [number, number, number]) => {
+    if (!selectedJoint) return;
+    onJointChange(selectedJoint.id, { axis, motionPlane: plane, status: 'candidate', validation: undefined });
+    if (selectedRigControl) {
+      applyGraph((current) => updateRigControl(current, selectedRigControl.id, { shape: 'ring', visible: true }), `Ring aligned to ${plane.toUpperCase()} plane`);
+    }
+  };
+
+  const updateRingReference = (index: number, value: number) => {
+    if (!selectedJoint) return;
+    const position: [number, number, number] = [...selectedJoint.origin.position];
+    position[index] = value;
+    onJointChange(selectedJoint.id, { origin: { ...selectedJoint.origin, position }, status: 'candidate', validation: undefined });
   };
 
   return (
@@ -299,6 +324,66 @@ export const AdvancedRigWorkspace = ({
             <button onClick={() => onShowJoint(selectedJoint.id, 'pick-origin')}><CircleDot size={14} /><span>Pick pivot</span></button>
             <button onClick={() => onShowJoint(selectedJoint.id, 'axis-gizmo')}><Axis3D size={14} /><span>Edit axis</span></button>
           </div>
+          {selectedJoint.type !== 'fixed' && selectedJoint.type !== 'prismatic' && (
+            <section className="ring-frame-calibration" aria-label="Rotation ring frame calibration">
+              <div className="ring-calibration-head">
+                <div>
+                  <strong>Rotation ring reference</strong>
+                  <span>The ring plane defines the real rotation axis. Its reference point is the joint pivot.</span>
+                </div>
+                <button
+                  type="button"
+                  className={selectedRigControl?.shape === 'ring' && selectedRigControl.visible ? 'active' : ''}
+                  onClick={() => selectedRigControl && applyGraph((current) => updateRigControl(current, selectedRigControl.id, { shape: 'ring', visible: true }), 'Rotation ring displayed')}
+                >
+                  <CircleDot size={14} /><span>Show ring</span>
+                </button>
+              </div>
+              <div className="ring-plane-selector" role="group" aria-label="Rotation ring plane">
+                {ringPlaneOptions.map((option) => (
+                  <button
+                    type="button"
+                    key={option.plane}
+                    className={selectedJoint.motionPlane === option.plane ? 'active' : ''}
+                    title={option.description}
+                    onClick={() => applyRingPlane(option.plane, option.axis)}
+                  >
+                    <span>{option.label}</span><small>around {option.axis[0] ? 'X' : option.axis[1] ? 'Y' : 'Z'}</small>
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  title="Reverse the positive rotation direction without moving the pivot."
+                  onClick={() => onJointChange(selectedJoint.id, { axis: selectedJoint.axis.map((value) => -value) as [number, number, number], status: 'candidate', validation: undefined })}
+                >
+                  <RotateCcw size={14} /><span>Reverse</span>
+                </button>
+              </div>
+              <div className="ring-reference-editor">
+                <div className="ring-reference-title">
+                  <span>Reference position</span>
+                  <label><span>Step</span><select value={referenceStep} onChange={(event) => setReferenceStep(Number(event.target.value))}><option value="0.001">0.001</option><option value="0.01">0.01</option><option value="0.1">0.1</option></select></label>
+                </div>
+                {(['X', 'Y', 'Z'] as const).map((axisLabel, index) => (
+                  <div className={`ring-reference-axis axis-${axisLabel.toLowerCase()}`} key={axisLabel}>
+                    <strong>{axisLabel}</strong>
+                    <button type="button" aria-label={`Decrease ring reference ${axisLabel}`} onClick={() => updateRingReference(index, selectedJoint.origin.position[index] - referenceStep)}>-</button>
+                    <input aria-label={`Ring reference ${axisLabel}`} type="number" step={referenceStep} value={selectedJoint.origin.position[index]} onChange={(event) => updateRingReference(index, finiteInput(event.target.value, selectedJoint.origin.position[index]))} />
+                    <button type="button" aria-label={`Increase ring reference ${axisLabel}`} onClick={() => updateRingReference(index, selectedJoint.origin.position[index] + referenceStep)}>+</button>
+                  </div>
+                ))}
+              </div>
+              <div className="ring-calibration-actions">
+                <button type="button" onClick={() => onShowJoint(selectedJoint.id, 'pick-origin')}><CircleDot size={14} /><span>Pick reference on model</span></button>
+                <button type="button" onClick={() => onShowJoint(selectedJoint.id, 'axis-gizmo')}><Axis3D size={14} /><span>Arbitrary orientation</span></button>
+                <button type="button" onClick={() => onShowJoint(selectedJoint.id, 'ring-translate')}><Move3D size={14} /><span>Move ring in 3D</span></button>
+                <button type="button" onClick={() => onShowJoint(selectedJoint.id, 'ring-rotate')}><Rotate3D size={14} /><span>Rotate ring in 3D</span></button>
+                <button type="button" onClick={() => onJointValueChange(selectedJoint.id, 0)}><RotateCcw size={14} /><span>Joint zero</span></button>
+                <button type="button" className="primary" onClick={() => onCommitJointFrame(selectedJoint.id)}><Save size={14} /><span>Adopt as Joint Movement</span></button>
+              </div>
+              <p className="ring-calibration-note">Choose the plane first, then use Move ring or Rotate ring to place its local XYZ frame on the physical bearing. Adopt as Joint Movement persists the complete frame with the robot.</p>
+            </section>
+          )}
           <div className="constraint-grid">
             <label><span>Motion</span><select value={selectedJoint.type} onChange={(event) => onJointChange(selectedJoint.id, { type: event.target.value as KinematicJoint['type'] })}><option value="fixed">Fixed</option><option value="revolute">Revolute</option><option value="continuous">Continuous</option><option value="prismatic">Prismatic</option><option value="screw">Screw</option></select></label>
             <label><span>Lower</span><input type="number" step="0.01" value={selectedJoint.limits?.lower ?? ''} onChange={(event) => onJointChange(selectedJoint.id, { limits: { ...selectedJoint.limits, lower: finiteInput(event.target.value, 0) } })} /></label>

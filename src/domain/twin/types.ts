@@ -8,6 +8,26 @@ export type DataQuality = 'GOOD' | 'UNCERTAIN' | 'BAD' | 'STALE' | 'COMM_LOST' |
 
 export type TwinSignalValue = boolean | number | string | number[];
 
+export type TwinPropertyAccess = 'READ' | 'WRITE' | 'READ_WRITE';
+
+export type TwinProperty = {
+  id: string;
+  componentId: string;
+  path: string;
+  name: string;
+  dataType: 'bool' | 'int' | 'uint' | 'float' | 'double' | 'string' | 'enum' | 'bytes';
+  unit?: string;
+  value?: TwinSignalValue;
+  access: TwinPropertyAccess;
+  writable: boolean;
+  range?: { min?: number; max?: number };
+  safeRange?: { min?: number; max?: number };
+  requiresConfirmation: boolean;
+  timestampUtc?: string;
+  quality: DataQuality;
+  metadata: Record<string, unknown>;
+};
+
 export type AssetRef = {
   kind: 'embedded-data-url' | 'warehouse-glb' | 'project-node' | 'external-uri';
   uri: string;
@@ -57,7 +77,18 @@ export type QualityPolicy = {
   missingTimestampQuality: DataQuality;
 };
 
-export type ProtocolKind = 'modbus' | 'mqtt' | 'opcua' | 'profinet' | 'sim';
+export type ProtocolKind = 'modbus' | 'mqtt' | 'opcua' | 'rest' | 'websocket' | 'ble' | 'profinet' | 'sim';
+
+export type ConnectionProfile = {
+  id: string;
+  name: string;
+  protocol: ProtocolKind;
+  endpoint: string;
+  enabled: boolean;
+  autoReconnect: boolean;
+  reconnectDelayMs: number;
+  metadata: Record<string, unknown>;
+};
 
 export type ModbusMapping = {
   kind: 'modbus';
@@ -135,6 +166,25 @@ export type TwinBinding = {
   protocol: ProtocolKind;
   mapping: ProtocolMapping;
   transform?: EngineeringTransform;
+  enabled: boolean;
+  metadata: Record<string, unknown>;
+};
+
+export type SignalBindingDirection = 'READ' | 'WRITE' | 'READ_WRITE';
+export type SignalBindingStatus = 'CONNECTED' | 'READING' | 'WRITING' | 'DISCONNECTED' | 'TIMEOUT' | 'BAD_QUALITY' | 'ERROR';
+
+export type SignalBinding = {
+  id: string;
+  propertyId: string;
+  connectionId: string;
+  protocol: ProtocolKind;
+  source: ProtocolMapping;
+  dataType: string;
+  transform?: EngineeringTransform;
+  direction: SignalBindingDirection;
+  pollingMs?: number;
+  qualityPolicy: QualityPolicy;
+  status: SignalBindingStatus;
   enabled: boolean;
   metadata: Record<string, unknown>;
 };
@@ -260,6 +310,8 @@ export type TwinProject = {
   relationships: TwinRelationship[];
   signals: TwinSignal[];
   bindings: TwinBinding[];
+  properties: TwinProperty[];
+  signalBindings: SignalBinding[];
   state: TwinStateVector;
   connectionHealth: ConnectionHealth[];
   events: TwinEvent[];
@@ -271,6 +323,8 @@ export type TwinProject = {
     sourceDocumentId?: string;
     maturityLevel: TwinMaturityLevel;
     references: string[];
+    platform?: 'TwinAxis';
+    legacyPlatform?: string;
   };
 };
 

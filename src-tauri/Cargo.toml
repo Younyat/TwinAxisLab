@@ -1,8 +1,8 @@
 [package]
 name = "asset_forge_desktop"
 version = "0.1.0"
-description = "3D Asset Forge desktop host"
-authors = ["3D Asset Forge"]
+description = "TwinAxis desktop host"
+authors = ["TwinAxis"]
 edition = "2021"
 
 [lib]

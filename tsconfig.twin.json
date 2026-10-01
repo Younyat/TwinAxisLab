@@ -14,6 +14,8 @@
     "src/domain/mechanics/**/*.ts",
     "src/domain/twin/**/*.ts",
     "src/application/industrialScene/industrialScenePack.ts",
-    "src/application/twin/**/*.ts"
+    "src/application/mechanics/**/*.ts",
+    "src/application/twin/**/*.ts",
+    "src/infrastructure/protocols/**/*.ts"
   ]
 }

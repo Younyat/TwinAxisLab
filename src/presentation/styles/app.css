@@ -215,7 +215,7 @@ button:disabled {
   bottom: 24px;
   width: min(1180px, calc(100vw - 20px));
   display: grid;
-  grid-template-rows: auto auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto auto auto minmax(0, 1fr) auto;
   overflow: hidden;
   border: 1px solid rgba(85, 214, 202, 0.5);
   border-radius: 7px;
@@ -240,6 +240,29 @@ button:disabled {
 .internal-settings-notice strong { color: #e5edef; font-size: 10px; }
 .internal-settings-notice small { color: #94a2a9; font-size: 9px; }
 .internal-settings-notice code { color: #7de0d7; }
+.connection-manager { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 8px; padding: 8px 10px; border-bottom: 1px solid #303a40; background: #141a1e; }
+.connection-manager-title { display: flex; align-items: center; gap: 8px; color: #62d9cf; }
+.connection-manager-title span { display: grid; gap: 2px; }
+.connection-manager-title strong { color: #e5edef; font-size: 10px; }
+.connection-manager-title small { color: #849198; font-size: 8px; }
+.connection-manager-grid { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.connection-card { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 8px; padding: 7px 9px; border: 1px solid #344047; border-radius: 4px; background: #1b2226; }
+.connection-card > div { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.connection-card strong { font-size: 10px; }
+.connection-card i { font-size: 8px; font-style: normal; }
+.connection-card i.online { color: #55df8a; }.connection-card i.connecting, .connection-card i.degraded { color: #f0b45e; }.connection-card i.disconnected { color: #89969c; }
+.connection-card span, .connection-card small { color: #839198; font-size: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connection-card code { color: #79dcd3; font-size: 8px; overflow: hidden; text-overflow: ellipsis; }
+.connection-card small { grid-column: 1 / -1; }
+.connection-profile-card { grid-template-columns: minmax(0, 1fr); align-content: start; }
+.connection-profile-card > div:first-child { grid-column: 1; }
+.connection-profile-card input { min-width: 0; width: 100%; height: 25px; border: 1px solid #3b474d; border-radius: 3px; padding: 3px 6px; color: #dce5e8; background: #11171a; font-size: 9px; }
+.connection-profile-card input:disabled { border-color: transparent; padding-left: 0; color: #dce5e8; background: transparent; }
+.connection-profile-actions { display: flex !important; justify-content: flex-start !important; gap: 6px !important; }
+.connection-profile-actions label { display: flex; align-items: center; gap: 4px; color: #9ba8ae; font-size: 8px; }
+.connection-profile-actions label input { width: 14px; height: 14px; accent-color: #51d58b; }
+.connection-profile-actions button { min-height: 24px; padding: 3px 7px; font-size: 8px; }
+.connection-card i.failed { color: #ef665f; }
 .internal-register-toolbar { display: flex; align-items: center; gap: 7px; padding: 7px 10px; border-bottom: 1px solid #303a40; }
 .internal-register-toolbar button { min-height: 30px; padding: 4px 9px; font-size: 9px; }
 .internal-register-toolbar .configuration-edit-toggle.editing { border-color: #42d47b; background: #173725; color: #8aefae; box-shadow: 0 0 0 1px rgba(66, 212, 123, 0.18) inset; }
@@ -269,6 +292,8 @@ button:disabled {
 .internal-live-value small { color: #7f8d94; font-size: 8px; }
 .internal-register-row > button.icon { width: 30px; min-width: 30px; min-height: 30px; padding: 0; }
 .register-conflict-message { grid-column: 2 / -1; display: flex; align-items: center; gap: 5px; color: #ff8b84; font-size: 9px; }
+.mapping-fields { grid-column: 2 / -1; display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); gap: 6px; padding: 7px; border: 1px solid #303b40; border-radius: 4px; background: #151b1e; }
+.mapping-fields label { min-width: 0; }
 .internal-settings-center > footer { display: flex; align-items: center; gap: 7px; min-height: 34px; padding: 7px 12px; border-top: 1px solid #354047; color: #8f9ca3; background: #171d20; font-size: 9px; }
 .internal-settings-center > footer svg { flex: 0 0 auto; color: #55d6ca; }
 .configuration-confirmation { position: absolute; z-index: 8; inset: 0; display: grid; place-items: center; padding: 18px; background: rgba(5, 8, 10, 0.72); backdrop-filter: blur(5px); }
@@ -537,6 +562,10 @@ button:disabled {
 .openplc-title strong { color: #eef4f5; font-size: 10px; }
 .openplc-title span { color: #8fa0a8; font-size: 9px; }
 .openplc-connector.online .openplc-title span { color: #7bea9e; }
+.openplc-connector.stalled { border-color: #d56a58; }
+.openplc-connector.stalled .openplc-title span,
+.openplc-runtime-error { color: #ff9b8d; }
+.openplc-runtime-error { display: block; font-size: 10px; line-height: 1.4; padding: 7px; border-left: 3px solid #d56a58; background: rgba(92, 32, 27, 0.28); }
 
 .openplc-connector label span,
 .openplc-connector label small,
@@ -1103,6 +1132,79 @@ button:disabled {
   font-weight: 700;
   white-space: nowrap;
 }
+.brand span { display: grid; }
+.brand span::after { content: 'Industrial Digital Twin Engineering Platform'; color: #7f8d94; font-size: 7px; font-weight: 500; line-height: 1; }
+.twin-inspector { display: grid; gap: 8px; }
+.twin-mode-badge { padding: 2px 5px; border: 1px solid #3d7f79; border-radius: 3px; color: #7de0d7; font-size: 8px; text-transform: uppercase; }
+.twin-inspector-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+.twin-inspector-summary span { display: grid; gap: 2px; padding: 6px; border: 1px solid #333d42; background: #171d20; color: #859299; font-size: 8px; text-align: center; }
+.twin-inspector-summary b { color: #e5edef; font-size: 12px; }
+.twin-property-list { display: grid; gap: 3px; max-height: 270px; overflow: auto; }
+.twin-property-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 3px 8px; padding: 6px 7px; border-left: 2px solid #3f8d86; background: #171e21; }
+.twin-property-row > span { min-width: 0; display: grid; gap: 1px; }
+.twin-property-row strong { overflow: hidden; text-overflow: ellipsis; font-size: 9px; }
+.twin-property-row small { overflow: hidden; text-overflow: ellipsis; color: #7e8b92; font-size: 7px; white-space: nowrap; }
+.twin-property-row code { color: #83e2d9; font-size: 9px; }
+.twin-property-row i { color: #a7b1b6; font-size: 7px; font-style: normal; }.twin-property-row i.good { color: #55df8a; }.twin-property-row i.bad, .twin-property-row i.comm_lost, .twin-property-row i.out_of_range { color: #ff7770; }
+.live-twin-monitor { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+.live-twin-monitor h4 { grid-column: 1 / -1; margin: 2px 0; font-size: 9px; }
+.live-twin-monitor div { display: grid; gap: 2px; padding: 5px; border-top: 2px solid #3e817b; background: #171d20; text-align: center; }
+.live-twin-monitor span { color: #829097; font-size: 7px; }.live-twin-monitor strong { font-size: 11px; }
+.twin-overlay-toggle { grid-template-columns: auto minmax(0, 1fr) auto; justify-content: initial; }
+.twin-overlay-toggle > span { text-align: left; }
+.twin-overlay-toggle .operational-state { padding: 2px 5px; border: 1px solid #465158; border-radius: 3px; color: #aab4b9; font-size: 7px; font-style: normal; text-transform: uppercase; }
+.twin-overlay-toggle .operational-state.normal { border-color: #397955; color: #63dc91; }
+.twin-overlay-toggle .operational-state.warning { border-color: #96702b; color: #e3b251; }
+.twin-overlay-toggle .operational-state.alarm { border-color: #9f4141; color: #ff7770; }
+.twin-overlay-toggle .operational-state.disconnected { border-color: #566168; color: #9ca8ae; }
+.twin-operational-detail { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+.twin-operational-detail h4, .twin-activity-list h4 { grid-column: 1 / -1; margin: 3px 0 1px; color: #cbd5d9; font-size: 9px; }
+.twin-operational-detail > div { display: grid; gap: 2px; padding: 5px 6px; background: #171d20; border-left: 2px solid #4d7774; }
+.twin-operational-detail span { color: #829097; font-size: 7px; }
+.twin-operational-detail strong { overflow: hidden; color: #dbe5e8; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.twin-activity-list { display: grid; gap: 3px; }
+.twin-activity-list > div { display: grid; grid-template-columns: minmax(0, .8fr) auto; gap: 2px 7px; padding: 5px 6px; background: #171d20; }
+.twin-activity-list span, .twin-activity-list strong { overflow: hidden; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.twin-activity-list small { grid-column: 1 / -1; overflow: hidden; color: #7f8d93; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
+.twin-activity-list p { margin: 0; padding: 5px 6px; color: #748187; background: #171d20; font-size: 8px; }
+.twin-activity-list .online, .twin-activity-list .info { color: #55df8a; }
+.twin-activity-list .degraded, .twin-activity-list .warning { color: #e3b251; }
+.twin-activity-list .failed, .twin-activity-list .error { color: #ff7770; }
+.historian-panel { display: grid; gap: 5px; padding: 7px; border: 1px solid #344148; background: #151b1e; }
+.historian-panel .section-title-row h4 { margin: 0; font-size: 9px; }
+.historian-panel .section-title-row span { color: #819097; font-size: 8px; }
+.historian-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+.historian-actions button { min-width: 0; padding: 0 5px; font-size: 8px; }
+.historian-actions button span { overflow: hidden; text-overflow: ellipsis; }
+.historian-panel input[type='range'] { width: 100%; }
+.replay-readout { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 7px; align-items: center; }
+.replay-readout span { color: #65d7cc; font-size: 9px; }
+.replay-readout strong { overflow: hidden; font-size: 8px; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.replay-readout code { grid-column: 1 / -1; color: #77868c; font-size: 7px; }
+.alarm-center { display: grid; gap: 5px; padding: 7px; border: 1px solid #493c38; background: #191817; }
+.alarm-center .section-title-row h4 { margin: 0; font-size: 9px; }
+.alarm-center .section-title-row button { height: 24px; padding: 0 6px; font-size: 8px; }
+.alarm-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+.alarm-summary span { display: grid; gap: 1px; padding: 5px; color: #958b87; background: #201d1b; font-size: 7px; text-align: center; }
+.alarm-summary b { color: #f0d9d0; font-size: 11px; }
+.alarm-rule-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)) auto auto; gap: 4px; padding: 6px; border-left: 2px solid #a36b43; background: #211d1b; }
+.alarm-rule-row label { display: grid; gap: 2px; min-width: 0; }
+.alarm-rule-row label span { color: #9c908a; font-size: 7px; }
+.alarm-rule-row input, .alarm-rule-row select { min-width: 0; height: 24px; padding: 0 4px; font-size: 8px; }
+.alarm-rule-row .alarm-instance-state { grid-column: 1 / -1; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px; padding: 4px 5px; background: #171514; }
+.alarm-instance-state strong { font-size: 8px; text-transform: uppercase; }.alarm-instance-state small { overflow: hidden; color: #928985; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
+.alarm-instance-state.active { border-left: 2px solid #ef5350; }.alarm-instance-state.acked { border-left: 2px solid #e3a34f; }.alarm-instance-state.shelved { border-left: 2px solid #77848b; }
+.alarm-center > p { margin: 0; padding: 6px; color: #897f7a; background: #201d1b; font-size: 8px; }
+.alarm-event { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px; padding: 4px 5px; font-size: 7px; }.alarm-event.error { border-left: 2px solid #ef5350; }.alarm-event.warning { border-left: 2px solid #e3a34f; }
+.scenario-studio { display: grid; gap: 5px; padding: 7px; border: 1px solid #34434a; background: #161b1e; }
+.scenario-studio .section-title-row h4 { margin: 0; font-size: 9px; }.scenario-studio .section-title-row button { height: 24px; padding: 0 6px; font-size: 8px; }
+.scenario-studio > label, .scenario-fields label { display: grid; gap: 2px; min-width: 0; }.scenario-studio label span { color: #829097; font-size: 7px; }
+.scenario-studio input, .scenario-studio select { min-width: 0; height: 24px; padding: 0 4px; font-size: 8px; }
+.scenario-fields { display: grid; grid-template-columns: minmax(0, 1fr) 82px auto; gap: 4px; }.scenario-fields .scenario-loop { display: flex; align-items: center; gap: 3px; }.scenario-fields .scenario-loop input { width: 14px; }
+.scenario-actions-list { display: grid; gap: 3px; }.scenario-actions-list > div { display: grid; grid-template-columns: 55px minmax(0, 1fr) 55px 24px; gap: 3px; }
+.scenario-transport { display: grid; grid-template-columns: auto auto minmax(0, 1fr); gap: 4px; align-items: center; }.scenario-transport button { height: 25px; padding: 0 6px; font-size: 8px; }.scenario-transport strong { color: #a8b5ba; font-size: 8px; text-align: right; }
+.scenario-status { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 6px; padding: 5px; background: #121719; }.scenario-status span, .scenario-status strong { font-size: 8px; }.scenario-status code { grid-column: 1 / -1; color: #5fc7bd; font-size: 7px; }
+.scenario-studio > p { margin: 0; padding: 6px; color: #7f8d93; background: #121719; font-size: 8px; }
 
 .toolbar-group {
   display: flex;
@@ -1200,6 +1302,126 @@ button:disabled {
 
 .right-panel {
   border-left: 1px solid #30363d;
+}
+
+.inspector-workflow {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid #30363d;
+  background: #1b2024;
+}
+
+.inspector-priority-nav {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.inspector-priority-nav button {
+  display: grid;
+  justify-items: center;
+  gap: 3px;
+  min-width: 0;
+  min-height: 46px;
+  padding: 5px 2px;
+  border-color: #384149;
+  background: #252b30;
+}
+
+.inspector-priority-nav button b {
+  display: grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  border: 1px solid #59656d;
+  border-radius: 50%;
+  color: #c7d1d6;
+  font-size: 9px;
+}
+
+.inspector-priority-nav button span {
+  width: 100%;
+  overflow: hidden;
+  color: #aeb8bf;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inspector-priority-nav button.active {
+  border-color: #55d6ca;
+  background: #153634;
+}
+
+.inspector-priority-nav button.active b {
+  border-color: #55d6ca;
+  background: #55d6ca;
+  color: #102322;
+}
+
+.inspector-priority-nav button.active span {
+  color: #d9fffb;
+}
+
+.inspector-dynamic-guide {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 9px;
+  border: 1px solid #3c5056;
+  border-radius: 6px;
+  background: #202a2e;
+  color: #75ddd4;
+}
+
+.inspector-dynamic-guide > div {
+  display: grid;
+  gap: 3px;
+}
+
+.inspector-dynamic-guide strong {
+  color: #edf6f7;
+  font-size: 11px;
+}
+
+.inspector-dynamic-guide p {
+  color: #b8c4c9;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.inspector-dynamic-guide > button {
+  grid-column: 2;
+  justify-self: start;
+  min-height: 27px;
+  padding: 4px 8px;
+  border-color: #4a817c;
+  color: #d9fffb;
+}
+
+.inspector-stage-empty {
+  display: grid;
+  justify-items: start;
+  gap: 7px;
+  margin: 10px;
+  padding: 12px;
+  border: 1px dashed #46535b;
+  border-radius: 6px;
+  color: #82cfc8;
+  background: #1c2226;
+}
+
+.inspector-stage-empty strong {
+  color: #e2ebee;
+  font-size: 12px;
+}
+
+.inspector-stage-empty p {
+  color: #aeb9bf;
+  font-size: 10px;
+  line-height: 1.45;
 }
 
 .panel section,
@@ -1806,6 +2028,182 @@ input[type="color"] {
 .nearby-joints button {
   min-height: 26px;
   font-size: 11px;
+}
+
+.joint-range-editor {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid rgba(85, 214, 202, 0.4);
+  border-radius: 6px;
+  background: rgba(14, 29, 31, 0.92);
+}
+
+.joint-range-editor-head,
+.joint-range-error,
+.joint-range-actions {
+  grid-column: 1 / -1;
+}
+
+.joint-range-editor-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.joint-range-editor-head strong {
+  color: #e8f4f3;
+  font-size: 12px;
+}
+
+.joint-range-editor-head span,
+.joint-range-editor label span {
+  color: #aebac0;
+  font-size: 10px;
+}
+
+.joint-range-editor label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.joint-range-editor input {
+  width: 100%;
+  min-width: 0;
+}
+
+.joint-range-error {
+  color: #ffaaa1;
+  font-size: 11px;
+}
+
+.joint-range-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.ring-frame-calibration {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #42635f;
+  border-radius: 6px;
+  background: #172426;
+}
+
+.ring-calibration-head,
+.ring-reference-title,
+.ring-calibration-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ring-calibration-head > div {
+  display: grid;
+  gap: 3px;
+}
+
+.ring-calibration-head strong {
+  color: #eff8f7;
+  font-size: 12px;
+}
+
+.ring-calibration-head span,
+.ring-reference-title > span,
+.ring-calibration-note {
+  color: #aebdc0;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.ring-plane-selector {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.ring-plane-selector button {
+  display: grid;
+  justify-items: center;
+  gap: 2px;
+  min-width: 0;
+  min-height: 40px;
+  padding: 5px;
+}
+
+.ring-plane-selector button span {
+  color: #e4ecef;
+  font-weight: 700;
+  font-size: 11px;
+}
+
+.ring-plane-selector button small {
+  color: #8f9da3;
+  font-size: 8px;
+}
+
+.ring-plane-selector button.active {
+  border-color: #55d6ca;
+  background: #153b38;
+}
+
+.ring-reference-editor {
+  display: grid;
+  gap: 5px;
+}
+
+.ring-reference-title label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #9eabb0;
+  font-size: 9px;
+}
+
+.ring-reference-title select {
+  min-height: 25px;
+  padding: 2px 5px;
+}
+
+.ring-reference-axis {
+  display: grid;
+  grid-template-columns: 20px 28px minmax(0, 1fr) 28px;
+  gap: 4px;
+  align-items: center;
+}
+
+.ring-reference-axis strong {
+  font-size: 11px;
+  text-align: center;
+}
+
+.ring-reference-axis.axis-x strong { color: #ff6868; }
+.ring-reference-axis.axis-y strong { color: #65dc83; }
+.ring-reference-axis.axis-z strong { color: #74a6ff; }
+
+.ring-reference-axis button {
+  min-height: 28px;
+  padding: 3px;
+}
+
+.ring-reference-axis input {
+  width: 100%;
+  min-width: 0;
+}
+
+.ring-calibration-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.ring-calibration-actions button {
+  min-width: 0;
 }
 
 .viewport-inspection-card {
@@ -3033,6 +3431,7 @@ input[type="color"] {
 }
 
 .warehouse-dashboard {
+  position: relative;
   min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
@@ -3100,6 +3499,19 @@ input[type="color"] {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.warehouse-search { display: flex; align-items: center; gap: 5px; min-width: 190px; height: 30px; padding: 0 7px; border: 1px solid #3b474e; background: #181d20; }
+.warehouse-search input { min-width: 0; width: 100%; border: 0; background: transparent; font-size: 10px; }
+.warehouse-type-filter { display: flex; gap: 2px; }.warehouse-type-filter button { height: 30px; padding: 0 7px; font-size: 9px; }
+.functional-library-inspector { position: absolute; z-index: 12; top: 0; right: 0; bottom: 0; width: min(430px, 92vw); display: grid; align-content: start; gap: 9px; overflow: auto; padding: 10px; border-left: 1px solid #46535b; background: rgba(27, 32, 36, .98); box-shadow: -16px 0 34px rgba(0, 0, 0, .34); }
+.functional-library-inspector > header { position: sticky; z-index: 2; top: -10px; display: flex; justify-content: space-between; align-items: center; padding: 8px 2px; background: #1b2024; }.functional-library-inspector > header div { display: grid; }.functional-library-inspector > header small { color: #8e9ba1; font-size: 9px; }
+.functional-library-inspector h3 { margin: 3px 0 0; font-size: 10px; }
+.component-identity-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }.component-identity-grid label { display: grid; gap: 2px; }.component-identity-grid span, .assembly-connection label span { color: #849198; font-size: 8px; }.component-identity-grid input, .component-identity-grid select { min-width: 0; height: 28px; font-size: 9px; }
+.component-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }.component-metrics span { display: grid; gap: 2px; padding: 6px; background: #151a1d; color: #839097; font-size: 8px; text-align: center; }.component-metrics b { color: #e4ecef; font-size: 12px; }
+.mechanical-interface-list, .assembly-connection-list, .assembly-validation-list { display: grid; gap: 5px; }.mechanical-interface-list > div { display: grid; grid-template-columns: minmax(0, 1fr) 90px auto auto; gap: 4px; align-items: center; padding: 6px; border-left: 2px solid #3f8d86; background: #151b1e; }.mechanical-interface-list input, .mechanical-interface-list select { min-width: 0; height: 26px; font-size: 9px; }.mechanical-interface-list code, .mechanical-interface-list strong { font-size: 8px; }
+.assembly-validation-banner { display: flex; gap: 7px; padding: 8px; border-left: 3px solid #77848b; background: #151a1d; }.assembly-validation-banner.valid { border-color: #42d47b; }.assembly-validation-banner.warning { border-color: #e3a34f; }.assembly-validation-banner.invalid { border-color: #ef5350; }.assembly-validation-banner span { display: grid; }.assembly-validation-banner small { color: #8b979d; font-size: 8px; }
+.assembly-connection { display: grid; gap: 5px; padding: 7px; border-left: 2px solid #7f8c92; background: #151a1d; }.assembly-connection.validated { border-color: #42d47b; }.assembly-connection.rejected { opacity: .64; border-color: #ef5350; }.assembly-connection.manual { border-color: #55a7d8; }.assembly-connection > header { display: flex; justify-content: space-between; gap: 8px; }.assembly-connection > header strong { overflow: hidden; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }.assembly-connection select, .assembly-connection input { min-width: 0; height: 25px; font-size: 8px; }.assembly-connection > label { display: grid; grid-template-columns: 44px minmax(0, 1fr); align-items: center; }.connection-axis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }.connection-axis label, .connection-limits label { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px; align-items: center; }.connection-limits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }.assembly-connection > small { overflow: hidden; color: #7f8b91; font-size: 7px; text-overflow: ellipsis; white-space: nowrap; }
+.assembly-validation-list > div { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px; padding: 5px; background: #151a1d; color: #aeb8bd; font-size: 8px; }
 
 .warehouse-dashboard-body {
   min-height: 0;
@@ -3334,5 +3746,620 @@ input[type="color"] {
   .advanced-tutorial > footer {
     align-items: stretch;
     flex-direction: column;
+  }
+}
+
+/* Responsive application shell ------------------------------------------------ */
+html,
+#root {
+  width: 100%;
+  min-width: 320px;
+  min-height: 100%;
+}
+
+.topbar,
+.workbench,
+.warehouse-dashboard,
+.warehouse-dashboard-head,
+.warehouse-dashboard-body,
+.panel,
+.viewport,
+.plc-dashboard,
+.trace-audit-shell,
+.internal-settings-center {
+  min-width: 0;
+}
+
+.topbar {
+  min-height: 48px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+  scrollbar-width: thin;
+}
+
+.topbar > * {
+  flex: 0 0 auto;
+}
+
+@media (max-width: 1280px) {
+  .app-shell {
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
+  }
+
+  .topbar {
+    gap: 6px;
+    padding: 6px 8px;
+  }
+
+  .brand {
+    padding: 0 8px;
+  }
+
+  .toolbar-group {
+    gap: 4px;
+  }
+
+  .toolbar-group button {
+    min-width: 34px;
+    padding-inline: 8px;
+  }
+
+  .cycle-tools button span,
+  .push-right button span {
+    max-width: 118px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .plc-top-button,
+  .modbus-controller-top-button {
+    min-width: 148px;
+  }
+
+  .workbench {
+    grid-template-columns: minmax(190px, 220px) minmax(320px, 1fr) minmax(250px, 300px);
+  }
+
+  .workbench:has(.mechanical-panel.advanced) {
+    grid-template-columns: minmax(180px, 210px) minmax(300px, 1fr) minmax(390px, 46vw);
+  }
+
+  .virtual-plc-rack {
+    grid-template-columns: minmax(180px, .8fr) minmax(0, 1.35fr);
+  }
+
+  .virtual-plc-process-image,
+  .openplc-connector {
+    grid-column: 1 / -1;
+  }
+
+  .openplc-connector {
+    grid-template-columns: repeat(4, minmax(90px, 1fr));
+  }
+
+  .connection-manager {
+    grid-template-columns: 150px minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 900px) {
+  body {
+    min-height: 100dvh;
+    overflow: auto;
+  }
+
+  .app-shell {
+    width: 100%;
+    min-height: 100dvh;
+    height: auto;
+    grid-template-rows: auto auto auto auto;
+  }
+
+  .topbar {
+    position: sticky;
+    z-index: 40;
+    top: 0;
+    flex-wrap: nowrap;
+    width: 100%;
+    min-height: 50px;
+    padding: 7px 8px;
+    background: rgba(31, 35, 39, .98);
+  }
+
+  .brand span::after {
+    display: none;
+  }
+
+  .cycle-tools button span,
+  .push-right button span {
+    max-width: 96px;
+  }
+
+  .workbench,
+  .workbench:has(.mechanical-panel.advanced) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(440px, 64dvh) minmax(210px, auto) minmax(280px, auto);
+    grid-template-areas:
+      'viewport'
+      'scene'
+      'inspector';
+    overflow: visible;
+  }
+
+  .workbench > .viewport {
+    grid-area: viewport;
+    min-height: 440px;
+    border-bottom: 1px solid #30363d;
+  }
+
+  .workbench > .left-panel {
+    grid-area: scene;
+    max-height: 44dvh;
+    border-top: 1px solid #30363d;
+  }
+
+  .workbench > .right-panel {
+    grid-area: inspector;
+    max-height: none;
+    border-top: 1px solid #30363d;
+  }
+
+  .panel section,
+  .inspector-head {
+    padding: 10px;
+  }
+
+  .plc-dashboard {
+    position: fixed;
+    z-index: 70;
+    inset: 56px 6px 6px;
+    width: auto;
+    max-height: none;
+    padding: 9px;
+    border-radius: 6px;
+  }
+
+  .plc-dashboard-head,
+  .plc-dashboard-head-right,
+  .plc-dashboard-actions,
+  .plc-dashboard-footer {
+    width: 100%;
+  }
+
+  .plc-dashboard-actions,
+  .plc-dashboard-footer {
+    flex-wrap: wrap;
+  }
+
+  .plc-dashboard-actions button {
+    flex: 1 1 120px;
+    min-width: 0;
+  }
+
+  .plc-endpoint-mini {
+    width: 100%;
+    max-width: none;
+    grid-template-columns: minmax(110px, 1fr) 82px repeat(3, auto);
+  }
+
+  .virtual-plc-rack,
+  .openplc-connector,
+  .plc-twin-split,
+  .plc-advanced-details,
+  .plc-dashboard-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .virtual-plc-safety {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .virtual-plc-process-image {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .openplc-command-control,
+  .iot-condition-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .openplc-command-control > span,
+  .openplc-command-control code,
+  .iot-condition-strip > div:first-child,
+  .iot-trace-cell {
+    grid-column: 1 / -1;
+  }
+
+  .plc-robot-view {
+    height: clamp(260px, var(--plc-mirror-height, 42dvh), 56dvh);
+  }
+
+  .warehouse-dashboard {
+    min-height: calc(100dvh - 80px);
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .warehouse-dashboard-head {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 9px;
+  }
+
+  .warehouse-dashboard-actions {
+    width: 100%;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    overflow: visible;
+  }
+
+  .warehouse-search {
+    flex: 1 1 210px;
+    min-width: 0;
+  }
+
+  .warehouse-dashboard-body {
+    grid-auto-flow: row;
+    grid-auto-columns: initial;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+    align-content: start;
+    overflow: visible;
+    padding: 10px;
+  }
+
+  .warehouse-rack {
+    min-height: 360px;
+  }
+
+  .connection-manager {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .connection-manager-grid {
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  }
+
+  .internal-settings-center,
+  .modbus-controller-drawer,
+  .trace-audit-drawer {
+    top: 50px;
+    bottom: 0;
+    max-height: calc(100dvh - 50px);
+  }
+
+  .internal-settings-center {
+    display: block;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .internal-register-list {
+    overflow: visible;
+  }
+
+  .drawer-width-resize-handle {
+    display: none;
+  }
+
+  .modbus-controller-edge-toggle.drawer-open,
+  .trace-audit-edge-toggle.drawer-open {
+    right: calc(100vw - 28px);
+  }
+
+  .internal-settings-notice,
+  .internal-settings-center > footer {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .advanced-rig-header,
+  .advanced-subhead,
+  .advanced-rig-footer,
+  .timeline-transport {
+    align-items: stretch;
+    flex-wrap: wrap;
+  }
+
+  .constraint-grid,
+  .animation-settings-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .statusbar {
+    min-height: 34px;
+    overflow-x: auto;
+  }
+
+  .validation-strip {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  button {
+    min-height: 38px;
+  }
+
+  .topbar {
+    min-height: 52px;
+  }
+
+  .brand {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    background: #1f2327;
+  }
+
+  .toolbar-group button {
+    min-width: 38px;
+    padding-inline: 7px;
+  }
+
+  .plc-top-button,
+  .modbus-controller-top-button {
+    min-width: 132px;
+  }
+
+  .workbench,
+  .workbench:has(.mechanical-panel.advanced) {
+    grid-template-rows: minmax(390px, 62dvh) minmax(220px, auto) minmax(300px, auto);
+  }
+
+  .workbench > .viewport {
+    min-height: 390px;
+  }
+
+  .viewport-guidance-toast {
+    top: 8px;
+    width: calc(100% - 20px);
+    max-width: none;
+    font-size: 10px;
+  }
+
+  .viewport-resource-meter {
+    left: 6px;
+    right: 6px;
+    gap: 5px;
+    overflow: hidden;
+    font-size: 8px;
+  }
+
+  .viewport-resource-meter span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .viewport-inspection-card {
+    left: 8px;
+    right: 8px;
+    bottom: 34px;
+    width: auto;
+    max-width: none;
+  }
+
+  .plc-dashboard {
+    inset: 52px 0 0;
+    padding-right: 34px;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 0;
+  }
+
+  .plc-flow,
+  .plc-screen-head,
+  .plc-packet div {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .plc-endpoint-mini,
+  .virtual-plc-safety,
+  .openplc-command-control,
+  .iot-condition-strip,
+  .openplc-iot-reaction,
+  .plc-mini-registers,
+  .live-twin-monitor,
+  .twin-inspector-summary,
+  .twin-operational-detail,
+  .alarm-summary,
+  .alarm-rule-row,
+  .scenario-fields,
+  .scenario-actions-list > div {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .plc-endpoint-mini code,
+  .openplc-command-control > span,
+  .openplc-command-control code,
+  .openplc-iot-reaction > div,
+  .iot-condition-strip > div,
+  .alarm-rule-row .alarm-instance-state,
+  .scenario-status code {
+    grid-column: 1;
+  }
+
+  .plc-mini-registers {
+    max-height: 48%;
+    overflow: auto;
+  }
+
+  .plc-register-control {
+    grid-template-columns: minmax(0, 1fr) 52px;
+  }
+
+  .plc-register-control input {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .internal-settings-summary,
+  .trace-kpi-strip,
+  .trace-rule-list,
+  .connection-manager-grid,
+  .component-identity-grid,
+  .component-metrics,
+  .constraint-grid,
+  .animation-settings-row,
+  .validation-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .internal-settings-center > header small,
+  .modbus-controller-drawer-head span,
+  .trace-audit-head > div:first-child span {
+    display: none;
+  }
+
+  .internal-settings-center > header,
+  .trace-audit-head,
+  .modbus-controller-drawer-head {
+    position: sticky;
+    z-index: 8;
+    top: 0;
+  }
+
+  .trace-audit-head-status code {
+    max-width: 110px;
+  }
+
+  .internal-register-row,
+  .mechanical-interface-list > div,
+  .rig-control-row,
+  .advanced-pose-row,
+  .keyframe-row,
+  .clip-properties-row,
+  .new-clip-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .functional-library-inspector {
+    width: 100%;
+    border-left: 0;
+  }
+
+  .warehouse-dashboard-head {
+    padding: 8px;
+  }
+
+  .warehouse-dashboard-actions > button,
+  .warehouse-type-filter {
+    flex: 1 1 auto;
+  }
+
+  .warehouse-type-filter button {
+    flex: 1 1 0;
+  }
+
+  .warehouse-dashboard-body {
+    grid-template-columns: minmax(0, 1fr);
+    padding: 8px;
+  }
+
+  .warehouse-rack-classes {
+    grid-auto-flow: row;
+    grid-auto-columns: initial;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  }
+
+  .advanced-tutorial-backdrop {
+    padding: 8px;
+  }
+
+  .advanced-tutorial {
+    width: calc(100vw - 16px);
+    max-height: calc(100dvh - 16px);
+    padding: 12px;
+  }
+
+  .advanced-rig-tabs button span,
+  .trace-layer-tabs button span {
+    display: none;
+  }
+
+  .statusbar span:first-child {
+    min-width: 130px;
+  }
+}
+
+.physical-plc-test-panel {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  gap: 6px;
+  align-items: stretch;
+  grid-column: 1 / -1;
+}
+
+.physical-plc-link-state {
+  display: grid;
+  grid-template-columns: 12px 1fr;
+  gap: 2px 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 7px 9px;
+  border: 1px solid #6b3030;
+  background: rgba(86, 25, 25, 0.35);
+}
+
+.physical-plc-link-state i {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #ef5350;
+  box-shadow: 0 0 8px rgba(239, 83, 80, 0.7);
+  grid-row: 1 / 3;
+}
+
+.physical-plc-link-state span {
+  overflow-wrap: anywhere;
+  color: #b7c1c5;
+  font-size: 11px;
+}
+
+.physical-plc-link-state.connected {
+  border-color: #267a4d;
+  background: rgba(24, 91, 56, 0.32);
+}
+
+.physical-plc-link-state.connected i {
+  background: #42d47b;
+  box-shadow: 0 0 9px rgba(66, 212, 123, 0.75);
+}
+
+.physical-plc-reaction-test {
+  border-color: #c88a2c !important;
+}
+
+@media (max-width: 760px) {
+  .physical-plc-test-panel {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .physical-plc-link-state {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-height: 620px) and (orientation: landscape) {
+  .topbar {
+    min-height: 44px;
+    padding-block: 4px;
+  }
+
+  .workbench,
+  .workbench:has(.mechanical-panel.advanced) {
+    grid-template-rows: minmax(360px, 76dvh) auto auto;
+  }
+
+  .plc-dashboard,
+  .internal-settings-center,
+  .modbus-controller-drawer,
+  .trace-audit-drawer {
+    top: 44px;
+    max-height: calc(100dvh - 44px);
   }
 }

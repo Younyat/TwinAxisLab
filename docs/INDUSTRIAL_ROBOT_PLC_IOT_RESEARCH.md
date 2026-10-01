@@ -2,7 +2,7 @@
 
 ## Scope
 
-This review evaluates the local robot condition-monitoring chain implemented by 3D Asset Forge V2. It covers sensing, edge acquisition, PLC decisions, Modbus transport, kinematic synchronization, traceability, visualization and security boundaries. It does not claim safety certification or replace the robot manufacturer's controller.
+This review evaluates the local robot condition-monitoring chain implemented by TwinAxis. It covers sensing, edge acquisition, PLC decisions, Modbus transport, kinematic synchronization, traceability, visualization and security boundaries. It does not claim safety certification or replace the robot manufacturer's controller.
 
 ## Reference models
 

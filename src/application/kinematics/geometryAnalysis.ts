@@ -35,6 +35,17 @@ const median = (values: number[]) => {
   return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 };
 
+const numericRange = (values: readonly number[]) => {
+  if (!values.length) return 0;
+  let minimum = values[0];
+  let maximum = values[0];
+  for (let index = 1; index < values.length; index += 1) {
+    if (values[index] < minimum) minimum = values[index];
+    if (values[index] > maximum) maximum = values[index];
+  }
+  return maximum - minimum;
+};
+
 const pointKey = (point: Vector3Tuple) => point.map((value) => value.toPrecision(12)).join(',');
 
 export const geometryHashForTriangles = (triangles: readonly ReferenceTriangle[]) => {
@@ -170,7 +181,7 @@ export const fitCylinderCandidate = (triangles: readonly ReferenceTriangle[]): C
       radialResidualMedian: median(residuals),
       supportRatio: inlierCount / points.length,
       angularCoverageDeg: angularCoverage(points, center, axis),
-      axialCoverage: Math.max(...axial) - Math.min(...axial),
+      axialCoverage: numericRange(axial),
       inlierCount,
       totalCount: points.length,
     } satisfies CylinderCandidate;
@@ -251,12 +262,41 @@ export const analyzeGeometryCached = (triangles: readonly ReferenceTriangle[]) =
   return analysis;
 };
 
+const triangleCenter = (triangle: ReferenceTriangle): Vector3Tuple => [
+  (triangle[0][0] + triangle[1][0] + triangle[2][0]) / 3,
+  (triangle[0][1] + triangle[1][1] + triangle[2][1]) / 3,
+  (triangle[0][2] + triangle[1][2] + triangle[2][2]) / 3,
+];
+
+const localTrianglesFromSeed = (triangles: readonly ReferenceTriangle[], seedPoint: Vector3Tuple, diagonal: number) => {
+  const ranked = triangles.map((triangle, index) => ({ triangle, index, distance: length(subtract(triangleCenter(triangle), seedPoint)) }));
+  const radiusSteps = [0.04, 0.08, 0.15, 0.3];
+  let selected: typeof ranked = [];
+  for (const radiusScale of radiusSteps) {
+    selected = ranked.filter((item) => item.distance <= diagonal * radiusScale);
+    if (selected.length >= 24) break;
+  }
+  if (selected.length < 12) selected = ranked.sort((a, b) => a.distance - b.distance || a.index - b.index).slice(0, Math.min(512, ranked.length));
+  if (selected.length > 12000) {
+    const stride = Math.ceil(selected.length / 12000);
+    selected = selected.filter((_, index) => index % stride === 0).slice(0, 12000);
+  }
+  return selected.map((item) => item.triangle);
+};
+
 export const inferJointFrameFromSeed = (triangles: readonly ReferenceTriangle[], seedPoint: Vector3Tuple): JointFrameCandidate | undefined => {
-  const analysis = analyzeGeometryCached(triangles);
-  const cylinder = analysis.cylinderCandidates[0];
-  if (!cylinder) return undefined;
-  const diagonal = Math.max(length(analysis.geometricProperties.dimensions), EPSILON);
-  const normalizedResidual = cylinder.radialResidualMedian / diagonal;
+  const globalAnalysis = analyzeGeometryCached(triangles);
+  const diagonal = Math.max(length(globalAnalysis.geometricProperties.dimensions), EPSILON);
+  const localTriangles = localTrianglesFromSeed(triangles, seedPoint, diagonal);
+  const localAnalysis = localTriangles.length >= 4 ? analyzeGeometryCached(localTriangles) : undefined;
+  const candidates = [localAnalysis, globalAnalysis].flatMap((analysis) => analysis?.cylinderCandidates.map((cylinder) => ({ analysis, cylinder, normalizedResidual: cylinder.radialResidualMedian / Math.max(length(analysis.geometricProperties.dimensions), EPSILON) })) ?? []);
+  const fitted = candidates.sort((a, b) => {
+    const aScore = a.normalizedResidual / Math.max(a.cylinder.supportRatio, EPSILON);
+    const bScore = b.normalizedResidual / Math.max(b.cylinder.supportRatio, EPSILON);
+    return aScore - bScore;
+  })[0];
+  if (!fitted) return undefined;
+  const { cylinder, normalizedResidual } = fitted;
   const evidenceLevel: JointFrame['evidence']['evidenceLevel'] = normalizedResidual <= 0.002 && cylinder.supportRatio >= 0.7 ? 'high' : normalizedResidual <= 0.01 ? 'medium' : 'low';
   if (evidenceLevel === 'low') return undefined;
   const frame = createJointFrame(cylinder.axisPoint, cylinder.axisDirection, 'user-seeded', {
@@ -268,7 +308,7 @@ export const inferJointFrameFromSeed = (triangles: readonly ReferenceTriangle[],
     axialCoverage: cylinder.axialCoverage,
     userSeeded: true,
     evidenceLevel,
-    messages: ['The click was used as a geometry seed; the fitted cylinder defines the mechanical axis.'],
+    messages: [`The click selected a deterministic local neighborhood of ${localTriangles.length} triangles; the fitted cylinder defines the mechanical axis.`],
   });
   return frame ? { frame, motionType: 'revolute', cylinder, seedPoint } : undefined;
 };

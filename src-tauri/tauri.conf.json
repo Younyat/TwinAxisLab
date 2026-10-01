@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "3D Asset Forge",
+  "productName": "TwinAxis",
   "version": "0.1.0",
   "identifier": "com.nics.assetforge",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "3D Asset Forge",
+        "title": "TwinAxis — Industrial Digital Twin Engineering Platform",
         "width": 1440,
         "height": 900,
         "minWidth": 1024,
@@ -28,7 +28,7 @@
     "active": true,
     "targets": "all",
     "category": "DeveloperTool",
-    "shortDescription": "Professional procedural 3D asset workbench",
-    "longDescription": "3D Asset Forge creates, validates, previews and exports game-ready procedural 3D assets."
+    "shortDescription": "Industrial Digital Twin Engineering Platform",
+    "longDescription": "TwinAxis transforms static 3D/CAD assets into mechanically functional, signal-connected and reusable digital twins."
   }
 }

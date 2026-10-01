@@ -7,6 +7,7 @@ import { TDSLoader } from 'three/examples/jsm/loaders/TDSLoader.js';
 import { createKinematicGraphFromLegacyJoints } from '../application/articulation/analyzeModel';
 import { createProfessionalRobotRigFromStaticObj, extractProfessionalRobotRig } from '../application/kinematics/professionalRobotRig';
 import { ImportedJointPose, ImportedModelGeometry, SceneNode, defaultMaterial, defaultTransform } from '../domain/model';
+import type { KinematicGraph, KinematicState } from '../domain/kinematics/types';
 
 const id = (prefix: string) => `${prefix}_${crypto.randomUUID().slice(0, 8)}`;
 
@@ -235,6 +236,26 @@ const objectHasVisibleGeometry = (object: THREE.Object3D) => {
   return hasGeometry;
 };
 
+type EmbeddedTwinAxisKinematics = {
+  schema: 'TwinAxis/Kinematics/1.0';
+  graph: KinematicGraph;
+  state?: KinematicState;
+  joints?: ImportedJointPose[];
+  partObjectNames?: string[];
+};
+
+const extractEmbeddedTwinAxisKinematics = (scene: THREE.Object3D): EmbeddedTwinAxisKinematics | undefined => {
+  let embedded: EmbeddedTwinAxisKinematics | undefined;
+  scene.traverse((object) => {
+    if (embedded) return;
+    const candidate = object.userData?.twinAxisKinematics as Partial<EmbeddedTwinAxisKinematics> | undefined;
+    if (candidate?.schema !== 'TwinAxis/Kinematics/1.0' || !candidate.graph) return;
+    if (!Array.isArray(candidate.graph.parts) || !Array.isArray(candidate.graph.joints)) return;
+    embedded = candidate as EmbeddedTwinAxisKinematics;
+  });
+  return embedded;
+};
+
 const extractRenderablePartNames = (scene: THREE.Object3D, joints: ImportedJointPose[]) => {
   const names = new Set<string>();
   const jointNames = new Set(joints.map((joint) => joint.name));
@@ -275,12 +296,13 @@ const computeImportNormalization = (scene: THREE.Object3D) => {
 
 export const createImportedModelNode = async (file: File): Promise<SceneNode> => {
   const [dataUrl, parsed] = await Promise.all([fileToDataUrl(file), parseModelFile(file)]);
-  const professionalRig = extractProfessionalRobotRig(parsed.scene, parsed.animations) ?? createProfessionalRobotRigFromStaticObj(parsed.scene, file.name);
-  const joints = professionalRig?.joints ?? extractArticulationJoints(parsed.scene);
-  const partObjectNames = extractRenderablePartNames(parsed.scene, joints);
+  const embedded = extractEmbeddedTwinAxisKinematics(parsed.scene);
+  const professionalRig = embedded ? undefined : extractProfessionalRobotRig(parsed.scene, parsed.animations) ?? createProfessionalRobotRigFromStaticObj(parsed.scene, file.name);
+  const joints = embedded?.joints ?? professionalRig?.joints ?? extractArticulationJoints(parsed.scene);
+  const partObjectNames = embedded?.partObjectNames ?? extractRenderablePartNames(parsed.scene, joints);
   const normalization = computeImportNormalization(parsed.scene);
   const bones = joints.filter((joint) => joint.sourceType === 'bone').map((joint) => joint.name);
-  const kinematicGraph = professionalRig?.kinematicGraph ?? createKinematicGraphFromLegacyJoints(parsed.scene.clone(true), joints);
+  const kinematicGraph = embedded?.graph ?? professionalRig?.kinematicGraph ?? createKinematicGraphFromLegacyJoints(parsed.scene.clone(true), joints);
   const animationNames = parsed.animations.map((clip: THREE.AnimationClip) => clip.name || 'Animation');
   const recoveredClipNames = professionalRig?.kinematicGraph.motionClips?.map((clip) => clip.name) ?? [];
   const geometry: ImportedModelGeometry = {
@@ -294,7 +316,7 @@ export const createImportedModelNode = async (file: File): Promise<SceneNode> =>
     joints,
     partObjectNames,
     kinematicGraph,
-    kinematicState: professionalRig?.kinematicState,
+    kinematicState: embedded?.state ?? professionalRig?.kinematicState,
   };
 
   return {

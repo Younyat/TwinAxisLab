@@ -12,5 +12,7 @@
     "src/domain/kinematics/**/*.ts",
     "src/domain/model.ts",
     "src/application/kinematics/**/*.ts"
+    ,"src/domain/mechanics/**/*.ts"
+    ,"src/application/mechanics/**/*.ts"
   ]
 }

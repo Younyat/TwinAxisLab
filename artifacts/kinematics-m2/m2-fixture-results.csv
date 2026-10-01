@@ -1,0 +1,9 @@
+fixture,axisErrorDeg,axisLineError,result
+cylinder-z,0.000003415094585006376,1.7608395385774073e-17,PASS
+cylinder-x,0.0000282520394970339,6.811217638672953e-17,PASS
+cylinder-arbitrary,0.000015904040849567444,1.2776026200422388e-17,PASS
+cylinder-fully-arbitrary,0.0000029575586669421963,2.7023515879264066e-16,PASS
+rigid-transform-invariance,0.00003631299154864664,,PASS
+one-click-cylinder,0,0,PASS
+open-cylinder-topology-cache,,,PASS
+pure-kinematics-home-persistence,,,PASS

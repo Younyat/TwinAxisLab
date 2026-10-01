@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "twinaxis-bindings/1.0",
+  "connection": { "id": "openplc-main", "protocol": "modbus", "host": "127.0.0.1", "port": 502, "unitId": 1 },
+  "properties": [
+    { "id": "robot.j1.position.actual", "componentId": "joint_j1", "path": "plant/cell01/robot/joints/j1/position.actual", "dataType": "float", "unit": "rad", "access": "READ", "writable": false }
+  ],
+  "signalBindings": [
+    {
+      "id": "modbus.robot.j1.position.actual",
+      "propertyId": "robot.j1.position.actual",
+      "connectionId": "openplc-main",
+      "protocol": "modbus",
+      "source": { "kind": "modbus", "area": "holding-register", "address": 100, "displayAddress": "40101", "quantity": 1, "dataType": "i16", "byteOrder": "be", "wordOrder": "high-low" },
+      "transform": { "scale": 0.0001, "offset": 0, "unitIn": "rad x10000", "unitOut": "rad" },
+      "direction": "READ",
+      "pollingMs": 250,
+      "status": "DISCONNECTED",
+      "enabled": true
+    }
+  ]
+}

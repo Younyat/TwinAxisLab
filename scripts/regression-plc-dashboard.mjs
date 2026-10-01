@@ -86,30 +86,79 @@ try {
     await settingsToggle.click();
     const settingsCenter = page.getByLabel('Internal PLC configuration center');
     await settingsCenter.waitFor({ state: 'visible', timeout: 30000 });
-    await settingsCenter.getByText('Internal Configuration Center').waitFor();
+    await settingsCenter.getByText('TwinAxis Signal Mapping').waitFor();
+    await settingsCenter.getByLabel('TwinAxis Connection Manager').waitFor();
+    const connectionManager = settingsCenter.getByLabel('TwinAxis Connection Manager');
+    if (await connectionManager.getByLabel('OpenPLC Runtime name').inputValue() !== 'OpenPLC Runtime' || !(await connectionManager.innerText()).includes('Modbus TCP')) throw new Error('Connection Manager does not expose the OpenPLC Modbus endpoint.');
     if (!/Wire\s+%QWn\s+maps to conventional holding register/.test(await settingsCenter.innerText())) throw new Error('Internal configuration center does not explain Wire/HR conversion.');
     const initialDefinitionCount = await settingsCenter.locator('.internal-register-row').count();
     if (initialDefinitionCount < 15) throw new Error(`Expected system and robot register definitions, found ${initialDefinitionCount}.`);
-    const commandWireInput = settingsCenter.locator('.internal-register-row').first().locator('input[type="number"]');
+    const commandWireInput = settingsCenter.locator('.internal-register-row').first().getByRole('spinbutton', { name: /Wire/ });
     if (await commandWireInput.isEnabled()) throw new Error('Sensitive register input must be read-only before Enable editing.');
     const editConfiguration = settingsCenter.getByRole('button', { name: 'Enable editing' });
     await editConfiguration.click();
     if (!await settingsCenter.getByRole('button', { name: 'Editing enabled' }).evaluate((element) => element.classList.contains('editing'))) throw new Error('Edit mode did not expose its active green state.');
     await commandWireInput.fill('89');
-    if (await page.evaluate(() => JSON.parse(localStorage.getItem('assetForge.internalRegisterConfiguration.v1') ?? '[]').some((entry) => entry.id === 'system-command' && entry.wire === 89))) throw new Error('Unconfirmed draft was persisted before confirmation.');
+    if (await page.evaluate(() => JSON.parse(localStorage.getItem('twinaxis.signalMapping.v1') ?? '[]').some((entry) => entry.id === 'system-command' && entry.wire === 89))) throw new Error('Unconfirmed draft was persisted before confirmation.');
     await settingsCenter.getByRole('button', { name: /Add register/ }).click();
     if (await settingsCenter.locator('.internal-register-row').count() !== initialDefinitionCount + 1) throw new Error('Add register did not create an editable definition.');
+    await settingsCenter.getByRole('button', { name: 'Add MQTT' }).click();
+    await settingsCenter.getByRole('button', { name: 'Add OPC UA' }).click();
+    if (await settingsCenter.locator('.connection-profile-card').count() < 5) throw new Error('Connection Manager did not create MQTT and OPC UA draft profiles.');
+    if (await page.evaluate(() => JSON.parse(localStorage.getItem('twinaxis.connectionProfiles.v1') ?? '[]').length) !== 3) throw new Error('Unconfirmed connection profiles were persisted before confirmation.');
+    const customMapping = settingsCenter.locator('.internal-register-row').last().locator('.mapping-fields');
+    await customMapping.locator('select').first().selectOption('mqtt');
+    await customMapping.locator('label').filter({ hasText: 'MQTT topic' }).locator('input').fill('factory/robot/joint-test');
+    await customMapping.locator('label').filter({ hasText: 'JSON value path' }).locator('input').fill('position.rad');
     await settingsCenter.getByRole('button', { name: /Save changes/ }).click();
     const saveConfirmation = page.getByRole('dialog', { name: 'Confirm sensitive configuration changes' });
     await saveConfirmation.waitFor({ state: 'visible' });
     await saveConfirmation.getByRole('button', { name: 'Confirm and save' }).click();
-    await page.waitForFunction(() => JSON.parse(localStorage.getItem('assetForge.internalRegisterConfiguration.v1') ?? '[]').some((entry) => entry.id === 'system-command' && entry.wire === 89));
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('twinaxis.signalMapping.v1') ?? '[]').some((entry) => entry.id === 'system-command' && entry.wire === 89));
+    await page.waitForFunction(() => {
+      const profiles = JSON.parse(localStorage.getItem('twinaxis.connectionProfiles.v1') ?? '[]');
+      const mappings = JSON.parse(localStorage.getItem('twinaxis.signalMapping.v1') ?? '[]');
+      return profiles.some((entry) => entry.protocol === 'mqtt') && profiles.some((entry) => entry.protocol === 'opcua') && mappings.some((entry) => entry.protocol === 'mqtt' && entry.topic === 'factory/robot/joint-test' && entry.valuePath === 'position.rad');
+    });
     await settingsCenter.getByRole('button', { name: 'Enable editing' }).click();
     await settingsCenter.getByRole('button', { name: /Restore documented map/ }).click();
     await settingsCenter.getByRole('button', { name: /Save changes/ }).click();
     await page.getByRole('dialog', { name: 'Confirm sensitive configuration changes' }).getByRole('button', { name: 'Confirm and save' }).click();
-    await page.waitForFunction(() => JSON.parse(localStorage.getItem('assetForge.internalRegisterConfiguration.v1') ?? '[]').some((entry) => entry.id === 'system-command' && entry.wire === 90));
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('twinaxis.signalMapping.v1') ?? '[]').some((entry) => entry.id === 'system-command' && entry.wire === 90));
     await settingsCenter.getByRole('button', { name: 'Close internal configuration' }).click();
+
+    await page.getByRole('tab', { name: /Twin/ }).click();
+    const twinInspector = page.getByLabel('Twin Inspector');
+    await twinInspector.waitFor({ state: 'visible' });
+    if (!/properties[\s\S]*bindings/.test(await twinInspector.innerText())) throw new Error('Twin Inspector does not expose properties and bindings.');
+    if (!/State overlay[\s\S]*Operational State[\s\S]*Connections[\s\S]*Recent Events[\s\S]*Recent Commands/.test(await twinInspector.innerText())) throw new Error('Twin Inspector does not expose the operational monitoring layer.');
+    const historian = twinInspector.getByLabel('Historian and Replay');
+    await historian.waitFor({ state: 'visible' });
+    if (!/Record[\s\S]*Load 1h[\s\S]*Clear[\s\S]*LIVE/.test(await historian.innerText())) throw new Error('Historian and Replay controls are incomplete.');
+    const alarmCenter = twinInspector.getByLabel('Twin alarm center');
+    await alarmCenter.waitFor({ state: 'visible' });
+    await alarmCenter.getByRole('button', { name: /Add rule/ }).click();
+    if (await alarmCenter.locator('.alarm-rule-row').count() !== 1 || await alarmCenter.locator('.alarm-rule-row select').count() < 3) throw new Error('Alarm Center did not create an editable signal rule.');
+    const scenarioStudio = twinInspector.getByLabel('Simulation Scenario Studio');
+    await scenarioStudio.waitFor({ state: 'visible' });
+    await scenarioStudio.getByRole('button', { name: 'New' }).click();
+    if (await scenarioStudio.locator('.scenario-actions-list > div').count() !== 3) throw new Error('Scenario Studio did not create the deterministic three-action template.');
+    await scenarioStudio.getByRole('button', { name: 'Run' }).click();
+    await page.waitForTimeout(180);
+    if (!/RUNNING|COMPLETE/.test(await scenarioStudio.innerText())) throw new Error('Simulation scenario did not enter a running state.');
+    await scenarioStudio.getByRole('button', { name: /Pause/ }).click();
+    const scenarioBefore = await canvasSample(page);
+    await scenarioStudio.getByRole('slider', { name: 'Scenario timeline' }).fill('2500');
+    await page.waitForTimeout(500);
+    const scenarioAfter = await canvasSample(page);
+    const scenarioPixelsChanged = sampleDiff(scenarioBefore, scenarioAfter);
+    if (scenarioPixelsChanged < 6) throw new Error(`Scenario timeline did not drive visible kinematicState. Changed samples: ${scenarioPixelsChanged}.`);
+    await scenarioStudio.getByRole('button', { name: 'Reset' }).click();
+    const stateOverlay = twinInspector.getByRole('button', { name: /State overlay/ });
+    if (await stateOverlay.getAttribute('aria-pressed') !== 'true') throw new Error('Operational state overlay must be enabled by default.');
+    await stateOverlay.click();
+    if (await stateOverlay.getAttribute('aria-pressed') !== 'false') throw new Error('Operational state overlay cannot be disabled.');
+    await stateOverlay.click();
 
     const before = await canvasSample(page);
     const plcButton = page.getByRole('button', { name: /Digital Twin Scenario/ });
@@ -183,7 +232,7 @@ try {
     await page.waitForFunction(() => document.body.innerText.includes('Disconnect Client'), undefined, { timeout: 30000 });
     const disconnectClient = page.getByRole('button', { name: /Disconnect Client/ });
     if (await disconnectClient.isEnabled()) await disconnectClient.click();
-    await page.getByRole('button', { name: /^Run$/ }).click();
+    await page.locator('.plc-dashboard').getByRole('button', { name: /^Run$/ }).click();
     await page.waitForFunction(() => /digital twin scenario/i.test(document.body.innerText), undefined, { timeout: 30000 });
     await page.waitForFunction(() => document.body.innerText.includes('Entidad Fisica Simulada') && document.body.innerText.includes('Gemelo Digital'), undefined, { timeout: 30000 });
     await page.waitForFunction(
@@ -207,9 +256,31 @@ try {
     await plcRack.getByRole('button', { name: /E-STOP TRIPPED/ }).click();
     await plcRack.getByRole('button', { name: 'RESET FAULT' }).click();
     await plcRack.getByText('STOP', { exact: true }).waitFor();
-    await page.getByRole('button', { name: /^Run$/ }).click();
+    await page.locator('.plc-dashboard').getByRole('button', { name: /^Run$/ }).click();
     await plcRack.getByText('RUN', { exact: true }).waitFor();
 
+    const dashboardHistorianButton = page.locator('.plc-dashboard').getByRole('button', { name: /Record History/ });
+    await dashboardHistorianButton.click();
+    await page.waitForFunction(
+      () => {
+        const panel = document.querySelector('[aria-label="Historian and Replay"]');
+        const match = panel?.textContent?.match(/(\d+) records/);
+        return Number(match?.[1] ?? 0) > 0;
+      },
+      undefined,
+      { timeout: 30000 },
+    );
+    await page.locator('.plc-dashboard').getByRole('button', { name: /Stop Record/ }).click();
+    const persistedHistorianRecords = await page.evaluate(async () => {
+      const request = indexedDB.open('twinaxis-historian');
+      const database = await new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error); });
+      const transaction = database.transaction('records', 'readonly');
+      const countRequest = transaction.objectStore('records').count();
+      const count = await new Promise((resolve, reject) => { countRequest.onsuccess = () => resolve(countRequest.result); countRequest.onerror = () => reject(countRequest.error); });
+      database.close();
+      return count;
+    });
+    if (persistedHistorianRecords < 1) throw new Error('Historian did not persist PLC samples in IndexedDB.');
     await page.getByRole('button', { name: /Advanced Details/ }).click();
     await page.waitForFunction(
       () => document.body.innerText.includes('Modbus Register Map') && document.body.innerText.includes('Live Modbus TCP Packets') && /FC 3|HR 40101|0x/.test(document.body.innerText),
@@ -270,6 +341,12 @@ try {
     if (!text?.includes('Simulated physical entity') || !text.includes('Digital twin 3D') || !text.includes('Modbus Register Map') || !text.includes('seq')) {
       throw new Error('PLC dashboard did not render physical/twin flow information.');
     }
+    await page.locator('.plc-dashboard').getByRole('button', { name: 'Close PLC test dashboard' }).click();
+    const replayTimeline = historian.getByRole('slider', { name: 'Replay timeline' });
+    await replayTimeline.fill('0');
+    if (!/replay/i.test(await twinInspector.innerText())) throw new Error('Selecting a historian frame did not enter read-only replay mode.');
+    await historian.getByRole('button', { name: /Return to live/ }).click();
+    if (!/LIVE/.test(await historian.innerText())) throw new Error('Historian could not return from replay to live mode.');
     const errors = logs.filter(
       (line) =>
         (line.startsWith('error') || line.startsWith('pageerror')) &&

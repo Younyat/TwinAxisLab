@@ -8,6 +8,7 @@ import {
   createTwinProjectFromAssetDocument,
   makeSample,
   markStaleSamples,
+  migrateLegacyTwinProject,
   requestTwinCommand,
   setDesiredValue,
   setEstimatedValue,
@@ -127,6 +128,19 @@ const runFoundationCreationTest = () => {
   assertValid(project);
 };
 
+const runLongSignalIdUniquenessTest = () => {
+  const document = testDocument();
+  const node = document.nodes[0];
+  const graph = 'kinematicGraph' in node.geometry ? node.geometry.kinematicGraph : undefined;
+  assert(graph, 'Long ID fixture requires a kinematic graph.');
+  node.id = `piece_analysis_${'industrial_component_'.repeat(6)}`;
+  graph.joints[0].id = `${'arm_base_not_moving_base_rotation_'.repeat(4)}joint`;
+  const project = createTwinProjectFromAssetDocument(document, { timestampUtc: '2026-09-06T12:00:00.000Z' });
+  assert(new Set(project.signals.map((signal) => signal.id)).size === project.signals.length, 'Long TwinSignal IDs collided after normalization.');
+  assert(new Set(project.components.map((component) => component.id)).size === project.components.length, 'Long TwinComponent IDs collided after normalization.');
+  assertValid(project);
+};
+
 const runStateSeparationTest = () => {
   const project = createTwinProjectFromAssetDocument(testDocument(), { timestampUtc: '2026-09-06T12:00:00.000Z' });
   const actualSignal = project.signals.find((signal) => signal.metadata.stateKind === 'reported');
@@ -201,13 +215,25 @@ const runEstimatedStateTest = () => {
   assertValid(estimated);
 };
 
+const runLegacyMigrationTest = () => {
+  const current = createTwinProjectFromAssetDocument(testDocument(), { timestampUtc: '2026-09-06T12:00:00.000Z' });
+  const legacy = { ...current, properties: undefined, signalBindings: undefined, metadata: { ...current.metadata, platform: 'legacy-product' } } as unknown as TwinProject;
+  const migrated = migrateLegacyTwinProject(legacy);
+  assert(migrated.properties.length === migrated.signals.length, 'Legacy TwinSignals were not migrated to TwinProperties.');
+  assert(migrated.signalBindings.length === migrated.bindings.length, 'Legacy TwinBindings were not migrated to SignalBindings.');
+  assert(migrated.metadata.platform === 'TwinAxis', 'Migrated project did not receive TwinAxis metadata.');
+  assert(migrated.metadata.legacyPlatform === 'legacy-product', 'Legacy platform metadata was not retained.');
+};
+
 export const runTwinFoundationTests = () => {
   runFoundationCreationTest();
+  runLongSignalIdUniquenessTest();
   runStateSeparationTest();
   runQualityAndStalenessTest();
   runMaturityTest();
   runCommandGovernanceTest();
   runDeltaBatchTest();
   runEstimatedStateTest();
+  runLegacyMigrationTest();
   console.log('Twin foundation P0 tests passed.');
 };

@@ -309,7 +309,7 @@ def self_test():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Terminal Modbus robot driver for 3D Asset Platform Digital Twin Scenario.")
+    parser = argparse.ArgumentParser(description="Terminal Modbus robot driver for TwinAxis Digital Twin Scenario.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--cycle", action="store_true", help="Start with automatic robot movement enabled.")

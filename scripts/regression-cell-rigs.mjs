@@ -189,6 +189,54 @@ const pivotForJoint = (debug, jointName) => {
   return debug.objects.find((object) => object.pivot && object.name.toLowerCase().includes(pivotSlug));
 };
 
+const quaternionMultiply = (a, b) => [
+  a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+  a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+  a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+  a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+];
+
+const verifyAdoptedJointFrameDrivesMotion = async (page, model) => {
+  if (!/Industrial Arm/i.test(model.name)) return;
+  const originalPivot = pivotForJoint(await page.evaluate(() => window.__assetForgeViewportMechanicsDebug?.()), 'J4_forearm_roll');
+  const setup = await page.evaluate((expectedAssetName) => {
+    const node = window.__assetForgeDocument?.nodes.find((item) => item.geometry?.assetName === expectedAssetName);
+    const graph = node?.geometry?.kinematicGraph;
+    const joint = graph?.joints.find((candidate) => candidate.name === 'J4_forearm_roll');
+    if (!node || !graph || !joint) return undefined;
+    joint.axis = [1, 0, 0];
+    joint.source = 'manual';
+    joint.evidence = [
+      ...joint.evidence.filter((item) => item.metadata?.useJointAxisVector !== true),
+      { type: 'manual', score: 1, message: 'Regression axis adopted from viewport ring.', metadata: { useJointAxisVector: true } },
+    ];
+    const values = { ...(node.geometry?.kinematicState?.homeJointValues ?? {}), [joint.id]: 0 };
+    window.__assetForgeSetKinematicJointValues?.(node.id, values);
+    return { nodeId: node.id, jointId: joint.id, values };
+  }, model.expectedAsset);
+  if (!setup) throw new Error(`${model.name} could not prepare the adopted J4 frame regression.`);
+
+  await page.waitForTimeout(120);
+  const before = pivotForJoint(await page.evaluate(() => window.__assetForgeViewportMechanicsDebug?.()), 'J4_forearm_roll');
+  if (!originalPivot || !before || distance(originalPivot.position, before.position) > 0.001) {
+    throw new Error(`${model.name} moved the J4 pivot while adopting an axis-only ring correction.`);
+  }
+  await page.evaluate(({ nodeId, jointId, values }) => {
+    window.__assetForgeSetKinematicJointValues?.(nodeId, { ...values, [jointId]: Math.PI / 3 });
+  }, setup);
+  await page.waitForTimeout(120);
+  const after = pivotForJoint(await page.evaluate(() => window.__assetForgeViewportMechanicsDebug?.()), 'J4_forearm_roll');
+  if (!before?.localQuaternion || !after?.localQuaternion) throw new Error(`${model.name} did not expose the J4 pivot orientation.`);
+
+  const inverseBefore = [-before.localQuaternion[0], -before.localQuaternion[1], -before.localQuaternion[2], before.localQuaternion[3]];
+  const delta = quaternionMultiply(inverseBefore, after.localQuaternion);
+  const magnitude = Math.hypot(delta[0], delta[1], delta[2]);
+  const axis = magnitude > 1e-8 ? delta.slice(0, 3).map((value) => Math.abs(value / magnitude)) : [0, 0, 0];
+  if (axis[0] < 0.98 || axis[1] > 0.08 || axis[2] > 0.08) {
+    throw new Error(`${model.name} ignored the adopted J4 X axis; measured local rotation axis ${axis.map((value) => value.toFixed(3)).join(', ')}.`);
+  }
+};
+
 const verifyStaticRigChainStability = async (page, model) => {
   if (!model.staticPivotReferences) return;
   const setup = await page.evaluate((expectedAssetName) => {
@@ -316,6 +364,7 @@ const verifyEndEffectorIntegrity = async (page, model) => {
 const verifyIndustrialMaterialEditing = async (page, model) => {
   if (!/Industrial Arm/i.test(model.name)) return;
   const globalColor = '#00bcd4';
+  await page.getByRole('tab', { name: /Objeto/ }).click();
   await page.locator('input[type="color"]').first().fill(globalColor);
   await page.waitForFunction(
     ({ expectedAssetName, globalColor }) => {
@@ -333,8 +382,9 @@ const verifyIndustrialMaterialEditing = async (page, model) => {
   const selected = await page.evaluate(() => window.__assetForgeSelectFirstTwoKinematicParts?.() ?? false);
   if (!selected) throw new Error(`${model.name} could not select viewport parts for material editing.`);
   await page.waitForFunction(() => (window.__assetForgeSelectedParts?.length ?? 0) > 0, undefined, { timeout: 30000 });
+  await page.getByRole('tab', { name: /Piezas/ }).click();
   const partColor = '#ff4fd8';
-  await page.locator('input[type="color"]').nth(1).fill(partColor);
+  await page.locator('input[type="color"]').first().fill(partColor);
   await page.waitForFunction(
     ({ expectedAssetName, partColor }) => {
       const node = window.__assetForgeDocument?.nodes.find((item) => item.geometry?.assetName === expectedAssetName);
@@ -347,6 +397,48 @@ const verifyIndustrialMaterialEditing = async (page, model) => {
   const partDebug = await page.evaluate(() => window.__assetForgeViewportMechanicsDebug?.());
   const partColored = partDebug?.objects?.filter((object) => object.materialColor?.toLowerCase() === partColor).length ?? 0;
   if (partColored < 1) throw new Error(`${model.name} did not apply the custom part material color to the selected mesh.`);
+};
+
+const verifyIndustrialGlbRoundTrip = async (page, model) => {
+  if (!/Industrial Arm/i.test(model.name)) return;
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByTitle('Export GLB').first().click();
+  const download = await downloadPromise;
+  const exportedPath = await download.path();
+  if (!exportedPath) throw new Error(`${model.name} GLB export did not create a downloadable file.`);
+  const exportedName = download.suggestedFilename();
+
+  await page.evaluate(() => localStorage.clear());
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.locator('input[accept*=".3ds"]').setInputFiles({ name: exportedName, mimeType: 'model/gltf-binary', buffer: readFileSync(exportedPath) });
+  await page.waitForFunction(
+    (assetName) => window.__assetForgeDocument?.nodes.some((node) => node.geometry?.assetName === assetName && node.geometry?.kinematicGraph),
+    exportedName,
+    { timeout: 120000 },
+  );
+  await page.waitForFunction(
+    () => (window.__assetForgeViewportMechanicsDebug?.().objects.filter((object) => object.pivot).length ?? 0) >= 8,
+    undefined,
+    { timeout: 30000 },
+  );
+  await page.waitForFunction(() => window.__assetForgeViewportFrameModel?.(), undefined, { timeout: 30000 });
+  await page.waitForTimeout(700);
+
+  const restored = await page.evaluate((assetName) => {
+    const node = window.__assetForgeDocument?.nodes.find((candidate) => candidate.geometry?.assetName === assetName);
+    const graph = node?.geometry?.kinematicGraph;
+    const joint = graph?.joints.find((candidate) => candidate.name === 'J4_forearm_roll');
+    return { analysisVersion: graph?.analysisVersion, jointCount: graph?.joints.length, j4Axis: joint?.axis, j4Source: joint?.source, usesJointAxisVector: joint?.evidence?.some((item) => item.metadata?.useJointAxisVector === true) };
+  }, exportedName);
+  if (restored.analysisVersion !== model.analysisVersion || restored.jointCount !== model.jointNames.length) {
+    throw new Error(`${model.name} GLB round-trip did not restore the original KinematicGraph.`);
+  }
+  if (restored.j4Source !== 'manual' || !restored.usesJointAxisVector || Math.abs(restored.j4Axis?.[0] ?? 0) < 0.99) {
+    throw new Error(`${model.name} GLB round-trip lost the adopted J4 axis.`);
+  }
+  await verifyStaticRigChainStability(page, { ...model, name: `${model.name} GLB round-trip`, expectedAsset: exportedName });
+  await page.evaluate(() => window.__assetForgeViewportFrameModel?.());
+  await page.waitForTimeout(500);
 };
 
 const verifyMotionChanges = async (page, model) =>
@@ -504,6 +596,7 @@ try {
       await verifyDocumentedClipPoses(page, model);
       await verifyStaticRigPivotPlacement(page, model);
       await verifyStaticRigChainStability(page, model);
+      await verifyAdoptedJointFrameDrivesMotion(page, model);
       if (/Industrial/i.test(model.name)) {
         const rightFinger = snapshot.joints?.find((candidate) => candidate.name === 'G1_finger_R');
         if (!rightFinger?.coupling || rightFinger.coupling.multiplier !== -1) throw new Error(`${model.name} gripper mimic coupling is missing`);
@@ -515,6 +608,7 @@ try {
       await verifyEndEffectorIntegrity(page, model);
       await verifyAutoButtonMotion(page, model);
       await verifyIndustrialMaterialEditing(page, model);
+      await verifyIndustrialGlbRoundTrip(page, model);
       const visiblePixels = await countVisiblePixels(page);
       const errors = logs.filter((line) => line.startsWith('error') || line.startsWith('pageerror'));
       if (errors.length) throw new Error(`${model.name} produced browser errors: ${errors.join('\n')}`);

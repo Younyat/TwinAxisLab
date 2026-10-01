@@ -1,4 +1,4 @@
-import { chromium } from '@playwright/test';
+import { chromium, expect } from '@playwright/test';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -143,14 +143,10 @@ try {
     const changed = sampleDiff(before, after);
     if (changed < 4) throw new Error(`Terminal Modbus write did not visibly move the digital twin. Changed samples: ${changed}.`);
     await page.getByRole('button', { name: /Disconnect Client/ }).click();
-    await page.waitForFunction(
-      () =>
-        document.body.innerText.includes('Visual Modbus controller client disconnected') &&
-        document.body.innerText.includes('controller off') &&
-        !document.body.innerText.includes('client connected'),
-      undefined,
-      { timeout: 30000 },
-    );
+    const connectionStatus = page.getByLabel('Modbus controller connection status');
+    await expect(connectionStatus).toContainText('RX no');
+    await expect(connectionStatus).toContainText(/client (waiting|off)/);
+    await expect(connectionStatus).not.toContainText('client connected');
 
     await fetch(`http://127.0.0.1:${bridgePort}/client-session`, {
       method: 'POST',

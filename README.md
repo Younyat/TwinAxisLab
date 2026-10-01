@@ -1,14 +1,123 @@
-# 3D Asset Forge
+# TwinAxis
 
-Plataforma profesional en JavaScript para crear, importar, validar, articular y exportar objetos 3D preparados para motores en tiempo real.
+TwinAxis is an industrial digital twin engineering platform for transforming static 3D/CAD assets into mechanically functional, signal-connected and reusable digital twins.
 
-![Vista general de 3D Asset Forge](docs/readme-assets/platform-overview.png)
+> **From static CAD to connected functional digital twins.**
+
+```text
+CAD -> Mechanical Structure -> Kinematics -> Functional Components -> Twin Properties -> Industrial Signals -> Live Digital Twin
+```
+
+![Vista general de TwinAxis](docs/readme-assets/platform-overview.png)
 
 ## Objetivo
 
-3D Asset Forge es un entorno de trabajo 3D centrado en la preparacion practica de assets. La plataforma combina generacion procedural, importacion de modelos, ajuste inteligente de escala, deteccion de articulaciones, validacion de movimientos y exportacion GLB en un unico flujo.
+TwinAxis combina preparacion geometrica, analisis mecanico, componentes funcionales, propiedades semanticas, señales industriales y runtime de gemelo digital en un unico flujo. Three.js visualiza el estado, pero la definicion funcional y los protocolos permanecen separados del renderer.
 
 El objetivo principal es reducir el trabajo manual necesario para preparar modelos 3D descargados, mecanicos, roboticos, vehiculares o de simulacion. La plataforma busca detectar pivotes, ejes y articulaciones, permitir validar como debe moverse cada pieza y guardar ese aprendizaje para futuras demos o exportaciones.
+
+## Arquitectura TwinAxis
+
+TwinAxis mantiene separadas las capas de dominio, aplicacion, infraestructura y presentacion. `KinematicGraph V2` sigue siendo la fuente de verdad mecanica; la conectividad industrial se anade sin modificar ni reconstruir la geometria original.
+
+```text
+ProtocolAdapter -> SignalBinding -> TwinProperty -> TwinAxisRuntime -> KinematicState -> Three.js
+       Modbus         direccion       semantica        validacion          estado       vista
+```
+
+- `TwinProperty` describe una propiedad funcional mediante ruta, tipo, unidad, acceso, rango seguro, calidad y politica de confirmacion.
+- `SignalBinding` relaciona una propiedad con una fuente industrial, su direccion, codificacion, transformacion, polling y estado de conexion.
+- `ProtocolAdapter` es el puerto de aplicacion neutral. `ModbusAdapter` es la primera implementacion de infraestructura y no introduce conocimiento de Three.js.
+- `TwinAxisRuntime` aplica escalas, offsets, calidad y limites seguros; las escrituras sensibles requieren confirmacion explicita.
+- `TwinProject` conserva simultaneamente las representaciones nuevas y los campos legacy durante la migracion para abrir proyectos existentes sin perdida.
+
+El ejemplo [twinaxis-bindings.json](examples/twinaxis-bindings.json) documenta una propiedad de joint enlazada a `%QW100` / `HR40101` mediante `INT16 rad x10000`.
+
+### Componentes funcionales y conexiones
+
+Los `FunctionalComponent` generados desde `KinematicGraph V2` incorporan propiedades funcionales por joint, interfaces de senal bidireccionales y contenedores persistentes para bindings, comandos y eventos. Los `FunctionalAssembly` conservan ademas conexiones de senal, relaciones de control, dependencias y estado del gemelo. Estos campos son opcionales al leer datos antiguos y se materializan en los componentes nuevos.
+
+`TwinAxisConnectionManager` administra perfiles de conexion sin introducir detalles de protocolo en el dominio. Mantiene endpoint, estado, calidad, ultima lectura, errores y reconexiones; cada perfil se ejecuta mediante un `ProtocolAdapter` registrado. Un endpoint conectado debe desconectarse antes de editarse o eliminarse.
+
+La sección `Connection Manager` aparece dentro de `TwinAxis Signal Mapping` y presenta los endpoints de OpenPLC y del gateway IoT, protocolo, estado runtime, RX y diagnóstico actual. El `Twin Inspector` aparece en el inspector derecho al seleccionar un objeto: enumera sus propiedades semánticas, valor y unidad, calidad y binding industrial asociado. Ambas vistas consumen el mismo `TwinProject`; no mantienen una copia paralela del estado.
+
+El `Twin Inspector` incorpora una capa operativa trazable: autoridad de control, modo PLC, estado de condición, código de alarma, salud de conexiones, eventos recientes y comandos gobernados. `State overlay` colorea únicamente el contorno de selección (`normal`, `warning`, `alarm` o `disconnected`). No modifica materiales, geometría, transforms ni jerarquía del modelo, por lo que desactivarlo devuelve exactamente la visualización original.
+
+El bloque `Live Twin Monitor` del inspector resume conexiones, eventos, comandos y alarmas del gemelo seleccionado. Los contadores proceden del `TwinProject` actual; si no existe telemetría o una regla activa se muestran valores vacíos o cero, nunca datos inventados.
+
+### MQTT y OPC UA
+
+El `Connection Manager` de `TwinAxis Signal Mapping` incluye perfiles persistentes para OpenPLC/Modbus, MQTT y OPC UA. La edicion esta bloqueada hasta pulsar `Enable editing`: endpoint, activacion, alta y borrado permanecen en borrador y solo se guardan tras `Confirm and save`. `Test connection` usa el adaptador real y solo muestra `ONLINE` cuando el broker MQTT o el gateway OPC UA confirma la sesion. Un fallo queda como `FAILED` con diagnostico; no se simula una conexion correcta.
+
+Los mappings son especificos por protocolo:
+
+- Modbus conserva Wire `%QW`, HR convencional, signedness, word count, escala y polling.
+- MQTT conserva connection profile, topic, JSON value path y QoS.
+- OPC UA conserva connection profile, NodeId, browse path y polling.
+
+Al confirmar, `configurePlcProject()` reconstruye los `SignalBinding` del `TwinProject`. La simulacion PLC sigue usando su mapa Modbus original y no modifica geometria ni `KinematicGraph V2`.
+
+Configuracion desde la rueda inferior izquierda:
+
+1. Abrir `TwinAxis Signal Mapping` y pulsar `Enable editing`.
+2. Activar el perfil requerido o crear uno con `Add MQTT` / `Add OPC UA`.
+3. Para MQTT indicar una URL WebSocket real. Para OPC UA indicar por separado la URL HTTP del gateway y el endpoint `opc.tcp://` del servidor.
+4. Asignar el perfil a un joint y completar topic/value path o NodeId/browse path.
+5. Pulsar `Save changes` y confirmar el cambio sensible.
+6. Pulsar `Test connection`. Un perfil sin servicio accesible debe quedar en `FAILED`, nunca en `ONLINE`.
+
+`MqttAdapter` usa MQTT.js y acepta endpoints MQTT sobre WebSocket como `ws://127.0.0.1:9001/mqtt` o `wss://broker.example/mqtt`. Implementa conexión, reconexión, lectura puntual con timeout, suscripción, QoS, retained messages y publicación de comandos. Los payloads se decodifican mediante el mapping `raw`, `json` o `sparkplug-metric` y su selector configurado.
+
+`OpcUaGatewayAdapter` mantiene la misma interfaz pero delega la sesión OPC UA en un gateway local o industrial. El navegador no abre directamente `opc.tcp://`; el gateway recibe `/connect`, `/disconnect`, `/read` y `/write`, y es responsable de certificados, trust list, usuario, política de seguridad y sesión OPC UA. TwinAxis conserva en el binding `nodeId`, `browsePath`, namespace, tipo, unidad, polling y calidad. Esta separación evita incluir claves privadas o una pila TCP OPC UA dentro del frontend.
+
+```text
+MQTT broker -- WebSocket --> MqttAdapter --> SignalBinding --> TwinProperty
+OPC UA server -- opc.tcp --> trusted gateway -- HTTP --> OpcUaGatewayAdapter --> SignalBinding --> TwinProperty
+```
+
+El catalogo comun de unidades permite conversiones compatibles para angulo, distancia, temperatura, presion, velocidad angular, corriente, tension, potencia, par y porcentaje. Una conversion entre familias incompatibles se rechaza en lugar de producir un valor ambiguo.
+
+### Twin Package
+
+Los botones `Import Twin Package` y `Export Twin Package` de la barra superior trabajan con archivos `.twin`. Un paquete contiene:
+
+```text
+manifest
+definition (TwinProject)
+sourceDocument
+functionalComponents
+functionalAssemblies
+configuration (connectionProfiles + signalMappings)
+runtime opcional
+```
+
+La configuracion portable conserva perfiles Modbus/MQTT/OPC UA y mappings confirmados. Al importar se restauran junto con alarmas, escenarios e historico; los paquetes antiguos migran con colecciones vacias.
+
+El manifest identifica TwinAxis, version, definicion, componentes, assemblies, protocolos y contadores de propiedades, bindings y assets. Antes de exportar y despues de importar se validan esquema, plataforma, identidad y consistencia de contadores. El documento fuente incluido permite cerrar la aplicacion, abrir posteriormente el `.twin` y reconstruir el workspace, warehouse, geometria y cinemática sin depender del estado de la interfaz.
+
+La extension `.twin` utiliza actualmente un contenedor JSON versionado (`twinaxis-package/1.0`). Esto mantiene inspeccion y migracion deterministas. La futura variante comprimida podra empaquetar binarios externos sin cambiar el modelo de dominio ni el manifest.
+
+### Histórico, alarmas, replay y escenarios
+
+`IndexedDbTwinHistorian` persiste muestras, eventos y comandos por proyecto y rango temporal en la base local `twinaxis-historian`. El orden se conserva mediante timestamp y secuencia. `MemoryHistorian` permanece como implementación determinista para procesamiento, reducción y tests, mientras IndexedDB evita depender de memoria durante sesiones reales largas.
+
+Los Twin Packages con runtime incluyen estado, conexiones, eventos, comandos, reglas e instancias de alarma, registros históricos y escenarios. La importación de paquetes anteriores inicializa de forma segura las colecciones que no existían.
+
+Un `SimulationScenario` es una línea temporal versionable de acciones `reported`, `desired`, `event` y `mode`. El runner valida duración y posiciones temporales, genera timestamps deterministas y puede ejecutar una vez o en bucle. El replay continúa siendo de solo lectura: reproducir un histórico no provoca escrituras en adaptadores físicos.
+
+El panel `Historian & Replay` del `Twin Inspector` conecta estas capacidades al runtime. `Record` persiste muestras, eventos y comandos del proyecto seleccionado en IndexedDB; `Load 1h` consulta la última hora; la línea temporal reconstruye estados reportados deterministas y muestra su hash. Mientras hay un frame histórico seleccionado, la inspección está en modo `replay`, la grabación queda bloqueada y no se ejecuta ninguna escritura industrial. `Return to live` recupera el runtime activo. Los registros cargados también viajan dentro del paquete `.twin` cuando se exporta con estado de runtime.
+
+`Alarm Center` permite crear reglas sobre `TwinSignal` de lectura: límite alto, límite bajo o calidad inválida. Cada regla conserva prioridad y habilitación; el motor produce estados `normal`, `active`, `acked`, `shelved` y `cleared`. Las alarmas activas alimentan el overlay rojo, pueden reconocerse o inhibirse durante 10 minutos y, cuando Historian está grabando, sus transiciones se almacenan como eventos trazables. Las reglas e instancias se incluyen en la exportación `.twin`.
+
+`Scenario Studio` construye secuencias temporales deterministas sobre señales reportadas. Cada escenario define duración, repetición y acciones con tiempo, señal y valor. La línea temporal permite inspección manual; `Run`, `Pause` y `Reset` controlan un reloj virtual de 50 ms. Al iniciar una simulación se detiene Historian y se sale de Replay para no mezclar datos reales, históricos y simulados. La ejecución actualiza una copia del `TwinProject` en modo `simulation` y nunca invoca escrituras de adaptadores industriales. Los escenarios se conservan en el paquete `.twin`.
+
+Los estados de Scenario y Replay se proyectan sobre el `kinematicState` visible mediante el `jointId` semántico de cada `TwinSignal`. Los valores se limitan con los límites mecánicos de KinematicGraph V2 y se aplican a un documento de presentación derivado. El `AssetDocument` original no se modifica, por lo que salir de Scenario o Replay recupera exactamente el estado de trabajo. Las reglas de alarma y los escenarios también se conservan automáticamente por proyecto en almacenamiento local.
+
+### Functional Component Library y Assembly Engineering
+
+La página `Parts Warehouse` funciona también como biblioteca de ingeniería. La búsqueda filtra por código, nombre, categoría, clase y asset de origen; el control de tipo separa piezas y assemblies. Al seleccionar una pieza, `Functional library inspector` permite revisar y corregir nombre, categoría, clase, rol mecánico e interfaces. Cada interfaz conserva tipo, frame, eje, compatibilidades, procedencia y confianza.
+
+Los assemblies muestran componentes, conexiones y estado de validación. Cada `AssemblyConnection` permite aceptar, rechazar o marcar como manual la unión, seleccionar el tipo de joint, editar el eje y corregir límites. El cambio actualiza el KinematicGraph del assembly y ejecuta `validateFunctionalAssembly`, que comprueba componentes o interfaces ausentes, incompatibilidades, límites contradictorios, piezas flotantes y ciclos cinemáticos. La edición no altera las geometrías GLB almacenadas.
 
 ## Capacidades Actuales
 
@@ -75,7 +184,7 @@ El flujo empieza con modelos reales importados, no con placeholders. La platafor
 
 ## Casos De Uso Y Valor
 
-3D Asset Forge esta pensada para convertir modelos 3D complejos en una libreria reutilizable de componentes. Esto reduce tiempo de preparacion, evita rehacer piezas y permite crear variantes comerciales a partir de assets existentes.
+TwinAxis esta pensada para convertir modelos 3D complejos en una libreria reutilizable de componentes. Esto reduce tiempo de preparacion, evita rehacer piezas y permite crear variantes comerciales a partir de assets existentes.
 
 Casos de uso principales:
 
@@ -487,9 +596,50 @@ Secuencia segura de operacion:
 
 Este runtime reproduce semantica y diagnostico PLC para simulacion, integracion y formacion. No es un PLC de seguridad certificado, no ofrece tiempo real duro y no debe controlar directamente actuadores fisicos peligrosos. Una maquina real necesita PLC, safety PLC, drives, cableado y evaluacion de riesgos certificados.
 
+### Conexion A Un PLC Fisico S7-1200
+
+`Digital Twin Scenario` admite un PLC fisico que exponga el data block `RobotHolding` como servidor Modbus TCP. El transporte es Modbus TCP estandar y reutiliza el mismo decoder, `KinematicGraph V2` y pipeline visual ya validados con OpenPLC; cambia explicitamente el mapa de memoria.
+
+| Offset Modbus | Referencia convencional | Semantica | Codificacion | Sentido |
+| ---: | ---: | --- | --- | --- |
+| `HR0` | `40001` | Command | `UINT16`: 0 Manual/Hold, 1 Auto, 2 Home | TwinAxis -> PLC |
+| `HR1..6` | `40002..40007` | Status, step, elapsed, alarm, condition, speed | `UINT16` | PLC -> TwinAxis |
+| `HR7..12` | `40008..40013` | J1..J6 | `INT16`, radianes x10000 | PLC -> TwinAxis |
+| `HR13` | `40014` | Temperatura | `INT16`, grados C x100 | IoT/TwinAxis -> PLC |
+| `HR14` | `40015` | Humedad | `UINT16`, %RH x100 | IoT/TwinAxis -> PLC |
+| `HR15` | `40016` | Magnitud del giroscopio | `UINT16`, grados/s x100 | IoT/TwinAxis -> PLC |
+| `HR16..19` | `40017..40020` | Age, valid, sequence, quality bits | `UINT16` | IoT/TwinAxis -> PLC |
+| `HR20` | `40021` | SensorPolicy | `UINT16`: 0 condition monitor, 1 motion permit | TwinAxis -> PLC |
+
+Procedimiento:
+
+1. Mantener la maquina en estado seguro y comprobar que ninguna otra estacion HMI tiene autoridad de escritura.
+2. Seleccionar un robot con `KinematicGraph` y abrir `Digital Twin Scenario`.
+3. En `PLC profile`, elegir `Physical S7-1200 - HR0..20`.
+4. Introducir la IP del PLC, puerto Modbus TCP (normalmente `502`) y Unit ID.
+5. Pulsar `Auto Detect Map`. La plataforma lee `HR0..20` mediante FC03 y solo acepta el perfil si Command, Status, Step, Condition, Speed, SensorValid y SensorPolicy tienen una firma coherente.
+6. Pulsar `Connect Physical PLC` y confirmar expresamente la conexion. El aviso indica que `HR0` y `HR13..20` pueden recibir escrituras reales.
+7. Comprobar `ONLINE - SCAN ACTIVE`, incremento de `RX` y movimiento coincidente de la entidad fisica y el gemelo digital.
+8. `Auto`, `Home` y `Motion permit` usan FC06. La telemetria IoT consecutiva usa FC16 cuando forma un bloque.
+9. Pulsar `Disconnect Physical PLC` antes de modificar el programa, mapa, cableado o autoridad de control.
+
+Tras la primera confirmacion, TwinAxis guarda localmente perfil, IP, puerto, Unit ID, bloque de joints, formato y periodo de polling. `Reconnect` queda armado al conectar: si el ordenador abandona temporalmente la red del PLC, el dashboard pasa a `CONNECTING`, conserva el endpoint y reintenta FC03; al volver a esa red recupera `ONLINE - SCAN ACTIVE` sin volver a configurar nada. Una desconexion manual desarma este comportamiento para respetar la retirada intencionada de autoridad.
+
+Para que el cambio de red sea realmente transparente, configure el S7-1200 con IP estatica `192.168.0.20` o una reserva DHCP equivalente y mantenga una ruta valida desde el ordenador. TwinAxis no escanea subredes desconocidas ni modifica la configuracion Ethernet del PLC. Si la IP fisica cambia, hay que actualizarla una vez en el perfil y confirmar nuevamente el endpoint.
+
+No se debe introducir `40001` como offset: la API utiliza direccion Modbus base cero, por lo que `HR0` es la referencia humana `40001`. La plataforma no descarga bloques Siemens ni configura el servidor MB_SERVER; el PLC debe tener `RobotHolding` publicado y el programa cargado. Modbus TCP no aporta autenticacion ni cifrado: un PLC fisico debe permanecer en una red OT segmentada, con firewall, allowlist de IP y funciones de seguridad independientes.
+
+La compatibilidad automatizada se verifica con:
+
+```powershell
+npm.cmd run test:openplc
+```
+
+La prueba levanta servidores Modbus instrumentados para los dos contratos, comprueba lectura del bloque fisico, decodificacion de J1..J6, reflejo en el gemelo y escrituras reales equivalentes `HR0=1` y `HR20=1`.
+
 ### Conexion Alternativa A OpenPLC
 
-El dashboard puede ceder la autoridad del robot a OpenPLC Runtime v4 mediante Modbus TCP real. OpenPLC Editor, OpenPLC Runtime y 3D Asset Forge son procesos diferentes: conectar el Editor a la API del Runtime no implica que el PLC este ejecutando un programa ni que Modbus este disponible.
+El dashboard puede ceder la autoridad del robot a OpenPLC Runtime v4 mediante Modbus TCP real. OpenPLC Editor, OpenPLC Runtime y TwinAxis son procesos diferentes: conectar el Editor a la API del Runtime no implica que el PLC este ejecutando un programa ni que Modbus este disponible.
 
 #### Esquema completo PLC - gemelo digital
 
@@ -508,7 +658,7 @@ flowchart LR
     RUNTIME --> IMAGE --> SLAVE
   end
 
-  subgraph PLATFORM[3D Asset Forge V2]
+  subgraph PLATFORM[TwinAxis]
     GATEWAY[Gateway Modbus<br/>FC03 / FC06 / FC16]
     DECODER[Decoder<br/>INT16 / 10000 = rad]
     STATE[kinematicState<br/>J1..J6]
@@ -552,7 +702,7 @@ Flujo temporal de una orden de marcha:
 ```mermaid
 sequenceDiagram
   participant UI as Digital Twin Scenario
-  participant GW as Gateway 3D Asset Forge
+  participant GW as Gateway TwinAxis
   participant MB as OpenPLC Modbus Slave
   participant PLC as Programa ST / TASK0
   participant KG as KinematicGraph V2
@@ -620,7 +770,7 @@ OpenPLC Editor
   -> HTTPS API 127.0.0.1:8443 (build y upload)
   -> OpenPLC Runtime v4 (estado EMPTY / RUNNING)
   -> Modbus TCP FC03 / FC16
-  -> gateway local 3D Asset Forge
+  -> gateway local TwinAxis
   -> decoder INT16 firmado / 10000
   -> kinematicState
   -> robot 3D
@@ -628,7 +778,7 @@ OpenPLC Editor
 
 El programa que reproduce el clip `Ciclo_Asistencia` de `Start Smart Demo` para `cobot-6dof.glb` esta en [`openplc/cobot-6dof-smart-demo/cobot_6dof_smart_demo.st`](openplc/cobot-6dof-smart-demo/cobot_6dof_smart_demo.st). El archivo tiene el formato POU admitido por OpenPLC Editor: bloque de declaraciones `VAR...END_VAR` seguido del cuerpo Structured Text. No deben anadirse wrappers `PROGRAM`, `FUNCTION` o `CONFIGURATION` al pegarlo en los dos paneles del Editor.
 
-La variante [`cobot_6dof_smart_demo_amplified.st`](openplc/cobot-6dof-smart-demo/cobot_6dof_smart_demo_amplified.st) amplía el recorrido de J1-J6 mediante seis transiciones coordinadas y suavizado cubico. Mantiene exactamente el mismo mapa Modbus, por lo que puede sustituir el cuerpo del programa sin cambiar la configuracion de 3D Asset Forge.
+La variante [`cobot_6dof_smart_demo_amplified.st`](openplc/cobot-6dof-smart-demo/cobot_6dof_smart_demo_amplified.st) amplía el recorrido de J1-J6 mediante seis transiciones coordinadas y suavizado cubico. Mantiene exactamente el mismo mapa Modbus, por lo que puede sustituir el cuerpo del programa sin cambiar la configuracion de TwinAxis.
 
 #### Escenario IoT: robot adaptativo por condicion
 
@@ -637,7 +787,7 @@ El escenario industrial usa un TI CC2650 SensorTag fijado rigidamente a la munec
 ```mermaid
 flowchart LR
   TAG[CC2650 en muneca<br/>HDC1000 + MPU9250] -->|BLE GATT<br/>temp, RH, gyro| CTRL[Modbus Controller<br/>Web Bluetooth]
-  CTRL -->|HTTP local<br/>telemetria + calidad| FORGE[3D Asset Forge<br/>IoT condition strip]
+  CTRL -->|HTTP local<br/>telemetria + calidad| FORGE[TwinAxis<br/>IoT condition strip]
   FORGE -->|Modbus TCP FC16<br/>QW120..124| PLC[OpenPLC Runtime<br/>Condition logic]
   PLC --> DECIDE{Estado}
   DECIDE -->|NORMAL| AUTO[Movimiento completo]
@@ -664,7 +814,7 @@ Mapa del programa [`cobot_6dof_iot_condition_monitoring.st`](openplc/cobot-6dof-
 | 126 | calidad/capacidades | bitfield | bit 0 valido, 1 fresco, 2 origen, 3 accel, 4 gyro, 5 ambiente, 6 magnetometro |
 | 127 | politica PLC | 0/1 | 0 condition monitor, 1 motion permit demo |
 
-La plataforma actua como gateway BLE/Modbus: recibe GATT, decodifica unidades, anade edad, secuencia, calidad y capacidades, y escribe `%QW120..126` como bloque de registros. OpenPLC es la autoridad de decision. Publica su reaccion en `%QW94..96` (`AlarmCode`, `ConditionState`, `SpeedPermille`) y las consignas articulares en `%QW100..105`; 3D Asset Forge lee ambas zonas y muestra tanto la decision como el movimiento resultante. Modbus define registros de 16 bits y FC03/FC16 para lectura/escritura de bloques, por lo que escalas, signedness y offset deben permanecer explicitos ([Modbus Application Protocol V1.1b3](https://www.modbus.org/file/secure/modbusprotocolspecification.pdf)).
+La plataforma actua como gateway BLE/Modbus: recibe GATT, decodifica unidades, anade edad, secuencia, calidad y capacidades, y escribe `%QW120..126` como bloque de registros. OpenPLC es la autoridad de decision. Publica su reaccion en `%QW94..96` (`AlarmCode`, `ConditionState`, `SpeedPermille`) y las consignas articulares en `%QW100..105`; TwinAxis lee ambas zonas y muestra tanto la decision como el movimiento resultante. Modbus define registros de 16 bits y FC03/FC16 para lectura/escritura de bloques, por lo que escalas, signedness y offset deben permanecer explicitos ([Modbus Application Protocol V1.1b3](https://www.modbus.org/file/secure/modbusprotocolspecification.pdf)).
 
 Estados de reaccion visibles:
 
@@ -756,7 +906,7 @@ Los seis joints ocupan seis words consecutivos, no doce. Los valores negativos v
 
 #### Centro de configuracion interno
 
-La rueda situada en la esquina inferior izquierda abre `Internal Configuration Center` desde cualquier vista de 3D Asset Forge. Este centro hace visible y editable el contrato que antes estaba implicito en el codigo:
+La rueda situada en la esquina inferior izquierda abre `TwinAxis Signal Mapping` desde cualquier vista de TwinAxis. Este centro hace visible y editable el contrato que antes estaba implicito en el codigo:
 
 ```text
 OpenPLC wire %QWn <-> Modbus Holding Register HR(40001 + n)
@@ -771,6 +921,8 @@ Cada definicion muestra en tiempo real:
 - sentido `Platform to PLC`, `PLC to platform` o `Read / write`;
 - robot y joint asociados;
 - ultimo valor procedente de OpenPLC o del PLC interno.
+- identificador de conexion y protocolo;
+- escala, offset, unidad de ingenieria y periodo de polling.
 
 El centro se abre siempre en modo `READ ONLY`. Ningun campo, selector, alta, borrado o restauracion puede utilizarse hasta pulsar `Enable editing`; el boton cambia a verde para indicar de forma inequívoca que se esta modificando un contrato sensible. Las modificaciones se realizan sobre un borrador y no afectan al PLC, al `TwinProject` ni a `localStorage` mientras no se confirmen.
 
@@ -780,7 +932,9 @@ Todos los joints permanecen visibles en el inventario. En una conexion OpenPLC, 
 
 Las codificaciones disponibles son `UINT16`, `INT16`, `INT16 rad x10000` y `FLOAT32 BE`. `FLOAT32 BE` ocupa dos Holding Registers; el resto ocupa uno. El panel calcula el rango completo y marca en rojo cualquier solapamiento entre definiciones habilitadas.
 
-El mapa se guarda en `localStorage` con la clave `assetForge.internalRegisterConfiguration.v1`. Al modificar una direccion, codificacion o joint, la plataforma detiene el movimiento local, invalida el frame anterior y reconstruye los bindings `TwinProject`. No se mantiene un mapa visual paralelo: el simulador Modbus local, las lecturas OpenPLC, las escrituras manuales, `Command`, `SensorPolicy` y la publicacion IoT consultan esta configuracion.
+El mapa se guarda en `localStorage` con la clave `twinaxis.signalMapping.v1`. La primera carga migra automaticamente la clave legacy `assetForge.internalRegisterConfiguration.v1`. Al modificar una direccion, codificacion o joint, la plataforma detiene el movimiento local, invalida el frame anterior y reconstruye tanto `TwinBinding` como `SignalBinding` dentro de `TwinProject`. No se mantiene un mapa visual paralelo: el simulador Modbus local, las lecturas OpenPLC, las escrituras manuales, `Command`, `SensorPolicy` y la publicacion IoT consultan esta configuracion.
+
+Los identificadores internos `assetForge.*`, la base IndexedDB historica y el identificador Tauri anterior se conservan unicamente como alias de compatibilidad para no perder proyectos ni warehouses existentes. La marca visible, los proyectos nuevos y los archivos exportados usan TwinAxis y la extension `.twin.json`.
 
 Flujo para asignar un registro nuevo a un joint:
 
@@ -798,7 +952,7 @@ Flujo para asignar un registro nuevo a un joint:
 
 Importante: modificar un mapa mientras existe una maquina fisica conectada cambia el contrato de comunicaciones. Debe mantenerse el PLC en `STOP`, comprobar tipos, escalas, limites y ausencia de colisiones, actualizar el programa ST y validar primero contra el gemelo digital. Este editor configura la integracion y la simulacion; no sustituye las funciones de seguridad certificadas del robot o PLC.
 
-Configuracion de 3D Asset Forge:
+Configuracion de TwinAxis:
 
 ```text
 IP / host:       127.0.0.1
@@ -824,7 +978,7 @@ Test-NetConnection 127.0.0.1 -Port 8443
 Test-NetConnection 127.0.0.1 -Port 502
 ```
 
-7. En 3D Asset Forge, seleccionar el cobot, abrir `Digital Twin Scenario` y pulsar `Auto Detect Map`.
+7. En TwinAxis, seleccionar el cobot, abrir `Digital Twin Scenario` y pulsar `Auto Detect Map`.
 8. La deteccion prueba puertos `502/5020`, Unit ID configurado/`1`/`0` y valida la firma `%QW90..%QW105`. Debe mostrar `Detected %QW90..105` y los words `RAW [...]`.
 9. Pulsar `Connect OpenPLC`. El indicador cambia a `ONLINE` y `RX` aumenta. FC03 actualiza el gemelo; una escritura manual usa FC06 o FC16 hacia OpenPLC.
 10. Pulsar `Disconnect OpenPLC` para devolver la autoridad al PLC virtual interno.
@@ -844,6 +998,22 @@ Test-NetConnection 127.0.0.1 -Port 502
 | `Address already in use` en `8443` | Otra instancia del Runtime sigue abierta | Cerrar todas las consolas Runtime y arrancar una sola instancia |
 
 OpenPLC Runtime v3 esta fuera de mantenimiento. La integracion objetivo es Runtime v4 y se basa en operaciones Modbus TCP estandar FC03, FC06 y FC16. Consulte la [documentacion oficial del driver Modbus de OpenPLC Runtime](https://github.com/Autonomy-Logic/openplc-runtime/blob/main/core/src/drivers/README.md).
+
+#### PLC fisico SIMATIC S7-1200
+
+El perfil `Physical S7-1200 - HR0..20` usa el S7-1200 como servidor Modbus TCP y mantiene una unica secuencia de E/S para su puerto. Siemens especifica una sola conexion por puerto `MB_SERVER` y recomienda ejecutar el bloque en cada ciclo del programa. TwinAxis serializa lectura FC03, escritura FC16 y telemetria IoT para evitar competir por ese recurso, conserva la ultima imagen de proceso durante interrupciones breves y solo declara `OFFLINE` despues de fallos consecutivos. Consulte el [manual oficial SIMATIC S7-1200 V4.7](https://cache.industry.siemens.com/dl/files/302/109977302/att_1307432/v1/s71200_system_manual_en-US.pdf).
+
+`Run Start Demo` no salta segun el reloj del navegador: parte del vector real leido en `HR7..HR12`, interpola durante 1.2 segundos hacia el primer frame y avanza el clip solamente despues de confirmar cada escritura. El gemelo y la entidad fisica simulada reciben la misma muestra validada. `Stop PLC Demo` detiene la secuencia y mantiene la ultima consigna con `HR0=0`.
+
+Mapa RobotHolding del perfil fisico:
+
+| Registro | Uso |
+| --- | --- |
+| `HR0` | Autoridad: `0` trayectoria/manual, `1` auto PLC, `2` home |
+| `HR1..6` | Estado, paso, tiempo, alarma, condicion y velocidad |
+| `HR7..12` | J1..J6, `INT16 rad x10000` |
+| `HR13..19` | Telemetria IoT y calidad |
+| `HR20` | Politica del sensor |
 
 Para lanzar el mando visual en Windows PowerShell:
 
@@ -875,7 +1045,7 @@ Flujo de uso:
 5. En la plataforma, pulsar `Visual Controller` para recibir los registros externos.
 6. Usar `Advanced Details` para ver HR, words hex, paquetes y estado de cliente.
 7. Usar `Disconnect Client` desde la plataforma para cortar el cliente conectado.
-8. Para reconectar despues de un corte solicitado por la plataforma, pulsar `Connect` en el mando visual. Ese intento manual elimina el bloqueo de la sesion, 3D Asset Forge vuelve a detectar el mismo Session ID y reactiva RX automaticamente. No es necesario reiniciar ninguno de los dos procesos.
+8. Para reconectar despues de un corte solicitado por la plataforma, pulsar `Connect` en el mando visual. Ese intento manual elimina el bloqueo de la sesion, TwinAxis vuelve a detectar el mismo Session ID y reactiva RX automaticamente. No es necesario reiniciar ninguno de los dos procesos.
 
 Mapa HR principal:
 
@@ -951,20 +1121,42 @@ Comandos principales de validacion:
 
 ```bash
 npm run build
+npm run test:twin
+npm run test:modbus-bridge
 npm run test:kinematics
 npm run test:kinematics:e2e
+npm run test:rig:advanced
 npm run test:articulation
 npm run test:render
 npm run test:parts
 npm run test:piece-mode
 npm run test:cell-rigs
 npm run test:industrial-scene
+npm run test:responsive
 npm run test:all
 ```
+
+La ejecucion integral del 27 de septiembre de 2026 termino con `M2-A` a `M2-J` en `PASS`. El resultado reproducible se guarda en `artifacts/kinematics-m2/m2-summary.json`; `M2-H` solo se marca como aprobado despues de completar todas las regresiones de `test:all`.
+
+| Gate | Resultado | Evidencia principal |
+| --- | --- | --- |
+| M2-A..E | PASS | cilindros X/Z/arbitrarios, invariancia rigida e inferencia one-click |
+| M2-F | PASS | adjacency mecanica conservada al desmontar, serializar, recargar y reensamblar coaxialmente |
+| M2-G | PASS | topologia abierta, cache geometrica y cinematica pura |
+| M2-H | PASS | suite integral de importacion, UX, rigs, robots, PLC, Warehouse y render |
+| M2-I..J | PASS | Home/persistencia sin drift y acceptance E2E sobre robot real |
 
 `test:kinematics` cubre K01-K30: normalizacion de ejes, ejes invalidos, eje arbitrario, pivote correcto, revolute, continuous, prismatic, fixed, limites, propagacion padre-hijo, cadenas con incoming/outgoing joint, ciclos, huerfanos, IDs duplicados, NaN/Infinity, two-point axis, origin picking, mimic/coupling, logical controls, home sin drift, no destructivo, rejected joints, quaternion normalizado, multiples padres y rendimiento sintetico.
 
 `test:kinematics:e2e` usa Playwright con un modelo robotico real para validar creacion manual de joint, picking visual, helpers de pivot/eje, mimic, guardado, reload, migracion legacy y proteccion no destructiva del asset fuente.
+
+`test:twin` valida SignalBinding, comandos gobernados, unidades, Twin Package, perfiles industriales y `MechanicalAdjacencyGraph`. Incluye nombres industriales largos para impedir que el truncado de IDs vuelva a fusionar las señales `actual`, `desired` y `simulated`.
+
+`test:modbus-bridge` valida escritura HR, movimiento visible del gemelo, desconexion confirmada por el servidor y reconexion manual posterior. La desconexion usa acuse HTTP y un rearme de dos fases para que una respuesta de polling atrasada no vuelva a conectar el cliente sin permiso.
+
+`test:rig:advanced` conserva 8 controles y 23 keyframes despues de guardar y recargar mediante la clave vigente `twinaxis.current-project`, manteniendo fallback de lectura para proyectos legacy.
+
+`test:responsive` verifica escritorio `1440x900`, tablet `820x1180` y movil `390x844`. Comprueba overflow, tamano minimo del viewport y limites de Warehouse, Digital Twin Scenario, configuracion interna, IoT Control Center y auditoria. Las capturas se generan en `artifacts/responsive/`.
 
 `test:piece-mode` usa `Rmk3.obj` y comprueba el flujo completo de una pieza desmontada: entrada desde un joint, calculo de centro desde la malla, correccion manual, coincidencia exacta entre centro y pivot, rotacion Z durante una prueba real, salida de modo pieza y persistencia del centro dentro del componente de Warehouse.
 

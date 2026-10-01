@@ -1,5 +1,6 @@
 import type { KinematicGraph, KinematicJoint, JointType } from '../kinematics';
 import type { MaterialDefinition, Transform, Vector3Tuple } from '../model';
+import type { SignalBinding, TwinCommand, TwinEvent, TwinProperty } from '../twin';
 
 export type MechanicalInterfaceKind = 'axis' | 'hinge' | 'support' | 'rail' | 'shaft' | 'mount' | 'gripper' | 'surface';
 
@@ -50,6 +51,17 @@ export type MechanicalInterface = {
   metadata: Record<string, unknown>;
 };
 
+export type SignalInterface = {
+  id: string;
+  componentId: string;
+  name: string;
+  direction: 'input' | 'output' | 'bidirectional';
+  propertyIds: string[];
+  dataType: TwinProperty['dataType'];
+  unit?: string;
+  metadata: Record<string, unknown>;
+};
+
 export type FunctionalComponent = {
   id: string;
   name: string;
@@ -71,6 +83,11 @@ export type FunctionalComponent = {
     massEstimateKg?: number;
   };
   interfaces: MechanicalInterface[];
+  twinProperties?: TwinProperty[];
+  signalInterfaces?: SignalInterface[];
+  signalBindings?: SignalBinding[];
+  commands?: TwinCommand[];
+  events?: TwinEvent[];
   kinematicGraph: KinematicGraph;
   motionDefinition?: FunctionalComponentMotionDefinition;
   sourceKinematicPartIds: string[];
@@ -100,6 +117,16 @@ export type FunctionalAssembly = {
   components: FunctionalComponent[];
   connections: AssemblyConnection[];
   kinematicGraph: KinematicGraph;
+  signalConnections?: Array<{
+    id: string;
+    sourceInterfaceId: string;
+    targetInterfaceId: string;
+    bindingIds: string[];
+    metadata: Record<string, unknown>;
+  }>;
+  controlRelationships?: Array<{ id: string; controllerComponentId: string; controlledComponentId: string; commandIds: string[] }>;
+  dependencies?: Array<{ sourceComponentId: string; targetComponentId: string; kind: 'required' | 'optional' | 'safety' }>;
+  twinState?: Record<string, unknown>;
   metadata: {
     createdAt: string;
     updatedAt: string;

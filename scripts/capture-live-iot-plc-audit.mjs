@@ -246,7 +246,7 @@ const buildReport = (startedAt, finishedAt, jsonName) => {
 \`\`\`mermaid
 flowchart LR
   A[CC2650 SensorTag\nBLE GATT] -->|XYZ, gyro, environment\nsampleId + sequence| B[Digital Twin Modbus Controller\n127.0.0.1:8765]
-  B -->|HTTP /state\ntelemetria con freshness| C[3D Asset Platform]
+  B -->|HTTP /state\ntelemetria con freshness| C[TwinAxis]
   C -->|Modbus TCP FC16\n%QW120..126| D[OpenPLC Runtime\n127.0.0.1:${port} Unit ${unitId}]
   D -->|Programa ST\npolitica %QW127| E[Estado PLC\n%QW94..96]
   D -->|%QW100..105\nINT16 rad x10000| F[Robot fisico simulado]

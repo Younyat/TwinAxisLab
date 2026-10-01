@@ -1,0 +1,17 @@
+{
+  "stage": "M2",
+  "status": "PENDING",
+  "gates": {
+    "M2-A": "PASS",
+    "M2-B": "PASS",
+    "M2-C": "PASS",
+    "M2-D": "PASS",
+    "M2-E": "PASS",
+    "M2-F": "PASS",
+    "M2-G": "PASS",
+    "M2-H": "PENDING",
+    "M2-I": "PASS",
+    "M2-J": "PASS"
+  },
+  "generatedAt": "2026-10-01T15:44:49.216Z"
+}

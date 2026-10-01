@@ -1,0 +1,9 @@
+{
+  "result": "PASS",
+  "checks": [
+    "pre-dismantle adjacency",
+    "warehouse component evidence",
+    "JSON reload",
+    "coaxial reconstruction"
+  ]
+}

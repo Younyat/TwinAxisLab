@@ -11,15 +11,15 @@ export const isDesktopRuntime = () => {
   }
 };
 
-const projectFilters = [{ name: '3D Asset Forge Project', extensions: ['forge.json', 'json'] }];
+const projectFilters = [{ name: 'TwinAxis Project', extensions: ['twin.json', 'forge.json', 'json'] }];
 const glbFilters = [{ name: 'glTF Binary', extensions: ['glb'] }];
 const jsonFilters = [{ name: 'JSON', extensions: ['json'] }];
 const pngFilters = [{ name: 'PNG Image', extensions: ['png'] }];
 
 export const saveProjectNative = async (assetDocument: AssetDocument, defaultPath?: string) => {
   const filePath = await save({
-    title: 'Save 3D Asset Forge Project',
-    defaultPath: defaultPath ?? `${assetDocument.metadata.name.replace(/\s+/g, '-').toLowerCase()}.forge.json`,
+    title: 'Save TwinAxis Project',
+    defaultPath: defaultPath ?? `${assetDocument.metadata.name.replace(/\s+/g, '-').toLowerCase()}.twin.json`,
     filters: projectFilters,
   });
 
@@ -30,7 +30,7 @@ export const saveProjectNative = async (assetDocument: AssetDocument, defaultPat
 
 export const openProjectNative = async () => {
   const filePath = await open({
-    title: 'Open 3D Asset Forge Project',
+    title: 'Open TwinAxis Project',
     multiple: false,
     directory: false,
     filters: projectFilters,

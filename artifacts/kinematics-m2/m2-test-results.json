@@ -1,0 +1,48 @@
+{
+  "fixtures": [
+    {
+      "fixture": "cylinder-z",
+      "axisErrorDeg": 0.000003415094585006376,
+      "axisLineError": 1.7608395385774073e-17,
+      "result": "PASS"
+    },
+    {
+      "fixture": "cylinder-x",
+      "axisErrorDeg": 0.0000282520394970339,
+      "axisLineError": 6.811217638672953e-17,
+      "result": "PASS"
+    },
+    {
+      "fixture": "cylinder-arbitrary",
+      "axisErrorDeg": 0.000015904040849567444,
+      "axisLineError": 1.2776026200422388e-17,
+      "result": "PASS"
+    },
+    {
+      "fixture": "cylinder-fully-arbitrary",
+      "axisErrorDeg": 0.0000029575586669421963,
+      "axisLineError": 2.7023515879264066e-16,
+      "result": "PASS"
+    },
+    {
+      "fixture": "rigid-transform-invariance",
+      "axisErrorDeg": 0.00003631299154864664,
+      "result": "PASS"
+    },
+    {
+      "fixture": "one-click-cylinder",
+      "axisErrorDeg": 0,
+      "axisLineError": 0,
+      "result": "PASS"
+    },
+    {
+      "fixture": "open-cylinder-topology-cache",
+      "result": "PASS"
+    },
+    {
+      "fixture": "pure-kinematics-home-persistence",
+      "result": "PASS"
+    }
+  ],
+  "hashes": []
+}

@@ -6,7 +6,7 @@ Este programa reproduce en OpenPLC el clip `Ciclo_Asistencia` usado por `Start S
 
 1. Crear un programa nuevo en OpenPLC y cargar `cobot_6dof_smart_demo.st`.
 2. Compilar, iniciar el runtime y habilitar el servidor Modbus TCP.
-3. En 3D Asset Forge, abrir `Digital Twin Scenario` con el cobot seleccionado.
+3. En TwinAxis, abrir `Digital Twin Scenario` con el cobot seleccionado.
 4. Configurar `IP / host`, el puerto Modbus del runtime y `Unit ID 1`.
 5. Pulsar `Auto Detect Map`. La plataforma prueba los puertos 502/5020 y Unit ID 1/0, y valida `%QW90..%QW105`.
 6. Confirmar `HR start = 100` y `Data = INT16 rad x10000`.

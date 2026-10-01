@@ -302,6 +302,20 @@ try {
     if (warehouseThumbnails < 1) {
       throw new Error(`${model.name} warehouse dashboard did not render real part thumbnails.`);
     }
+    const librarySearch = page.getByRole('textbox', { name: 'Search functional library' });
+    await librarySearch.fill('no-such-functional-component');
+    if (await page.locator('.warehouse-bin').count() !== 0) throw new Error(`${model.name} functional library search did not filter warehouse bins.`);
+    await librarySearch.fill('');
+    await page.getByLabel('Warehouse item type filter').getByRole('button', { name: 'Parts' }).click();
+    if (await page.locator('.warehouse-bin').count() < 2) throw new Error(`${model.name} part filter hid valid functional components.`);
+    await page.locator('.warehouse-bin').first().click();
+    const functionalInspector = page.getByLabel('Functional library inspector');
+    await functionalInspector.waitFor({ state: 'visible' });
+    if (await functionalInspector.locator('.mechanical-interface-list > div').count() < 1) throw new Error(`${model.name} functional component inspector has no mechanical interfaces.`);
+    const interfaceKind = functionalInspector.locator('.mechanical-interface-list select').first();
+    await interfaceKind.selectOption('mount');
+    if (await interfaceKind.inputValue() !== 'mount') throw new Error(`${model.name} mechanical interface kind was not editable.`);
+    await functionalInspector.getByRole('button', { name: 'Close component inspector' }).click();
     const projectId = await page.evaluate(() => window.__assetForgeDocument?.metadata?.id);
     await page.getByRole('button', { name: /Save All/ }).click();
     await page.waitForFunction(() => /saved permanently|already saved/.test(document.body.innerText), undefined, { timeout: 120000 });
@@ -487,6 +501,20 @@ try {
     ) {
       throw new Error(`${model.name} did not persist a functional assembly with components and kinematic connections.`);
     }
+    await page.getByLabel('Warehouse item type filter').getByRole('button', { name: 'Assemblies' }).click();
+    const assemblyBins = page.locator('.warehouse-bin');
+    if (await assemblyBins.count() < 1) throw new Error(`${model.name} assembly filter did not expose the stored functional assembly.`);
+    await assemblyBins.first().click();
+    const assemblyInspector = page.getByLabel('Functional library inspector');
+    await assemblyInspector.waitFor({ state: 'visible' });
+    if (!/Assembly Connections[\s\S]*Validation/.test(await assemblyInspector.innerText())) throw new Error(`${model.name} assembly engineering inspector is incomplete.`);
+    const connectionStatus = assemblyInspector.locator('.assembly-connection > header select').first();
+    if (await connectionStatus.count()) {
+      await connectionStatus.selectOption('validated');
+      if (await connectionStatus.inputValue() !== 'validated') throw new Error(`${model.name} assembly connection validation was not retained.`);
+    }
+    await assemblyInspector.getByRole('button', { name: 'Close component inspector' }).click();
+    await page.getByLabel('Warehouse item type filter').getByRole('button', { name: 'All' }).click();
 
     const beforeDeleteBins = await page.locator('.warehouse-bin').count();
     await page.locator('.warehouse-bin').first().click({ button: 'right' });

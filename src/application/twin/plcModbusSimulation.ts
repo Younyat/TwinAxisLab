@@ -4,7 +4,7 @@ import type { ModbusMapping, TwinBinding, TwinProject, TwinSignal, TwinSignalSam
 import { sampleKinematicMotionClip } from '../kinematics/robotMotionController';
 import { applyDataBusSamples } from './dataBus';
 import { decodeModbusBlockSamples, encodeModbusValue, planModbusReadBlocks } from './modbusCodec';
-import { createTwinProjectFromAssetDocument, validateTwinProject } from './twinFoundation';
+import { createTwinProjectFromAssetDocument, signalBindingFromLegacyBinding, validateTwinProject } from './twinFoundation';
 
 export type PlcRegister = {
   address: number;
@@ -146,6 +146,7 @@ export const createPlcTwinProjectForNode = (node: SceneNode, options: { timestam
   const project: TwinProject = {
     ...base,
     bindings,
+    signalBindings: bindings.map(signalBindingFromLegacyBinding),
     signals: base.signals.map((signal) => {
       const binding = bindings.find((item) => item.signalId === signal.id);
       return binding ? { ...signal, bindingId: binding.id } : signal;

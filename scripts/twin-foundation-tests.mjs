@@ -20,11 +20,17 @@ const { runTwinFoundationTests } = await import(pathToFileURL(testModule).href);
 const runtimeTestModule = path.resolve('.tmp/twin-tests/application/twin/twinRuntime.test.js');
 const { runTwinRuntimeTests } = await import(pathToFileURL(runtimeTestModule).href);
 await import(pathToFileURL(path.resolve('.tmp/twin-tests/application/twin/virtualPlcRuntime.test.js')).href);
+const { runTwinAxisRuntimeTests } = await import(pathToFileURL(path.resolve('.tmp/twin-tests/application/twin/twinAxisRuntime.test.js')).href);
+const { runTwinMilestoneTests } = await import(pathToFileURL(path.resolve('.tmp/twin-tests/application/twin/twinMilestones.test.js')).href);
+const { runFunctionalModelTests } = await import(pathToFileURL(path.resolve('.tmp/twin-tests/application/mechanics/functionalModel.test.js')).href);
 const { createTwinProjectFromAssetDocument, validateTwinProject } = await import(pathToFileURL(path.resolve('.tmp/twin-tests/application/twin/twinFoundation.js')).href);
 const { createIndustrialSceneModelNode } = await import(pathToFileURL(path.resolve('.tmp/twin-tests/application/industrialScene/industrialScenePack.js')).href);
 
 runTwinFoundationTests();
 runTwinRuntimeTests();
+await runTwinAxisRuntimeTests();
+await runTwinMilestoneTests();
+runFunctionalModelTests();
 
 const realGlbPath = path.resolve('3d imported models/celda_robotica/industrial-arm-6dof.glb');
 assert(fs.existsSync(realGlbPath), `Real GLB missing for Twin P0 validation: ${realGlbPath}`);

@@ -80,6 +80,13 @@ try {
   await workspace.getByRole('button', { name: 'Pose', exact: true }).click();
   const poseRows = workspace.locator('.advanced-pose-row');
   if ((await poseRows.count()) < 1) throw new Error('Advanced pose channels are empty.');
+  const rotationalJoint = await page.evaluate(() => {
+    const node = window.__assetForgeDocument?.nodes.find((item) => item.id === window.__assetForgeDocument?.selectedNodeId);
+    const joint = node?.geometry?.kinematicGraph?.joints?.find((item) => item.type === 'revolute' || item.type === 'continuous');
+    return joint ? { id: joint.id, name: joint.name, origin: [...joint.origin.position] } : undefined;
+  });
+  if (!rotationalJoint) throw new Error('Advanced rig fixture has no rotational joint for ring calibration.');
+  await workspace.locator('.advanced-pose-row').filter({ hasText: rotationalJoint.name }).getByRole('button').first().click();
   const firstPoseSlider = poseRows.first().locator('input[type="range"]');
   if (await firstPoseSlider.isEnabled()) {
     const maximum = Number(await firstPoseSlider.getAttribute('max'));
@@ -94,6 +101,25 @@ try {
 
   await workspace.getByRole('button', { name: 'Constraints', exact: true }).click();
   await workspace.getByText('Local joint space').waitFor();
+  const ringCalibration = workspace.getByLabel('Rotation ring frame calibration');
+  await ringCalibration.waitFor();
+  await ringCalibration.getByRole('button', { name: /XZ around Y/ }).click();
+  await ringCalibration.getByRole('button', { name: 'Increase ring reference X' }).click();
+  await ringCalibration.getByRole('button', { name: 'Adopt as Joint Movement' }).click();
+  await page.waitForFunction(() => document.body.innerText.includes('Joint frame adopted and saved'), undefined, { timeout: 30000 });
+  const calibrated = await page.evaluate((jointId) => {
+    const node = window.__assetForgeDocument?.nodes.find((item) => item.id === window.__assetForgeDocument?.selectedNodeId);
+    const joint = node?.geometry?.kinematicGraph?.joints?.find((item) => item.id === jointId);
+    const control = node?.geometry?.kinematicGraph?.rigControls?.find((item) => item.jointId === jointId);
+    const storedText = localStorage.getItem('twinaxis.current-project');
+    const stored = storedText ? JSON.parse(storedText) : undefined;
+    const storedNode = stored?.nodes?.find((item) => item.id === stored.selectedNodeId);
+    const storedJoint = storedNode?.geometry?.kinematicGraph?.joints?.find((item) => item.id === jointId);
+    return joint ? { axis: joint.axis, plane: joint.motionPlane, origin: joint.origin.position, shape: control?.shape, visible: control?.visible, status: joint.status, storedJoint } : undefined;
+  }, rotationalJoint.id);
+  if (!calibrated || JSON.stringify(calibrated.axis) !== JSON.stringify([0, 1, 0]) || calibrated.plane !== 'xz' || calibrated.origin[0] <= rotationalJoint.origin[0] || calibrated.shape !== 'ring' || !calibrated.visible || calibrated.status !== 'validated' || calibrated.storedJoint?.motionPlane !== 'xz' || calibrated.storedJoint?.axis?.[1] !== 1) {
+    throw new Error(`Ring frame calibration was not applied to the joint: ${JSON.stringify(calibrated)}`);
+  }
   await workspace.getByRole('button', { name: 'Show', exact: true }).click();
 
   await workspace.getByRole('button', { name: 'Animation', exact: true }).click();
@@ -107,17 +133,18 @@ try {
 
   await workspace.getByRole('button', { name: /Save Rig/ }).click();
   await page.waitForTimeout(250);
-  const persisted = await page.evaluate(() => {
-    const documentText = localStorage.getItem('3d-asset-forge.current-project');
+  const persisted = await page.evaluate((jointId) => {
+    const documentText = localStorage.getItem('twinaxis.current-project') ?? localStorage.getItem('3d-asset-forge.current-project');
     const project = documentText ? JSON.parse(documentText) : undefined;
     const node = project?.nodes?.find((item) => item.id === project.selectedNodeId);
     return {
       controls: node?.geometry?.kinematicGraph?.rigControls?.length ?? 0,
       keys: node?.geometry?.kinematicGraph?.motionClips?.reduce((total, item) => total + (item.keyframes?.length ?? 0), 0) ?? 0,
       fps: node?.geometry?.kinematicGraph?.animationSettings?.fps,
+      calibratedJoint: node?.geometry?.kinematicGraph?.joints?.find((item) => item.id === jointId),
     };
-  });
-  if (persisted.controls !== controlCount || persisted.keys < 1 || persisted.fps !== 24) {
+  }, rotationalJoint.id);
+  if (persisted.controls !== controlCount || persisted.keys < 1 || persisted.fps !== 24 || persisted.calibratedJoint?.motionPlane !== 'xz' || persisted.calibratedJoint?.axis?.[1] !== 1) {
     throw new Error(`Advanced rig was not persisted correctly: ${JSON.stringify(persisted)}`);
   }
 
@@ -126,6 +153,14 @@ try {
   await reloadedMechanicalPanel.getByRole('button', { name: 'Advanced', exact: true }).click();
   const reloadedWorkspace = page.getByLabel('Advanced mechanical rig workspace');
   await reloadedWorkspace.waitFor({ timeout: 30000 });
+  const reloadedFrame = await page.evaluate((jointId) => {
+    const node = window.__assetForgeDocument?.nodes.find((item) => item.id === window.__assetForgeDocument?.selectedNodeId);
+    const joint = node?.geometry?.kinematicGraph?.joints?.find((item) => item.id === jointId);
+    return joint ? { axis: joint.axis, plane: joint.motionPlane, origin: joint.origin.position, status: joint.status } : undefined;
+  }, rotationalJoint.id);
+  if (!reloadedFrame || reloadedFrame.plane !== 'xz' || reloadedFrame.axis[1] !== 1 || reloadedFrame.origin[0] <= rotationalJoint.origin[0] || reloadedFrame.status !== 'validated') {
+    throw new Error(`Adopted ring frame disappeared after reload: ${JSON.stringify(reloadedFrame)}`);
+  }
   await reloadedWorkspace.getByRole('button', { name: 'Animation', exact: true }).click();
   if ((await reloadedWorkspace.locator('.keyframe-row').count()) < 1) throw new Error('Saved keyframes disappeared after reload.');
   mkdirSync(screenshotDirectory, { recursive: true });

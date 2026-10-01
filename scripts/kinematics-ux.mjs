@@ -116,6 +116,23 @@ try {
       throw new Error('UX12 failed: context menu is outside the viewport.');
     }
 
+    await page.getByRole('button', { name: /Edit Movement Range/ }).click();
+    await page.getByLabel('Joint range minimum').fill('-35');
+    await page.getByLabel('Joint range maximum').fill('70');
+    await page.getByRole('button', { name: /Save Range/ }).click();
+    await page.waitForFunction(() => document.body.innerText.includes('Joint movement range saved'), undefined, { timeout: 30000 });
+    let rangeSnapshot = await documentSnapshot(page);
+    let rangeNode = rangeSnapshot.nodes.find((item) => item.geometry.kind === 'imported-model');
+    let rangeJoint = rangeNode.geometry.kinematicGraph.joints[0];
+    if (Math.abs(rangeJoint.limits.lower - (-35 * Math.PI / 180)) > 0.00001 || Math.abs(rangeJoint.limits.upper - (70 * Math.PI / 180)) > 0.00001) {
+      throw new Error('UX33 failed: contextual degree range was not stored in canonical radians.');
+    }
+    if (rangeJoint.status !== 'candidate' || rangeJoint.source !== 'manual') {
+      throw new Error('UX33 failed: changing a range did not mark the joint for revalidation.');
+    }
+
+    await rightClickActiveJoint(page);
+
     await page.getByRole('button', { name: /^Test Movement$/ }).click();
     await page.waitForFunction(() => document.body.innerText.includes('Watch the movement'), undefined, { timeout: 30000 });
     await page.waitForFunction(() => {
@@ -319,6 +336,10 @@ try {
     if (JSON.stringify(reloadedNode.geometry.kinematicGraph) !== savedGraph) {
       throw new Error('UX10 failed: reload did not preserve inspected kinematic configuration.');
     }
+    rangeJoint = reloadedNode.geometry.kinematicGraph.joints.find((item) => item.id === firstJointId);
+    if (!rangeJoint?.limits || Math.abs(rangeJoint.limits.lower - (-35 * Math.PI / 180)) > 0.00001 || Math.abs(rangeJoint.limits.upper - (70 * Math.PI / 180)) > 0.00001) {
+      throw new Error('UX34 failed: reload did not preserve the manually configured joint range.');
+    }
     await page.locator('.kinematic-joint-row').first().getByRole('button', { name: /Show Joint/ }).click();
     await page.waitForFunction(() => window.__assetForgeViewportActiveJointPoint?.(), undefined, { timeout: 30000 });
     await page.locator('canvas').dblclick({ position: { x: 8, y: 8 } });
@@ -330,7 +351,7 @@ try {
 
     const errors = logs.filter((line) => line.startsWith('error') || line.startsWith('pageerror'));
     if (errors.length) throw new Error(`Browser errors during kinematics UX test: ${errors.join('\n')}`);
-    console.log('Kinematics UX01-UX32 PASS: guided setup, viewport context menu, helper scale, safe tests, STOP, repair routing, empty-space deselect and reload persistence.');
+    console.log('Kinematics UX01-UX34 PASS: guided setup, contextual range editing, canonical units, helper scale, safe tests, STOP, repair routing, empty-space deselect and reload persistence.');
     await context.close();
   } finally {
     await browser.close();

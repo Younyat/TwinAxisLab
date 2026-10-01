@@ -6,7 +6,22 @@ import { createRenderableSceneAsync } from './threeSceneFactory';
 export const exportDocumentAsGlb = async (document: AssetDocument) => {
   const scene = new THREE.Scene();
   scene.name = document.metadata.name;
-  scene.add(await createRenderableSceneAsync(document.nodes.filter((node) => node.visible)));
+  const assetRoot = await createRenderableSceneAsync(document.nodes.filter((node) => node.visible));
+  scene.add(assetRoot);
+
+  document.nodes.filter((node) => node.visible).forEach((node) => {
+    if (!('kinematicGraph' in node.geometry) || !node.geometry.kinematicGraph) return;
+    const nodeObject = assetRoot.children.find((child) => child.userData.nodeId === node.id);
+    const mechanicalRoot = node.geometry.kind === 'imported-model' ? nodeObject?.children[0] : nodeObject;
+    if (!mechanicalRoot) return;
+    mechanicalRoot.userData.twinAxisKinematics = {
+      schema: 'TwinAxis/Kinematics/1.0',
+      graph: node.geometry.kinematicGraph,
+      state: node.geometry.kinematicState,
+      joints: node.geometry.kind === 'imported-model' ? node.geometry.joints : undefined,
+      partObjectNames: node.geometry.kind === 'imported-model' ? node.geometry.partObjectNames : undefined,
+    };
+  });
 
   const exporter = new GLTFExporter();
 

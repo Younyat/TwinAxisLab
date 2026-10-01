@@ -17,6 +17,8 @@ import type {
   TwinMaturityLevel,
   TwinMode,
   TwinProject,
+  TwinProperty,
+  SignalBinding,
   TwinRelationship,
   TwinSignal,
   TwinSignalSample,
@@ -29,12 +31,23 @@ const schemaVersion = 'industrial-twin/1.0' as const;
 
 const nowUtc = () => new Date().toISOString();
 
-const id = (prefix: string, value: string) =>
-  `${prefix}_${value
+const stableIdHash = (value: string) => {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+};
+
+const id = (prefix: string, value: string) => {
+  const normalized = value
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_|_$/g, '')
-    .slice(0, 80)}`;
+    .replace(/^_|_$/g, '');
+  const bounded = normalized.length <= 80 ? normalized : `${normalized.slice(0, 71)}_${stableIdHash(normalized)}`;
+  return `${prefix}_${bounded}`;
+};
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
@@ -78,6 +91,55 @@ const defaultQualityPolicy = () => ({
 const signalDataTypeForJoint = (joint: KinematicJoint): TwinSignal['dataType'] => (joint.type === 'fixed' ? 'enum' : 'float');
 
 const unitForJoint = (joint: KinematicJoint) => (joint.type === 'prismatic' ? 'm' : joint.type === 'fixed' ? undefined : 'rad');
+
+const propertyAccessFromSignal = (access: TwinSignal['access']): TwinProperty['access'] => access === 'read' ? 'READ' : access === 'write' ? 'WRITE' : 'WRITE';
+
+export const twinPropertyFromLegacySignal = (signal: TwinSignal, componentId = String(signal.metadata.componentId ?? signal.metadata.jointId ?? signal.metadata.assetId ?? 'unassigned')): TwinProperty => ({
+  id: signal.id,
+  componentId,
+  path: signal.path,
+  name: signal.path.split('/').slice(-1)[0] ?? signal.id,
+  dataType: signal.dataType,
+  unit: signal.unit,
+  access: propertyAccessFromSignal(signal.access),
+  writable: signal.access !== 'read',
+  range: signal.range,
+  safeRange: signal.range,
+  requiresConfirmation: signal.access !== 'read',
+  quality: 'STALE',
+  metadata: { ...signal.metadata, compatibilitySource: 'TwinSignal' },
+});
+
+export const signalBindingFromLegacyBinding = (binding: TwinBinding): SignalBinding => ({
+  id: binding.id,
+  propertyId: binding.signalId,
+  connectionId: binding.connectionId,
+  protocol: binding.protocol,
+  source: binding.mapping,
+  dataType: binding.mapping.kind === 'modbus' ? binding.mapping.dataType : binding.mapping.kind,
+  transform: binding.transform,
+  direction: 'READ',
+  pollingMs: Number(binding.metadata.pollingMs ?? 250),
+  qualityPolicy: defaultQualityPolicy(),
+  status: binding.enabled ? 'DISCONNECTED' : 'DISCONNECTED',
+  enabled: binding.enabled,
+  metadata: { ...binding.metadata, compatibilitySource: 'TwinBinding' },
+});
+
+export const migrateLegacyTwinProject = (project: TwinProject): TwinProject => {
+  const properties = project.properties?.length ? project.properties : project.signals.map((signal) => twinPropertyFromLegacySignal(signal));
+  const signalBindings = project.signalBindings?.length ? project.signalBindings : project.bindings.map(signalBindingFromLegacyBinding);
+  return {
+    ...project,
+    properties,
+    signalBindings,
+    metadata: {
+      ...project.metadata,
+      platform: 'TwinAxis',
+      legacyPlatform: (project.metadata as Record<string, unknown>).platform && (project.metadata as Record<string, unknown>).platform !== 'TwinAxis' ? String((project.metadata as Record<string, unknown>).platform) : project.metadata.legacyPlatform,
+    },
+  };
+};
 
 const signalRangeForJoint = (joint: KinematicJoint): TwinSignal['range'] | undefined => {
   if (joint.type === 'fixed') return undefined;
@@ -321,6 +383,8 @@ export const createTwinProjectFromAssetDocument = (document: AssetDocument, opti
     relationships,
     signals,
     bindings,
+    properties: signals.map((signal) => twinPropertyFromLegacySignal(signal)),
+    signalBindings: bindings.map(signalBindingFromLegacyBinding),
     state,
     connectionHealth: options.includeSimulatedBindings
       ? [
@@ -352,6 +416,7 @@ export const createTwinProjectFromAssetDocument = (document: AssetDocument, opti
       sourceDocumentId: document.metadata.id,
       maturityLevel: 0,
       references: ['Manual_Tecnico_Cientifico_3D_Asset_Platform_V2_Digital_Twin.pdf P0'],
+      platform: 'TwinAxis',
     },
   };
   project.metadata.maturityLevel = calculateTwinMaturity(project);

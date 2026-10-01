@@ -1,4 +1,4 @@
-import type { KinematicGraph, KinematicJoint, JointType, MechanicalPart } from '../../domain/kinematics';
+import type { KinematicGraph, KinematicJoint, JointType, MechanicalAdjacency, MechanicalPart } from '../../domain/kinematics';
 import type { AssemblyConnection, AssemblyValidationIssue, FunctionalAssembly, FunctionalComponent, MechanicalInterface, MechanicalInterfaceKind } from '../../domain/mechanics';
 import type { MaterialDefinition, SceneNode, Transform, Vector3Tuple } from '../../domain/model';
 
@@ -19,12 +19,60 @@ const zeroTransform = (): Transform => ({
 
 const tuple = (values?: Vector3Tuple): Vector3Tuple => values ?? [0, 0, 0];
 
+const boundsGap = (a: MechanicalPart['bounds'], b: MechanicalPart['bounds']) => {
+  const gap = ([0, 1, 2] as const).map((axis) => Math.max(0, a.min[axis] - b.max[axis], b.min[axis] - a.max[axis]));
+  return Math.hypot(gap[0], gap[1], gap[2]);
+};
+
+const normalized = (axis: Vector3Tuple): Vector3Tuple => {
+  const length = Math.hypot(axis[0], axis[1], axis[2]);
+  return length > 1e-9 ? [axis[0] / length, axis[1] / length, axis[2] / length] : [0, 0, 0];
+};
+
+export const buildMechanicalAdjacencyGraph = (graph: KinematicGraph): MechanicalAdjacency[] => {
+  const byPair = new Map<string, MechanicalAdjacency>();
+  const pairKey = (a: string, b: string) => [a, b].sort().join('|');
+  (graph.mechanicalAdjacency ?? []).forEach((item) => byPair.set(pairKey(item.partA, item.partB), clone(item)));
+
+  for (let left = 0; left < graph.parts.length; left += 1) {
+    for (let right = left + 1; right < graph.parts.length; right += 1) {
+      const partA = graph.parts[left];
+      const partB = graph.parts[right];
+      const joint = graph.joints.find((item) => (item.parentPartId === partA.id && item.childPartId === partB.id) || (item.parentPartId === partB.id && item.childPartId === partA.id));
+      const distance = boundsGap(partA.bounds, partB.bounds);
+      const scale = Math.max(Math.hypot(...partA.bounds.size), Math.hypot(...partB.bounds.size), 1e-6);
+      if (!joint && distance > scale * 0.02) continue;
+      const key = pairKey(partA.id, partB.id);
+      const existing = byPair.get(key);
+      const coaxialCandidates = existing?.coaxialCandidates ?? (joint ? [{
+        axisPoint: tuple(joint.origin.position),
+        axisDirection: normalized(tuple(joint.axis)),
+        lineDistance: 0,
+        angularErrorDeg: 0,
+      }] : []);
+      byPair.set(key, {
+        partA: existing?.partA ?? partA.id,
+        partB: existing?.partB ?? partB.id,
+        minimumDistance: Math.min(existing?.minimumDistance ?? Number.POSITIVE_INFINITY, distance),
+        coaxialCandidates,
+        metadata: {
+          ...existing?.metadata,
+          evidence: joint ? 'kinematic-joint' : 'aabb-proximity',
+          sourceJointId: joint?.id,
+          normalizedDistance: distance / scale,
+        },
+      });
+    }
+  }
+  return [...byPair.values()];
+};
+
 const interfaceCompatibility: Record<MechanicalInterfaceKind, MechanicalInterfaceKind[]> = {
-  axis: ['shaft', 'hinge', 'support', 'mount'],
-  hinge: ['axis', 'support', 'mount'],
+  axis: ['axis', 'shaft', 'hinge', 'support', 'mount'],
+  hinge: ['axis', 'hinge', 'support', 'mount'],
   support: ['axis', 'hinge', 'shaft', 'mount', 'surface'],
-  rail: ['support', 'mount'],
-  shaft: ['axis', 'support', 'mount'],
+  rail: ['rail', 'support', 'mount'],
+  shaft: ['axis', 'shaft', 'support', 'mount'],
   mount: ['axis', 'hinge', 'support', 'rail', 'shaft', 'surface'],
   gripper: ['mount', 'surface'],
   surface: ['support', 'mount', 'gripper'],
@@ -142,10 +190,15 @@ const componentSubgraph = (sourceGraph: KinematicGraph | undefined, partIds: str
       ...clone(joint),
       status: joint.status === 'rejected' ? 'candidate' : joint.status,
     }));
+  const mechanicalAdjacency = buildMechanicalAdjacencyGraph(sourceGraph)
+    .filter((item) => partSet.has(item.partA) || partSet.has(item.partB))
+    .map(clone);
   return {
     rootPartId: parts[0]?.id ?? sourceGraph.rootPartId,
     parts: parts.length ? parts : [clone(sourceGraph.parts.find((part) => part.id === sourceGraph.rootPartId) ?? sourceGraph.parts[0])],
     joints,
+    mechanicalAdjacency,
+    analysisVersion: sourceGraph.analysisVersion,
   };
 };
 
@@ -200,6 +253,16 @@ export const buildFunctionalComponent = (input: BuildFunctionalComponentInput): 
   const graphInterfaces = interfacesFromGraph(componentId, input.sourceGraph, sourcePartIds);
   const fallbackInterfaces = semanticInterfaces(componentId, input.name, role);
   const interfaces = graphInterfaces.length ? graphInterfaces : fallbackInterfaces;
+  const twinProperties = kinematicGraph.joints.filter((joint) => joint.type !== 'fixed').map((joint) => ({
+    id: `${componentId}.${joint.id}.position`, componentId, path: `${componentId}/joints/${joint.id}/position`, name: `${joint.name} position`, dataType: 'float' as const,
+    unit: joint.type === 'prismatic' ? 'm' : 'rad', access: 'READ_WRITE' as const, writable: true,
+    range: { min: joint.limits?.lower, max: joint.limits?.upper }, safeRange: { min: joint.limits?.lower, max: joint.limits?.upper },
+    requiresConfirmation: true, quality: 'STALE' as const, metadata: { jointId: joint.id, source: 'KinematicGraph V2' },
+  }));
+  const signalInterfaces = twinProperties.map((property) => ({
+    id: `${property.id}.interface`, componentId, name: property.name, direction: 'bidirectional' as const,
+    propertyIds: [property.id], dataType: property.dataType, unit: property.unit, metadata: { generatedFrom: property.metadata.jointId },
+  }));
 
   return {
     id: componentId,
@@ -222,6 +285,11 @@ export const buildFunctionalComponent = (input: BuildFunctionalComponentInput): 
       massEstimateKg: Math.max(input.bounds[0] * input.bounds[1] * input.bounds[2] * 35, 0.001),
     },
     interfaces,
+    twinProperties,
+    signalInterfaces,
+    signalBindings: [],
+    commands: [],
+    events: [],
     kinematicGraph,
     motionDefinition: cleanMotionDefinition(input.bounds),
     sourceKinematicPartIds: sourcePartIds,
@@ -233,6 +301,13 @@ export const buildFunctionalComponent = (input: BuildFunctionalComponentInput): 
 };
 
 const compatible = (a: MechanicalInterface, b: MechanicalInterface) => a.compatibleWith.includes(b.kind) || b.compatibleWith.includes(a.kind);
+
+const adjacencyBetweenComponents = (a: FunctionalComponent, b: FunctionalComponent) => {
+  const aParts = new Set(a.sourceKinematicPartIds);
+  const bParts = new Set(b.sourceKinematicPartIds);
+  const candidates = [...(a.kinematicGraph.mechanicalAdjacency ?? []), ...(b.kinematicGraph.mechanicalAdjacency ?? [])];
+  return candidates.find((item) => (aParts.has(item.partA) && bParts.has(item.partB)) || (aParts.has(item.partB) && bParts.has(item.partA)));
+};
 
 const connectionJointType = (a: MechanicalInterface, b: MechanicalInterface, parent: FunctionalComponent, child: FunctionalComponent): JointType => {
   const preferred = child.mechanicalProperties.preferredJointType ?? parent.mechanicalProperties.preferredJointType;
@@ -247,17 +322,19 @@ export const suggestAssemblyConnections = (components: FunctionalComponent[]): A
   const connected = new Set<string>();
 
   for (let index = 1; index < components.length; index += 1) {
-    const parent = components[index - 1];
     const child = components[index];
-    const candidates = parent.interfaces.flatMap((parentInterface) =>
-      child.interfaces
+    const candidates = components.slice(0, index).flatMap((parent) => {
+      const adjacency = adjacencyBetweenComponents(parent, child);
+      return parent.interfaces.flatMap((parentInterface) => child.interfaces
         .filter((childInterface) => compatible(parentInterface, childInterface))
-        .map((childInterface) => ({ parentInterface, childInterface, score: parentInterface.confidence + childInterface.confidence })),
-    );
+        .map((childInterface) => ({ parent, parentInterface, childInterface, adjacency, score: parentInterface.confidence + childInterface.confidence + (adjacency ? 2 : 0) })));
+    });
     const best = candidates.sort((a, b) => b.score - a.score)[0];
     if (!best) continue;
 
+    const parent = best.parent;
     const jointType = connectionJointType(best.parentInterface, best.childInterface, parent, child);
+    const coaxial = best.adjacency?.coaxialCandidates[0];
     const joint: KinematicJoint = {
       id: id('joint', `${parent.id}_${child.id}_${best.parentInterface.id}_${best.childInterface.id}`),
       name: `${parent.name} to ${child.name}`,
@@ -265,10 +342,10 @@ export const suggestAssemblyConnections = (components: FunctionalComponent[]): A
       childPartId: child.id,
       type: jointType,
       origin: {
-        position: best.childInterface.frame.position,
+        position: coaxial?.axisPoint ?? best.childInterface.frame.position,
         rotation: [0, 0, 0, 1],
       },
-      axis: best.childInterface.axis ?? best.parentInterface.axis ?? [1, 0, 0],
+      axis: coaxial?.axisDirection ?? best.childInterface.axis ?? best.parentInterface.axis ?? [1, 0, 0],
       limits: jointType === 'revolute' ? { lower: -Math.PI, upper: Math.PI } : jointType === 'prismatic' ? { lower: -1, upper: 1 } : undefined,
       source: 'hybrid',
       confidence: Math.min(best.score / 2, 0.95),
@@ -296,6 +373,10 @@ export const suggestAssemblyConnections = (components: FunctionalComponent[]): A
       metadata: {
         parentKind: best.parentInterface.kind,
         childKind: best.childInterface.kind,
+        mechanicalAdjacency: Boolean(best.adjacency),
+        sourcePartA: best.adjacency?.partA,
+        sourcePartB: best.adjacency?.partB,
+        coaxialCandidate: coaxial,
       },
     });
     connected.add(parent.id);
@@ -304,6 +385,17 @@ export const suggestAssemblyConnections = (components: FunctionalComponent[]): A
 
   if (components.length === 1 && !connected.has(components[0].id)) return [];
   return connections;
+};
+
+const assemblyAdjacency = (components: FunctionalComponent[]): MechanicalAdjacency[] => {
+  const result = new Map<string, MechanicalAdjacency>();
+  components.forEach((componentA, index) => components.slice(index + 1).forEach((componentB) => {
+    const adjacency = adjacencyBetweenComponents(componentA, componentB);
+    if (!adjacency) return;
+    const key = [componentA.id, componentB.id].sort().join('|');
+    result.set(key, { ...clone(adjacency), partA: componentA.id, partB: componentB.id, metadata: { ...adjacency.metadata, sourcePartA: adjacency.partA, sourcePartB: adjacency.partB, restoredAfterDismantle: true } });
+  }));
+  return [...result.values()];
 };
 
 const graphFromAssembly = (components: FunctionalComponent[], connections: AssemblyConnection[]): KinematicGraph => ({
@@ -329,6 +421,8 @@ const graphFromAssembly = (components: FunctionalComponent[], connections: Assem
     },
   })),
   joints: connections.map((connection) => connection.joint),
+  mechanicalAdjacency: assemblyAdjacency(components),
+  analysisVersion: 'mechanical-adjacency/1.0',
 });
 
 export const validateFunctionalAssembly = (assembly: FunctionalAssembly): AssemblyValidationIssue[] => {
@@ -426,6 +520,10 @@ export const buildFunctionalAssembly = (input: {
     components: input.components,
     connections,
     kinematicGraph: graphFromAssembly(input.components, connections),
+    signalConnections: [],
+    controlRelationships: [],
+    dependencies: [],
+    twinState: {},
     metadata: {
       createdAt: now,
       updatedAt: now,

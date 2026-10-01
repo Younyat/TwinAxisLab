@@ -61,7 +61,7 @@ const modbusControllerPlugin = () => {
 
 const validOpenPlcHost = (value: string) => /^[a-zA-Z0-9.-]+$/.test(value) && value.length <= 253;
 
-const openPlcRequest = (options: { host: string; port: number; unitId: number; functionCode: number; address: number; quantity?: number; values?: number[]; timeoutMs?: number }) =>
+const openPlcRequest = (options: { host: string; port: number; unitId: number; functionCode: number; address: number; quantity?: number; values?: number[]; timeoutMs?: number; deviceLabel?: string }) =>
   new Promise<Buffer>((resolveRequest, rejectRequest) => {
     const transactionId = Math.floor(Math.random() * 0xffff);
     const values = options.values ?? [];
@@ -74,7 +74,10 @@ const openPlcRequest = (options: { host: string; port: number; unitId: number; f
     const requestFrame = Buffer.concat([mbap, pdu]);
     const socket = net.createConnection({ host: options.host, port: options.port });
     const chunks: Buffer[] = [];
+    let settled = false;
     const finish = (error?: Error, response?: Buffer) => {
+      if (settled) return;
+      settled = true;
       socket.removeAllListeners();
       socket.destroy();
       if (error) rejectRequest(error);
@@ -82,17 +85,19 @@ const openPlcRequest = (options: { host: string; port: number; unitId: number; f
     };
     socket.setTimeout(options.timeoutMs ?? 1200);
     socket.on('connect', () => socket.write(requestFrame));
-    socket.on('timeout', () => finish(new Error('OpenPLC Modbus TCP timeout')));
+    socket.on('timeout', () => finish(new Error(`${options.deviceLabel ?? 'Modbus endpoint'} did not answer within ${options.timeoutMs ?? 1200} ms`)));
     socket.on('error', (error) => finish(error));
+    socket.on('end', () => finish(new Error(`${options.deviceLabel ?? 'Modbus endpoint'} closed the connection before completing the Modbus response`)));
+    socket.on('close', () => finish(new Error(`${options.deviceLabel ?? 'Modbus endpoint'} closed the connection before completing the Modbus response`)));
     socket.on('data', (chunk) => {
       chunks.push(chunk);
       const response = Buffer.concat(chunks);
       if (response.length < 7) return;
       const expectedLength = 6 + response.readUInt16BE(4);
       if (response.length < expectedLength) return;
-      if (response.readUInt16BE(0) !== transactionId) return finish(new Error('OpenPLC transaction ID mismatch'));
-      if (response[6] !== options.unitId) return finish(new Error('OpenPLC Unit ID mismatch'));
-      if ((response[7] & 0x80) !== 0) return finish(new Error(`OpenPLC Modbus exception ${response[8] ?? 0}`));
+      if (response.readUInt16BE(0) !== transactionId) return finish(new Error(`${options.deviceLabel ?? 'Modbus endpoint'} transaction ID mismatch`));
+      if (response[6] !== options.unitId) return finish(new Error(`${options.deviceLabel ?? 'Modbus endpoint'} Unit ID mismatch`));
+      if ((response[7] & 0x80) !== 0) return finish(new Error(`${options.deviceLabel ?? 'Modbus endpoint'} Modbus exception ${response[8] ?? 0}`));
       finish(undefined, response.subarray(0, expectedLength));
     });
   });
@@ -109,8 +114,10 @@ const openPlcPlugin = () => ({
         const unitId = Number(url.searchParams.get('unitId') ?? 1);
         const address = Number(url.searchParams.get('address') ?? 100);
         const quantity = Number(url.searchParams.get('quantity') ?? 12);
+        const profile = url.searchParams.get('profile') ?? 'openplc';
+        const physical = profile === 's7-1200-robot-holding';
         if (!validOpenPlcHost(host) || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(unitId) || unitId < 0 || unitId > 255 || !Number.isInteger(address) || address < 0 || address > 65535 || !Number.isInteger(quantity) || quantity < 1 || quantity > 125) throw new Error('Invalid OpenPLC endpoint or register range');
-        const frame = await openPlcRequest({ host, port, unitId, functionCode: 3, address, quantity });
+        const frame = await openPlcRequest({ host, port, unitId, functionCode: 3, address, quantity, timeoutMs: physical ? 2500 : 1200, deviceLabel: physical ? `Physical S7-1200 ${host}:${port}` : `OpenPLC ${host}:${port}` });
         const byteCount = frame[8];
         const registers = Array.from({ length: Math.floor(byteCount / 2) }, (_, index) => frame.readUInt16BE(9 + index * 2));
         response.end(JSON.stringify({ ok: true, host, port, unitId, address, quantity, registers, transactionId: frame.readUInt16BE(0), functionCode: frame[7], receivedAt: new Date().toISOString() }));
@@ -126,6 +133,7 @@ const openPlcPlugin = () => ({
       const host = url.searchParams.get('host') ?? '127.0.0.1';
       const requestedPort = Number(url.searchParams.get('port') ?? 502);
       const requestedUnit = Number(url.searchParams.get('unitId') ?? 1);
+      const profile = url.searchParams.get('profile') ?? 'openplc';
       if (!validOpenPlcHost(host)) return void (response.statusCode = 400, response.end(JSON.stringify({ ok: false, error: 'Invalid OpenPLC host' })));
       const ports = [...new Set([requestedPort, 502, 5020])].filter((port) => Number.isInteger(port) && port > 0 && port <= 65535);
       const unitIds = [...new Set([requestedUnit, 1, 0])].filter((unitId) => Number.isInteger(unitId) && unitId >= 0 && unitId <= 255);
@@ -133,6 +141,25 @@ const openPlcPlugin = () => ({
       for (const port of ports) {
         for (const unitId of unitIds) {
           try {
+            if (profile === 's7-1200-robot-holding') {
+              const frame = await openPlcRequest({ host, port, unitId, functionCode: 3, address: 0, quantity: 21, timeoutMs: 2500, deviceLabel: `Physical S7-1200 ${host}:${port}` });
+              const byteCount = frame[8];
+              const registers = Array.from({ length: Math.floor(byteCount / 2) }, (_, index) => frame.readUInt16BE(9 + index * 2));
+              const signature = registers.length === 21
+                && registers[0] <= 2
+                && registers[1] <= 3
+                && registers[2] <= 6
+                && registers[5] <= 3
+                && registers[6] <= 1000
+                && registers[17] <= 1
+                && registers[20] <= 1;
+              attempts.push({ port, unitId, result: signature ? 's7-1200-robot-holding' : 'holding-registers-readable' });
+              if (signature) {
+                response.end(JSON.stringify({ ok: true, detected: true, profile, host, port, unitId, address: 7, quantity: 6, dataFormat: 'int16-rad-x10000', commandAddress: 0, rawAddress: 0, registers, attempts, receivedAt: new Date().toISOString() }));
+                return;
+              }
+              continue;
+            }
             const frame = await openPlcRequest({ host, port, unitId, functionCode: 3, address: 90, quantity: 16, timeoutMs: 650 });
             const byteCount = frame[8];
             const registers = Array.from({ length: Math.floor(byteCount / 2) }, (_, index) => frame.readUInt16BE(9 + index * 2));
@@ -149,7 +176,7 @@ const openPlcPlugin = () => ({
         }
       }
       response.statusCode = 502;
-      response.end(JSON.stringify({ ok: false, detected: false, error: 'Cobot OpenPLC register signature not found at %QW90..%QW105', attempts }));
+      response.end(JSON.stringify({ ok: false, detected: false, error: profile === 's7-1200-robot-holding' ? 'S7-1200 RobotHolding signature not found at HR0..HR20' : 'Cobot OpenPLC register signature not found at %QW90..%QW105', attempts }));
     });
 
     server.middlewares.use('/__openplc/write', async (request, response) => {
