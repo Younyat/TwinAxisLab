@@ -156,6 +156,14 @@ try {
     });
     await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => document.body.innerText.includes('Digital Twin Modbus Controller'), undefined, { timeout: 30000 });
+    const environmentalDecoder = await page.evaluate(() => ({
+      sentinel: window.__parseCc2650Environment?.([0, 0, 0, 0]),
+      sample: window.__parseCc2650Environment?.([0, 128, 0, 128]),
+    }));
+    if (environmentalDecoder.sentinel?.hasEnvironment !== false) throw new Error(`CC2650 raw-zero environmental sentinel was accepted: ${JSON.stringify(environmentalDecoder)}`);
+    if (environmentalDecoder.sample?.hasEnvironment !== true || Math.abs(environmentalDecoder.sample.temperatureC - 42.5) > 0.01 || Math.abs(environmentalDecoder.sample.humidityPercent - 50) > 0.01) {
+      throw new Error(`CC2650 environmental conversion is incorrect: ${JSON.stringify(environmentalDecoder)}`);
+    }
     await page.waitForFunction(() => document.body.innerText.includes('not connected') && document.body.innerText.includes('No packets before manual connection'), undefined, { timeout: 30000 });
     await page.waitForFunction(
       () =>

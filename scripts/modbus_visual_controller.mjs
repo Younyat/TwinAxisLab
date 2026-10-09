@@ -1031,12 +1031,13 @@ const controllerHtml = (endpoint) => `<!doctype html>
         const environment = context.iotTelemetry || {};
         const supportsMotionSuite = context.profile?.parser === 'cc2650';
         const supportsEnvironment = Boolean(context.profile?.environment);
+        const environmentAvailable = Boolean(environment.hasEnvironment);
         return '<div class="ble-device-card ' + (active ? 'active' : '') + '">' +
           '<div><strong>IoT ' + context.slot + ' | ' + escapeHtml(context.label) + '</strong><span>' + escapeHtml(context.profile.label) + ' | ' + (context.connected ? samples + ' samples/s' : 'disconnected') + '</span></div>' +
           '<div class="ble-vector"><span>Accelerometer XYZ</span><code>X' + context.slot + ' ' + context.smooth.x.toFixed(3) + ' | Y' + context.slot + ' ' + context.smooth.y.toFixed(3) + ' | Z' + context.slot + ' ' + context.smooth.z.toFixed(3) + ' g</code></div>' +
           '<div class="ble-vector"><span>Gyroscope XYZ</span><code>' + (!supportsMotionSuite ? 'Not available on this profile' : !context.motionTelemetryReceived ? 'Waiting for movement data...' : 'GX ' + gyro.x.toFixed(2) + ' | GY ' + gyro.y.toFixed(2) + ' | GZ ' + gyro.z.toFixed(2) + ' deg/s') + '</code></div>' +
           '<div class="ble-vector"><span>Magnetometer</span><code>' + (!supportsMotionSuite ? 'Not available on this profile' : !context.motionTelemetryReceived ? 'Waiting for movement data...' : 'MX ' + magnetometer.x.toFixed(0) + ' | MY ' + magnetometer.y.toFixed(0) + ' | MZ ' + magnetometer.z.toFixed(0) + ' raw') + '</code></div>' +
-          '<div class="ble-vector environment ' + (context.environmentTelemetryReceived ? 'live' : 'waiting') + '"><span>Environmental telemetry</span><code>Temperature ' + (!supportsEnvironment ? 'not available' : context.environmentTelemetryReceived ? environment.temperatureC.toFixed(1) + ' C' : 'waiting...') + '</code><code>Humidity ' + (!supportsEnvironment ? 'not available' : context.environmentTelemetryReceived ? environment.humidityPercent.toFixed(1) + ' %RH' : 'waiting...') + '</code></div>' +
+          '<div class="ble-vector environment ' + (environmentAvailable ? 'live' : 'waiting') + '"><span>Environmental telemetry</span><code>Temperature ' + (!supportsEnvironment ? 'not available' : environmentAvailable ? environment.temperatureC.toFixed(1) + ' C' : context.environmentTelemetryReceived ? 'not available (raw zero)' : 'waiting...') + '</code><code>Humidity ' + (!supportsEnvironment ? 'not available' : environmentAvailable ? environment.humidityPercent.toFixed(1) + ' %RH' : context.environmentTelemetryReceived ? 'not available (raw zero)' : 'waiting...') + '</code></div>' +
           '<button class="' + (active ? 'active' : '') + '" data-ble-active="' + context.id + '">' + (active ? 'Driving Robot' : 'Drive Robot') + '</button>' +
           '<button data-ble-disconnect="' + context.id + '">Disconnect</button>' +
           '</div>';
@@ -1365,10 +1366,28 @@ const controllerHtml = (endpoint) => `<!doctype html>
         gyroDps:Math.sqrt((gyroscope.x ** 2) + (gyroscope.y ** 2) + (gyroscope.z ** 2)),
       };
     };
-    const parseCc2650Environment = (dataView) => ({
-      temperatureC: dataView.byteLength >= 2 ? (dataView.getUint16(0, true) / 65536) * 165 - 40 : 0,
-      humidityPercent: dataView.byteLength >= 4 ? (dataView.getUint16(2, true) / 65536) * 100 : 0,
-    });
+    const parseCc2650Environment = (dataView) => {
+      if (dataView.byteLength < 4) {
+        return { temperatureC: 0, humidityPercent: 0, hasEnvironment: false };
+      }
+      const rawTemperature = dataView.getUint16(0, true);
+      const rawHumidity = dataView.getUint16(2, true);
+      // CC2650 returns all-zero environmental bytes when the TMP007/HDC1000
+      // data is unavailable. The normal conversion would display -40 C / 0
+      // %RH, so keep the movement stream live but reject this pair as data.
+      if (rawTemperature === 0 && rawHumidity === 0) {
+        return { temperatureC: 0, humidityPercent: 0, hasEnvironment: false };
+      }
+      return {
+        temperatureC: (rawTemperature / 65536) * 165 - 40,
+        humidityPercent: (rawHumidity / 65536) * 100,
+        hasEnvironment: true,
+      };
+    };
+    window.__parseCc2650Environment = (bytes) => {
+      const data = new Uint8Array(bytes);
+      return parseCc2650Environment(new DataView(data.buffer));
+    };
     const publishIotTelemetry = async (context, patch = {}) => {
       context.iotTelemetry = { ...(context.iotTelemetry || {}), ...patch };
       scheduleBleDeviceRender();
@@ -1793,8 +1812,9 @@ const controllerHtml = (endpoint) => `<!doctype html>
           const environmentConfig = findCharacteristic(environmentCharacteristics, session.profile.environment.config);
           const environmentPeriod = findCharacteristic(environmentCharacteristics, session.profile.environment.period);
           const environmentHandler = (event) => {
+            const environment = parseCc2650Environment(event.target.value);
             context.environmentTelemetryReceived = true;
-            publishIotTelemetry(context, { ...parseCc2650Environment(event.target.value), hasEnvironment:true });
+            publishIotTelemetry(context, environment);
           };
           if (environmentData) {
             const environmentNotified = await trackBleNotification(context, environmentData, environmentHandler).catch(() => false);
@@ -1804,8 +1824,9 @@ const controllerHtml = (endpoint) => `<!doctype html>
               context.environmentPollTimer = setInterval(async () => {
                 const value = await environmentData.readValue().catch(() => undefined);
                 if (value) {
+                  const environment = parseCc2650Environment(value);
                   context.environmentTelemetryReceived = true;
-                  publishIotTelemetry(context, { ...parseCc2650Environment(value), hasEnvironment:true });
+                  publishIotTelemetry(context, environment);
                 }
               }, 1000);
             }
