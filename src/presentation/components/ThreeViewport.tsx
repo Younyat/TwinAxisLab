@@ -331,7 +331,11 @@ const usesImportedHierarchyKinematics = (node: SceneNode) => {
 const usesStaticRigHierarchyKinematics = (node: SceneNode) => {
   if (!('kinematicGraph' in node.geometry) || !node.geometry.kinematicGraph) return false;
   const version = node.geometry.kinematicGraph.analysisVersion ?? '';
-  return /^professional-rig-1\./.test(version) && version.includes('static-obj');
+  return /^professional-rig-1\./.test(version) && (
+    version.includes('static-obj') ||
+    version.includes('cylindrical-glb') ||
+    version.includes('cylindrical-obj-new-model')
+  );
 };
 
 const usesIndustrialContractKinematics = (node: SceneNode) => {
@@ -758,6 +762,74 @@ const buildStaticRigHierarchy = (assetRoot: THREE.Group, node: SceneNode) => {
   return sourceObject;
 };
 
+const resetStaticRigHierarchyPivots = (sourceObject: THREE.Object3D, graph: { joints: KinematicJoint[] }) => {
+  graph.joints.forEach((joint) => {
+    const pivot = findDescendantByName(sourceObject, staticRigPivotName(joint.id));
+    if (!pivot) return;
+    const restPosition = (pivot.userData.staticRigRestPosition as THREE.Vector3 | undefined) ?? pivot.position.clone();
+    const restQuaternion = (pivot.userData.staticRigRestQuaternion as THREE.Quaternion | undefined) ?? pivot.quaternion.clone();
+    const restScale = (pivot.userData.staticRigRestScale as THREE.Vector3 | undefined) ?? pivot.scale.clone();
+    pivot.position.copy(restPosition);
+    pivot.quaternion.copy(restQuaternion);
+    pivot.scale.copy(restScale);
+  });
+  sourceObject.updateMatrixWorld(true);
+};
+
+const graphHasPartMotionOverrides = (graph: { parts: Array<{ metadata?: Record<string, unknown> }> }) =>
+  graph.parts.some((part) => {
+    const participation = part.metadata?.motionParticipation;
+    return Boolean(
+      participation &&
+        typeof participation === 'object' &&
+        !Array.isArray(participation) &&
+        Object.values(participation as Record<string, unknown>).some((value) => value === false),
+    );
+  });
+
+const applyIndependentPartKinematicState = (assetRoot: THREE.Group, node: SceneNode) => {
+  const geometry = node.geometry;
+  if (!('kinematicGraph' in geometry) || !geometry.kinematicGraph || !('kinematicState' in geometry) || !geometry.kinematicState) return;
+  const nodeObject = assetRoot.children.find((child) => child.userData.nodeId === node.id);
+  const sourceObject = geometry.kind === 'serialized-object' ? nodeObject : (nodeObject?.children[0] ?? nodeObject);
+  if (!sourceObject) return;
+  const assetRootInverse = assetRoot.matrixWorld.clone().invert();
+  sourceObject.updateMatrixWorld(true);
+  const sourceToAssetMatrix = assetRootInverse.clone().multiply(sourceObject.matrixWorld);
+  const assetToSourceMatrix = sourceToAssetMatrix.clone().invert();
+  const poses = evaluateForwardKinematics(geometry.kinematicGraph, geometry.kinematicState);
+  const partsByObjectName = new Map<string, string>();
+  geometry.kinematicGraph.parts.forEach((part) => {
+    part.meshObjectIds.forEach((objectName) => partsByObjectName.set(objectName, part.id));
+    const selectionMeshObjectIds = part.metadata?.selectionMeshObjectIds;
+    if (Array.isArray(selectionMeshObjectIds)) {
+      selectionMeshObjectIds.forEach((objectName) => {
+        if (typeof objectName === 'string') partsByObjectName.set(objectName, part.id);
+      });
+    }
+  });
+
+  assetRoot.traverse((child) => {
+    if (child.userData.nodeId !== node.id || !child.name || child.userData.freeDragging || child.userData.staticRigPivot) return;
+    const partId = partsByObjectName.get(child.name);
+    const pose = partId ? poses[partId] : undefined;
+    if (!pose) return;
+
+    child.updateMatrixWorld(true);
+    if (!child.userData.kinematicRestAssetMatrix) {
+      child.userData.kinematicRestAssetMatrix = assetRootInverse.clone().multiply(child.matrixWorld);
+    }
+    const restAssetMatrix = child.userData.kinematicRestAssetMatrix as THREE.Matrix4;
+    const sourcePoseMatrix = matrixFromEvaluatedPose(pose.matrix);
+    const assetPoseMatrix = sourceToAssetMatrix.clone().multiply(sourcePoseMatrix).multiply(assetToSourceMatrix);
+    const nextAssetMatrix = assetPoseMatrix.multiply(restAssetMatrix);
+    const parentAssetMatrix = child.parent ? assetRootInverse.clone().multiply(child.parent.matrixWorld) : new THREE.Matrix4();
+    const nextLocalMatrix = parentAssetMatrix.clone().invert().multiply(nextAssetMatrix);
+    nextLocalMatrix.decompose(child.position, child.quaternion, child.scale);
+    child.updateMatrixWorld(true);
+  });
+};
+
 const applyStaticRigHierarchyKinematicState = (assetRoot: THREE.Group, node: SceneNode) => {
   const geometry = node.geometry;
   if (!('kinematicGraph' in geometry) || !geometry.kinematicGraph || !('kinematicState' in geometry) || !geometry.kinematicState) return;
@@ -765,6 +837,33 @@ const applyStaticRigHierarchyKinematicState = (assetRoot: THREE.Group, node: Sce
   if (!sourceObject) return;
   const graph = geometry.kinematicGraph;
   const state = geometry.kinematicState;
+
+  if (graphHasPartMotionOverrides(graph)) {
+    if (!sourceObject.userData.staticRigIndependentMode) {
+      sourceObject.traverse((object) => {
+        if (!object.userData.staticRigPivot && object.userData.nodeId === node.id) {
+          object.userData.staticRigIndependentRestMatrix = object.matrix.clone();
+        }
+      });
+    }
+    resetStaticRigHierarchyPivots(sourceObject, graph);
+    sourceObject.userData.staticRigIndependentMode = true;
+    applyIndependentPartKinematicState(assetRoot, node);
+    return;
+  }
+
+  if (sourceObject.userData.staticRigIndependentMode) {
+    resetStaticRigHierarchyPivots(sourceObject, graph);
+    sourceObject.traverse((object) => {
+      const restMatrix = object.userData.staticRigIndependentRestMatrix as THREE.Matrix4 | undefined;
+      if (!restMatrix) return;
+      object.matrix.copy(restMatrix);
+      object.matrix.decompose(object.position, object.quaternion, object.scale);
+      delete object.userData.staticRigIndependentRestMatrix;
+    });
+    sourceObject.userData.staticRigIndependentMode = false;
+    sourceObject.updateMatrixWorld(true);
+  }
 
   graph.joints.forEach((joint) => {
     const pivot = findDescendantByName(sourceObject, staticRigPivotName(joint.id));
@@ -1226,6 +1325,7 @@ export const ThreeViewport = ({
   const partEditModeRef = useRef(partEditMode);
   const kinematicEditTargetRef = useRef(kinematicEditTarget);
   const motionDemoNodeIdRef = useRef(motionDemoNodeId);
+  const motionDemoStartedAtRef = useRef<number | undefined>();
   const industrialCellDemoActiveRef = useRef(industrialCellDemoActive);
   const robotCursorGuideNodeIdRef = useRef(robotCursorGuideNodeId);
   const motionTrainingPreviewRef = useRef(motionTrainingPreview);
@@ -1333,11 +1433,15 @@ export const ThreeViewport = ({
     toolRef.current = tool;
     partEditModeRef.current = partEditMode;
     kinematicEditTargetRef.current = kinematicEditTarget;
-    motionDemoNodeIdRef.current = motionDemoNodeId;
     industrialCellDemoActiveRef.current = industrialCellDemoActive;
     robotCursorGuideNodeIdRef.current = robotCursorGuideNodeId;
     motionTrainingPreviewRef.current = motionTrainingPreview;
   }, [document, tool, partEditMode, kinematicEditTarget, motionDemoNodeId, industrialCellDemoActive, robotCursorGuideNodeId, motionTrainingPreview]);
+
+  useEffect(() => {
+    motionDemoNodeIdRef.current = motionDemoNodeId;
+    motionDemoStartedAtRef.current = motionDemoNodeId ? performance.now() : undefined;
+  }, [motionDemoNodeId]);
 
   useEffect(() => {
     onSelectRef.current = onSelect;
@@ -2478,7 +2582,10 @@ export const ThreeViewport = ({
 
       orbit.update();
       applyKinematicGraphState(assetRoot, documentRef.current);
-      applyRuntimeMotionDemo(assetRoot, documentRef.current, motionDemoNodeIdRef.current, motionTrainingPreviewRef.current, time / 1000);
+      const motionElapsed = motionDemoNodeIdRef.current && motionDemoStartedAtRef.current !== undefined
+        ? Math.max(0, (time - motionDemoStartedAtRef.current) / 1000)
+        : time / 1000;
+      applyRuntimeMotionDemo(assetRoot, documentRef.current, motionDemoNodeIdRef.current, motionTrainingPreviewRef.current, motionElapsed);
       if (industrialCellDemoActiveRef.current) applyIndustrialCellCycleDemo(assetRoot, documentRef.current, time / 1000);
       syncKinematicHelpers();
       if (selectionBox.visible) selectionBox.update();

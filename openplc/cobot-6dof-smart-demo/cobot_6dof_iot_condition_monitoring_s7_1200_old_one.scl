@@ -1,0 +1,901 @@
+// ============================================================
+// ROBOT ARM CONTROL - S7-1200
+// ============================================================
+
+
+// ============================================================
+// 1. CONVERSIÓN DE SENSORES
+// ============================================================
+
+#TemperatureC :=
+INT_TO_REAL("RobotHolding".Struct.TemperatureCx100) / 100.0;
+
+#HumidityRH :=
+UINT_TO_REAL("RobotHolding".Struct.HumidityRHx100) / 100.0;
+
+#GyroDps :=
+UINT_TO_REAL("RobotHolding".Struct.GyroDpsx100) / 100.0;
+
+#MotionPresent := #GyroDps >= 3.0;
+
+
+// ============================================================
+// 2. TEMPORIZADOR DE AUSENCIA DE MOVIMIENTO
+// ============================================================
+
+#MotionIdleTimer(
+                 IN := ("RobotHolding".Struct.SensorPolicy = 1)
+                 AND (NOT #MotionPresent),
+                 PT := T#2s
+);
+
+
+// ============================================================
+// 3. SUPERVISIÓN DE CONDICIONES
+// ============================================================
+
+// Estado normal por defecto
+"RobotHolding".Struct.ConditionState := 0;
+"RobotHolding".Struct.AlarmCode := 0;
+
+#MotionScale := 1.0;
+"RobotHolding".Struct.SpeedPermille := 1000;
+
+
+// ------------------------------------------------------------
+// SENSOR INVÁLIDO
+// ------------------------------------------------------------
+
+IF ("RobotHolding".Struct.SensorValid = 0)
+    OR (("RobotHolding".Struct.SensorQualityBits AND UINT#1) = UINT#0)
+    OR ("RobotHolding".Struct.SensorAgeMs > 2500)
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 3;
+    "RobotHolding".Struct.AlarmCode := 4;
+    
+    #MotionScale := 0.0;
+    "RobotHolding".Struct.SpeedPermille := 0;
+    
+    
+    // ------------------------------------------------------------
+    // SENSOR DE MOVIMIENTO NO DISPONIBLE
+    // ------------------------------------------------------------
+    
+ELSIF ("RobotHolding".Struct.SensorPolicy = 1)
+    AND (("RobotHolding".Struct.SensorQualityBits AND UINT#16) = UINT#0)
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 3;
+    "RobotHolding".Struct.AlarmCode := 6;
+    
+    #MotionScale := 0.0;
+    "RobotHolding".Struct.SpeedPermille := 0;
+    
+    
+    // ------------------------------------------------------------
+    // SIN MOVIMIENTO DURANTE 2 SEGUNDOS
+    // ------------------------------------------------------------
+    
+ELSIF ("RobotHolding".Struct.SensorPolicy = 1)
+    AND #MotionIdleTimer.Q
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 2;
+    "RobotHolding".Struct.AlarmCode := 5;
+    
+    #MotionScale := 0.0;
+    "RobotHolding".Struct.SpeedPermille := 0;
+    
+    
+    // ------------------------------------------------------------
+    // CONDICIÓN CRÍTICA
+    // ------------------------------------------------------------
+    
+ELSIF (#TemperatureC >= 55.0)
+    OR (#HumidityRH >= 85.0)
+    OR (#GyroDps >= 220.0)
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 2;
+    
+    #MotionScale := 0.0;
+    "RobotHolding".Struct.SpeedPermille := 0;
+    
+    IF #TemperatureC >= 55.0 THEN
+        
+        "RobotHolding".Struct.AlarmCode := 1;
+        
+    ELSIF #HumidityRH >= 85.0 THEN
+        
+        "RobotHolding".Struct.AlarmCode := 2;
+        
+    ELSE
+        
+        "RobotHolding".Struct.AlarmCode := 3;
+        
+    END_IF;
+    
+    
+    // ------------------------------------------------------------
+    // CONDICIÓN DEGRADADA
+    // ------------------------------------------------------------
+    
+ELSIF (#TemperatureC >= 45.0)
+    OR (#HumidityRH >= 75.0)
+    OR (#GyroDps >= 120.0)
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 1;
+    
+    #MotionScale := 0.55;
+    "RobotHolding".Struct.SpeedPermille := 550;
+    
+END_IF;
+
+
+// ============================================================
+// 4. GESTIÓN DE COMANDOS
+// ============================================================
+
+
+// ------------------------------------------------------------
+// COMMAND = 2 -> HOME / RESET
+// ------------------------------------------------------------
+
+IF "RobotHolding".Struct.Command = 2 THEN
+    
+    #TimerEnabled := FALSE;
+    #ResetTimer := TRUE;
+    
+    "RobotHolding".Struct.Status := 2;
+    "RobotHolding".Struct.ActiveStep := 0;
+    "RobotHolding".Struct.ElapsedMsOut := 0;
+    
+    #J1Deg := 0.0;
+    #J2Deg := -35.0;
+    #J3Deg := 75.0;
+    #J4Deg := 50.0;
+    #J5Deg := 0.0;
+    #J6Deg := 0.0;
+    
+    
+    // ------------------------------------------------------------
+    // COMMAND = 0 -> IDLE
+    // ------------------------------------------------------------
+    
+ELSIF "RobotHolding".Struct.Command = 0 THEN
+    
+    #TimerEnabled := FALSE;
+    #ResetTimer := TRUE;
+    
+    "RobotHolding".Struct.Status := 0;
+    "RobotHolding".Struct.ActiveStep := 0;
+    "RobotHolding".Struct.ElapsedMsOut := 0;
+    
+    
+    // ------------------------------------------------------------
+    // ALARMA / BLOQUEO
+    // ------------------------------------------------------------
+    
+ELSIF "RobotHolding".Struct.ConditionState >= 2 THEN
+    
+    #TimerEnabled := FALSE;
+    #ResetTimer := TRUE;
+    
+    "RobotHolding".Struct.Status := 3;
+    "RobotHolding".Struct.ActiveStep := 0;
+    
+    
+    // ------------------------------------------------------------
+    // COMMAND = 1 -> RUN
+    // ------------------------------------------------------------
+    
+ELSE
+    
+    "RobotHolding".Struct.Status := 1;
+    
+    IF #ResetTimer THEN
+        
+        #TimerEnabled := FALSE;
+        #ResetTimer := FALSE;
+        
+    ELSE
+        
+        #TimerEnabled := TRUE;
+        
+    END_IF;
+    
+END_IF;
+
+
+// ============================================================
+// 5. TIMER DEL CICLO DE MOVIMIENTO
+// ============================================================
+
+#CycleTimer(
+            IN := #TimerEnabled,
+            PT := T#12s
+);
+
+
+// ============================================================
+// 6. TRAYECTORIA
+// Solo cuando Status = 1
+// ============================================================
+
+IF "RobotHolding".Struct.Status = 1 THEN
+    
+    #ElapsedMs := TIME_TO_DINT(#CycleTimer.ET);
+    
+    IF #ElapsedMs > 12000 THEN
+        #ElapsedMs := 12000;
+    END_IF;
+    
+    "RobotHolding".Struct.ElapsedMsOut :=
+    DINT_TO_UINT(#ElapsedMs);
+    
+    
+    // --------------------------------------------------------
+    // STEP 1 : 0 - 3 s
+    // --------------------------------------------------------
+    
+    IF #ElapsedMs < 3000 THEN
+        
+        "RobotHolding".Struct.ActiveStep := 1;
+        
+        #SegmentStartMs := 0;
+        #SegmentDurationMs := 3000;
+        
+        #TargetJ1 := -90.0;
+        #TargetJ2 := -10.0;
+        #TargetJ3 := 105.0;
+        #TargetJ4 := 10.0;
+        #TargetJ5 := -45.0;
+        #TargetJ6 := -90.0;
+        
+        
+        // --------------------------------------------------------
+        // STEP 2 : 3 - 6 s
+        // --------------------------------------------------------
+        
+    ELSIF #ElapsedMs < 6000 THEN
+        
+        "RobotHolding".Struct.ActiveStep := 2;
+        
+        #SegmentStartMs := 3000;
+        #SegmentDurationMs := 3000;
+        
+        #TargetJ1 := 90.0;
+        #TargetJ2 := 40.0;
+        #TargetJ3 := 125.0;
+        #TargetJ4 := -70.0;
+        #TargetJ5 := 60.0;
+        #TargetJ6 := 120.0;
+        
+        
+        // --------------------------------------------------------
+        // STEP 3 : 6 - 9 s
+        // --------------------------------------------------------
+        
+    ELSIF #ElapsedMs < 9000 THEN
+        
+        "RobotHolding".Struct.ActiveStep := 3;
+        
+        #SegmentStartMs := 6000;
+        #SegmentDurationMs := 3000;
+        
+        #TargetJ1 := -55.0;
+        #TargetJ2 := -75.0;
+        #TargetJ3 := 45.0;
+        #TargetJ4 := 120.0;
+        #TargetJ5 := -80.0;
+        #TargetJ6 := -140.0;
+        
+        
+        // --------------------------------------------------------
+        // STEP 4 : 9 - 12 s
+        // --------------------------------------------------------
+        
+    ELSE
+        
+        "RobotHolding".Struct.ActiveStep := 4;
+        
+        #SegmentStartMs := 9000;
+        #SegmentDurationMs := 3000;
+        
+        #TargetJ1 := 0.0;
+        #TargetJ2 := -35.0;
+        #TargetJ3 := 75.0;
+        #TargetJ4 := 50.0;
+        #TargetJ5 := 0.0;
+        #TargetJ6 := 0.0;
+        
+    END_IF;
+    
+    
+    // ============================================================
+    // 7. PROGRESO DEL SEGMENTO
+    // ============================================================
+    
+    #P :=
+    DINT_TO_REAL(#ElapsedMs - #SegmentStartMs)
+    /
+    DINT_TO_REAL(#SegmentDurationMs);
+    
+    IF #P < 0.0 THEN
+        #P := 0.0;
+    END_IF;
+    
+    IF #P > 1.0 THEN
+        #P := 1.0;
+    END_IF;
+    
+    
+    // Smoothstep:
+    // P = P² (3 - 2P)
+    
+    #P :=
+    #P
+    * #P
+    * (3.0 - (2.0 * #P));
+    
+    
+    // ============================================================
+    // 8. MOVIMIENTO J1 ... J6
+    // ============================================================
+    
+    #J1Deg :=
+    #J1Deg
+    +
+    (
+    (
+    (0.0 + ((#TargetJ1 - 0.0) * #MotionScale))
+    - #J1Deg
+    )
+    * #P
+    );
+    
+    
+    #J2Deg :=
+    #J2Deg
+    +
+    (
+    (
+    (-35.0 + ((#TargetJ2 - (-35.0)) * #MotionScale))
+    - #J2Deg
+    )
+    * #P
+    );
+    
+    
+    #J3Deg :=
+    #J3Deg
+    +
+    (
+    (
+    (75.0 + ((#TargetJ3 - 75.0) * #MotionScale))
+    - #J3Deg
+    )
+    * #P
+    );
+    
+    
+    #J4Deg :=
+    #J4Deg
+    +
+    (
+    (
+    (50.0 + ((#TargetJ4 - 50.0) * #MotionScale))
+    - #J4Deg
+    )
+    * #P
+    );
+    
+    
+    #J5Deg :=
+    #J5Deg
+    +
+    (
+    (
+    (0.0 + ((#TargetJ5 - 0.0) * #MotionScale))
+    - #J5Deg
+    )
+    * #P
+    );
+    
+    
+    #J6Deg :=
+    #J6Deg
+    +
+    (
+    (
+    (0.0 + ((#TargetJ6 - 0.0) * #MotionScale))
+    - #J6Deg
+    )
+    * #P
+    );
+    
+    
+    // ============================================================
+    // 9. FIN DEL CICLO
+    // ============================================================
+    
+    IF #CycleTimer.Q THEN
+        #ResetTimer := TRUE;
+    END_IF;
+    
+END_IF;
+
+
+// ============================================================
+// 10. PUBLICAR POSICIONES EN MODBUS
+// ============================================================
+
+"RobotHolding".Struct.J1Raw :=
+REAL_TO_INT(#J1Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J2Raw :=
+REAL_TO_INT(#J2Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J3Raw :=
+REAL_TO_INT(#J3Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J4Raw :=
+REAL_TO_INT(#J4Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J5Raw :=
+REAL_TO_INT(#J5Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J6Raw :=
+REAL_TO_INT(#J6Deg * #DegToRadScaled);// ============================================================
+// ROBOT ARM CONTROL - S7-1200
+// ============================================================
+
+
+// ============================================================
+// 1. CONVERSIÓN DE SENSORES
+// ============================================================
+
+#TemperatureC :=
+INT_TO_REAL("RobotHolding".Struct.TemperatureCx100) / 100.0;
+
+#HumidityRH :=
+UINT_TO_REAL("RobotHolding".Struct.HumidityRHx100) / 100.0;
+
+#GyroDps :=
+UINT_TO_REAL("RobotHolding".Struct.GyroDpsx100) / 100.0;
+
+#MotionPresent := #GyroDps >= 3.0;
+
+
+// ============================================================
+// 2. TEMPORIZADOR DE AUSENCIA DE MOVIMIENTO
+// ============================================================
+
+#MotionIdleTimer(
+                 IN := ("RobotHolding".Struct.SensorPolicy = 1)
+                 AND (NOT #MotionPresent),
+                 PT := T#2s
+);
+
+
+// ============================================================
+// 3. SUPERVISIÓN DE CONDICIONES
+// ============================================================
+
+// Estado normal por defecto
+"RobotHolding".Struct.ConditionState := 0;
+"RobotHolding".Struct.AlarmCode := 0;
+
+#MotionScale := 1.0;
+"RobotHolding".Struct.SpeedPermille := 1000;
+
+
+// ------------------------------------------------------------
+// SENSOR INVÁLIDO
+// ------------------------------------------------------------
+
+IF ("RobotHolding".Struct.SensorValid = 0)
+    OR (("RobotHolding".Struct.SensorQualityBits AND UINT#1) = UINT#0)
+    OR ("RobotHolding".Struct.SensorAgeMs > 2500)
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 3;
+    "RobotHolding".Struct.AlarmCode := 4;
+    
+    #MotionScale := 0.0;
+    "RobotHolding".Struct.SpeedPermille := 0;
+    
+    
+    // ------------------------------------------------------------
+    // SENSOR DE MOVIMIENTO NO DISPONIBLE
+    // ------------------------------------------------------------
+    
+ELSIF ("RobotHolding".Struct.SensorPolicy = 1)
+    AND (("RobotHolding".Struct.SensorQualityBits AND UINT#16) = UINT#0)
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 3;
+    "RobotHolding".Struct.AlarmCode := 6;
+    
+    #MotionScale := 0.0;
+    "RobotHolding".Struct.SpeedPermille := 0;
+    
+    
+    // ------------------------------------------------------------
+    // SIN MOVIMIENTO DURANTE 2 SEGUNDOS
+    // ------------------------------------------------------------
+    
+ELSIF ("RobotHolding".Struct.SensorPolicy = 1)
+    AND #MotionIdleTimer.Q
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 2;
+    "RobotHolding".Struct.AlarmCode := 5;
+    
+    #MotionScale := 0.0;
+    "RobotHolding".Struct.SpeedPermille := 0;
+    
+    
+    // ------------------------------------------------------------
+    // CONDICIÓN CRÍTICA
+    // ------------------------------------------------------------
+    
+ELSIF (#TemperatureC >= 55.0)
+    OR (#HumidityRH >= 85.0)
+    OR (#GyroDps >= 220.0)
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 2;
+    
+    #MotionScale := 0.0;
+    "RobotHolding".Struct.SpeedPermille := 0;
+    
+    IF #TemperatureC >= 55.0 THEN
+        
+        "RobotHolding".Struct.AlarmCode := 1;
+        
+    ELSIF #HumidityRH >= 85.0 THEN
+        
+        "RobotHolding".Struct.AlarmCode := 2;
+        
+    ELSE
+        
+        "RobotHolding".Struct.AlarmCode := 3;
+        
+    END_IF;
+    
+    
+    // ------------------------------------------------------------
+    // CONDICIÓN DEGRADADA
+    // ------------------------------------------------------------
+    
+ELSIF (#TemperatureC >= 45.0)
+    OR (#HumidityRH >= 75.0)
+    OR (#GyroDps >= 120.0)
+THEN
+    
+    "RobotHolding".Struct.ConditionState := 1;
+    
+    #MotionScale := 0.55;
+    "RobotHolding".Struct.SpeedPermille := 550;
+    
+END_IF;
+
+
+// ============================================================
+// 4. GESTIÓN DE COMANDOS
+// ============================================================
+
+
+// ------------------------------------------------------------
+// COMMAND = 2 -> HOME / RESET
+// ------------------------------------------------------------
+
+IF "RobotHolding".Struct.Command = 2 THEN
+    
+    #TimerEnabled := FALSE;
+    #ResetTimer := TRUE;
+    
+    "RobotHolding".Struct.Status := 2;
+    "RobotHolding".Struct.ActiveStep := 0;
+    "RobotHolding".Struct.ElapsedMsOut := 0;
+    
+    #J1Deg := 0.0;
+    #J2Deg := -35.0;
+    #J3Deg := 75.0;
+    #J4Deg := 50.0;
+    #J5Deg := 0.0;
+    #J6Deg := 0.0;
+    
+    
+    // ------------------------------------------------------------
+    // COMMAND = 0 -> IDLE
+    // ------------------------------------------------------------
+    
+ELSIF "RobotHolding".Struct.Command = 0 THEN
+    
+    #TimerEnabled := FALSE;
+    #ResetTimer := TRUE;
+    
+    "RobotHolding".Struct.Status := 0;
+    "RobotHolding".Struct.ActiveStep := 0;
+    "RobotHolding".Struct.ElapsedMsOut := 0;
+    
+    
+    // ------------------------------------------------------------
+    // ALARMA / BLOQUEO
+    // ------------------------------------------------------------
+    
+ELSIF "RobotHolding".Struct.ConditionState >= 2 THEN
+    
+    #TimerEnabled := FALSE;
+    #ResetTimer := TRUE;
+    
+    "RobotHolding".Struct.Status := 3;
+    "RobotHolding".Struct.ActiveStep := 0;
+    
+    
+    // ------------------------------------------------------------
+    // COMMAND = 1 -> RUN
+    // ------------------------------------------------------------
+    
+ELSE
+    
+    "RobotHolding".Struct.Status := 1;
+    
+    IF #ResetTimer THEN
+        
+        #TimerEnabled := FALSE;
+        #ResetTimer := FALSE;
+        
+    ELSE
+        
+        #TimerEnabled := TRUE;
+        
+    END_IF;
+    
+END_IF;
+
+
+// ============================================================
+// 5. TIMER DEL CICLO DE MOVIMIENTO
+// ============================================================
+
+#CycleTimer(
+            IN := #TimerEnabled,
+            PT := T#12s
+);
+
+
+// ============================================================
+// 6. TRAYECTORIA
+// Solo cuando Status = 1
+// ============================================================
+
+IF "RobotHolding".Struct.Status = 1 THEN
+    
+    #ElapsedMs := TIME_TO_DINT(#CycleTimer.ET);
+    
+    IF #ElapsedMs > 12000 THEN
+        #ElapsedMs := 12000;
+    END_IF;
+    
+    "RobotHolding".Struct.ElapsedMsOut :=
+    DINT_TO_UINT(#ElapsedMs);
+    
+    
+    // --------------------------------------------------------
+    // STEP 1 : 0 - 3 s
+    // --------------------------------------------------------
+    
+    IF #ElapsedMs < 3000 THEN
+        
+        "RobotHolding".Struct.ActiveStep := 1;
+        
+        #SegmentStartMs := 0;
+        #SegmentDurationMs := 3000;
+        
+        #TargetJ1 := -90.0;
+        #TargetJ2 := -10.0;
+        #TargetJ3 := 105.0;
+        #TargetJ4 := 10.0;
+        #TargetJ5 := -45.0;
+        #TargetJ6 := -90.0;
+        
+        
+        // --------------------------------------------------------
+        // STEP 2 : 3 - 6 s
+        // --------------------------------------------------------
+        
+    ELSIF #ElapsedMs < 6000 THEN
+        
+        "RobotHolding".Struct.ActiveStep := 2;
+        
+        #SegmentStartMs := 3000;
+        #SegmentDurationMs := 3000;
+        
+        #TargetJ1 := 90.0;
+        #TargetJ2 := 40.0;
+        #TargetJ3 := 125.0;
+        #TargetJ4 := -70.0;
+        #TargetJ5 := 60.0;
+        #TargetJ6 := 120.0;
+        
+        
+        // --------------------------------------------------------
+        // STEP 3 : 6 - 9 s
+        // --------------------------------------------------------
+        
+    ELSIF #ElapsedMs < 9000 THEN
+        
+        "RobotHolding".Struct.ActiveStep := 3;
+        
+        #SegmentStartMs := 6000;
+        #SegmentDurationMs := 3000;
+        
+        #TargetJ1 := -55.0;
+        #TargetJ2 := -75.0;
+        #TargetJ3 := 45.0;
+        #TargetJ4 := 120.0;
+        #TargetJ5 := -80.0;
+        #TargetJ6 := -140.0;
+        
+        
+        // --------------------------------------------------------
+        // STEP 4 : 9 - 12 s
+        // --------------------------------------------------------
+        
+    ELSE
+        
+        "RobotHolding".Struct.ActiveStep := 4;
+        
+        #SegmentStartMs := 9000;
+        #SegmentDurationMs := 3000;
+        
+        #TargetJ1 := 0.0;
+        #TargetJ2 := -35.0;
+        #TargetJ3 := 75.0;
+        #TargetJ4 := 50.0;
+        #TargetJ5 := 0.0;
+        #TargetJ6 := 0.0;
+        
+    END_IF;
+    
+    
+    // ============================================================
+    // 7. PROGRESO DEL SEGMENTO
+    // ============================================================
+    
+    #P :=
+    DINT_TO_REAL(#ElapsedMs - #SegmentStartMs)
+    /
+    DINT_TO_REAL(#SegmentDurationMs);
+    
+    IF #P < 0.0 THEN
+        #P := 0.0;
+    END_IF;
+    
+    IF #P > 1.0 THEN
+        #P := 1.0;
+    END_IF;
+    
+    
+    // Smoothstep:
+    // P = P² (3 - 2P)
+    
+    #P :=
+    #P
+    * #P
+    * (3.0 - (2.0 * #P));
+    
+    
+    // ============================================================
+    // 8. MOVIMIENTO J1 ... J6
+    // ============================================================
+    
+    #J1Deg :=
+    #J1Deg
+    +
+    (
+    (
+    (0.0 + ((#TargetJ1 - 0.0) * #MotionScale))
+    - #J1Deg
+    )
+    * #P
+    );
+    
+    
+    #J2Deg :=
+    #J2Deg
+    +
+    (
+    (
+    (-35.0 + ((#TargetJ2 - (-35.0)) * #MotionScale))
+    - #J2Deg
+    )
+    * #P
+    );
+    
+    
+    #J3Deg :=
+    #J3Deg
+    +
+    (
+    (
+    (75.0 + ((#TargetJ3 - 75.0) * #MotionScale))
+    - #J3Deg
+    )
+    * #P
+    );
+    
+    
+    #J4Deg :=
+    #J4Deg
+    +
+    (
+    (
+    (50.0 + ((#TargetJ4 - 50.0) * #MotionScale))
+    - #J4Deg
+    )
+    * #P
+    );
+    
+    
+    #J5Deg :=
+    #J5Deg
+    +
+    (
+    (
+    (0.0 + ((#TargetJ5 - 0.0) * #MotionScale))
+    - #J5Deg
+    )
+    * #P
+    );
+    
+    
+    #J6Deg :=
+    #J6Deg
+    +
+    (
+    (
+    (0.0 + ((#TargetJ6 - 0.0) * #MotionScale))
+    - #J6Deg
+    )
+    * #P
+    );
+    
+    
+    // ============================================================
+    // 9. FIN DEL CICLO
+    // ============================================================
+    
+    IF #CycleTimer.Q THEN
+        #ResetTimer := TRUE;
+    END_IF;
+    
+END_IF;
+
+
+// ============================================================
+// 10. PUBLICAR POSICIONES EN MODBUS
+// ============================================================
+
+"RobotHolding".Struct.J1Raw :=
+REAL_TO_INT(#J1Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J2Raw :=
+REAL_TO_INT(#J2Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J3Raw :=
+REAL_TO_INT(#J3Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J4Raw :=
+REAL_TO_INT(#J4Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J5Raw :=
+REAL_TO_INT(#J5Deg * #DegToRadScaled);
+
+"RobotHolding".Struct.J6Raw :=
+REAL_TO_INT(#J6Deg * #DegToRadScaled);

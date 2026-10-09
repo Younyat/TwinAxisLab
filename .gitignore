@@ -3,4 +3,5 @@ dist/
 .tmp/
 tmp-test-warehouse/
 project-warehouse/
+project-telemetry/
 *.log

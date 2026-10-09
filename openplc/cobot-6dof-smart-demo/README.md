@@ -22,6 +22,14 @@ Todos los valores permanecen dentro de la capacidad de `INT16 rad x10000` (aprox
 
 `cobot_6dof_iot_condition_monitoring.st` recibe telemetria real de un CC2650 montado en la muneca del robot. Conserva el formato OpenPLC Editor de dos bloques: declaraciones `VAR...END_VAR` y cuerpo ST, sin wrappers adicionales.
 
+## S7-1200 fisico
+
+`cobot_6dof_iot_condition_monitoring_s7_1200.scl` es el bloque equivalente para TIA Portal/S7-1200. Usa el DB `RobotHolding`.Struct y publica el mismo proceso `RobotHolding` en HR0..HR20: HR0 Command, HR1..HR6 estado, HR7..HR12 J1..J6, HR13..HR19 telemetria IoT y HR20 SensorPolicy. El mapa y las escalas son los mismos que en el POU OpenPLC.
+
+La version SCL corrige la interpolacion de la trayectoria: al entrar en cada `ActiveStep` captura `SegmentStartJ1..SegmentStartJ6` una sola vez y calcula cada ciclo `start + (target - start) * smoothstep(P) * MotionScale`. No aplica `P` repetidamente sobre una posicion ya avanzada. Esto evita rafagas, saltos y deformaciones. Los cambios de sensor siguen teniendo prioridad de seguridad: `SensorAgeMs > 2500`, calidad invalida, ausencia de movimiento en `SensorPolicy=1` o umbrales criticos fuerzan HOLD/TRIP.
+
+En TIA Portal declara las variables indicadas al inicio del archivo como estaticas del FB, llama el bloque desde el ciclo que actualiza `RobotHolding` y compila/descarga el programa. No basta con copiar el archivo al ordenador: el bloque debe estar en RUN y el servidor Modbus TCP del S7-1200 debe exponer HR0..HR20. Tras descargarlo, comprueba en `Deep Movement Traceability -> Probes` que `interval`, `latency`, `jump`, `stepTransition` y `conditionTransition` son coherentes.
+
 | Wire | Variable | Escala |
 | ---: | --- | --- |
 | 120 | Temperatura | grados C x100, `INT16` |

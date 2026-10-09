@@ -3,10 +3,11 @@ VAR
   Status AT %QW91 : UINT := 1;
   ActiveStep AT %QW92 : UINT := 0;
   ElapsedMsOut AT %QW93 : UINT := 0;
+  ProgramSignature AT %QW97 : UINT := 2101;
   J1Raw AT %QW100 : INT := 0;
-  J2Raw AT %QW101 : INT := -6109;
-  J3Raw AT %QW102 : INT := 13090;
-  J4Raw AT %QW103 : INT := 8727;
+  J2Raw AT %QW101 : INT := 0;
+  J3Raw AT %QW102 : INT := 0;
+  J4Raw AT %QW103 : INT := 0;
   J5Raw AT %QW104 : INT := 0;
   J6Raw AT %QW105 : INT := 0;
   CycleTimer : TON;
@@ -26,18 +27,20 @@ VAR
 END_VAR
 
 
+ProgramSignature := 2101;
+
 IF Command = 2 THEN
   TimerEnabled := FALSE; Status := 2; ActiveStep := 0; ElapsedMsOut := 0;
   J1Deg := 0.0; J2Deg := -35.0; J3Deg := 75.0;
   J4Deg := 50.0; J5Deg := 0.0; J6Deg := 0.0;
 ELSIF Command = 0 THEN
   TimerEnabled := FALSE; Status := 0; ActiveStep := 0;
-  J1Deg := INT_TO_REAL(J1Raw) / DegToRadScaled;
-  J2Deg := INT_TO_REAL(J2Raw) / DegToRadScaled;
-  J3Deg := INT_TO_REAL(J3Raw) / DegToRadScaled;
-  J4Deg := INT_TO_REAL(J4Raw) / DegToRadScaled;
-  J5Deg := INT_TO_REAL(J5Raw) / DegToRadScaled;
-  J6Deg := INT_TO_REAL(J6Raw) / DegToRadScaled;
+  J1Deg := 0.0 + (INT_TO_REAL(J1Raw) / DegToRadScaled);
+  J2Deg := -35.0 + (INT_TO_REAL(J2Raw) / DegToRadScaled);
+  J3Deg := 75.0 + (INT_TO_REAL(J3Raw) / DegToRadScaled);
+  J4Deg := 50.0 + (INT_TO_REAL(J4Raw) / DegToRadScaled);
+  J5Deg := 0.0 + (INT_TO_REAL(J5Raw) / DegToRadScaled);
+  J6Deg := 0.0 + (INT_TO_REAL(J6Raw) / DegToRadScaled);
 ELSE
   Status := 1;
   IF ResetTimer THEN 
@@ -120,9 +123,9 @@ ELSE
   IF CycleTimer.Q THEN ResetTimer := TRUE; END_IF;
 END_IF;
 
-J1Raw := REAL_TO_INT(J1Deg * DegToRadScaled);
-J2Raw := REAL_TO_INT(J2Deg * DegToRadScaled);
-J3Raw := REAL_TO_INT(J3Deg * DegToRadScaled);
-J4Raw := REAL_TO_INT(J4Deg * DegToRadScaled);
-J5Raw := REAL_TO_INT(J5Deg * DegToRadScaled);
-J6Raw := REAL_TO_INT(J6Deg * DegToRadScaled);
+J1Raw := REAL_TO_INT((J1Deg - 0.0) * DegToRadScaled);
+J2Raw := REAL_TO_INT((J2Deg - (-35.0)) * DegToRadScaled);
+J3Raw := REAL_TO_INT((J3Deg - 75.0) * DegToRadScaled);
+J4Raw := REAL_TO_INT((J4Deg - 50.0) * DegToRadScaled);
+J5Raw := REAL_TO_INT((J5Deg - 0.0) * DegToRadScaled);
+J6Raw := REAL_TO_INT((J6Deg - 0.0) * DegToRadScaled);

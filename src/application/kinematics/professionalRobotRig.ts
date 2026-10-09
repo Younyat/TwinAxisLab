@@ -21,6 +21,8 @@ type RobotArmRigJointMetadata = {
   homeMeters?: number;
   maxSpeedDegPerSec?: number;
   maxSpeedMetersPerSec?: number;
+  manualOriginOverride?: boolean;
+  gripperSide?: 'left' | 'right';
   morphology?: {
     method: 'rounded-body' | 'contact';
     score?: number;
@@ -39,6 +41,9 @@ type RobotArmRigMetadata = {
     openMeters?: number;
     closedMeters?: number;
     strokeMeters?: number;
+    openValue?: number;
+    closedValue?: number;
+    jointToValue?: (value: number) => number;
   };
   clips?: Array<{ name: string; durationSec?: number; loop?: boolean }>;
 };
@@ -68,7 +73,8 @@ type StaticRigSpec = {
   sourceSchema: string;
   analysisVersion: string;
   rootPartName: string;
-  parts: Array<{ name: string; meshObjectIds: string[]; static?: boolean }>;
+  angleUnit?: 'degrees' | 'radians';
+  parts: Array<{ name: string; meshObjectIds: string[]; meshObjectPatterns?: RegExp[]; static?: boolean }>;
   joints: RobotArmRigJointMetadata[];
   gripper?: NonNullable<RobotArmRigMetadata['gripper']>;
   clips?: Array<{ name: string; durationSec: number; loop: boolean; description?: string; keys: GenericRigPoseKey[] }>;
@@ -84,6 +90,9 @@ export type ProfessionalRigImport = {
 
 const DEG_TO_RAD = Math.PI / 180;
 const EPSILON = 1e-8;
+// Negative Z rotation raises the forearm in the industrial cell model.
+// Keep this correction isolated to J3_elbow_pitch.
+const INDUSTRIAL_J3_LIFT_OFFSET_RAD = -10 * DEG_TO_RAD;
 
 const id = (prefix: string, value: string) =>
   `${prefix}_${value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 56)}`;
@@ -371,6 +380,209 @@ const CELL_INDUSTRIAL_STATIC_SPEC: StaticRigSpec = {
   ],
 };
 
+const CYLINDRICAL_STATIC_SPEC: StaticRigSpec = {
+  filePattern: /brazo[_-]cilindrico[_-]4[_-]nodos\.glb$/i,
+  assetName: 'brazo_cilindrico_4_nodos',
+  rootName: 'brazo_cilindrico_4_nodos',
+  sourceSchema: 'robot-arm-rig/1.1-cylindrical-static-glb',
+  analysisVersion: 'professional-rig-1.2-cylindrical-glb',
+  rootPartName: 'BASE_fixed',
+  angleUnit: 'radians',
+  parts: [
+    { name: 'BASE_fixed', static: true, meshObjectIds: ['nodo1_base_fija'] },
+    { name: 'J1_base_rotate', meshObjectIds: ['nodo1_giratorio'] },
+    { name: 'J2_carro_vertical', meshObjectIds: ['nodo2_carro_vertical'] },
+    { name: 'J3_viga_avance', meshObjectIds: ['nodo3_manguito', 'nodo3_viga', 'nodo4_pinza'] },
+    { name: 'J4_finger_L', meshObjectIds: ['pinza_dedo_izquierdo'] },
+    { name: 'J4_finger_R', meshObjectIds: ['pinza_dedo_derecho'] },
+  ],
+  joints: [
+    { name: 'J1_base_rotate', order: 'J1', type: 'revolute', axis: 'Y', parent: 'BASE_fixed', originMeters: [0, 0.177, 0], limitsDeg: [-171, 171], homeDeg: 0, maxSpeedDegPerSec: 86 },
+    { name: 'J2_carro_vertical', order: 'J2', type: 'prismatic', axis: 'Y', parent: 'J1_base_rotate', originMeters: [0, 1.1, 0], limitsMeters: [0.45, 1.5], homeMeters: 1.1, maxSpeedMetersPerSec: 0.8 },
+    { name: 'J3_viga_avance', order: 'J3', type: 'prismatic', axis: 'X', parent: 'J2_carro_vertical', originMeters: [0.25, 1.1, 0.21], limitsMeters: [-0.5, 0.5], homeMeters: 0.25, maxSpeedMetersPerSec: 0.8 },
+    { name: 'J4_finger_L', order: 'G1', type: 'prismatic', axis: 'Z', parent: 'J3_viga_avance', originMeters: [1.03, 0.67, 0.149], limitsMeters: [-0.081, -0.0285], homeMeters: -0.061, maxSpeedMetersPerSec: 0.05 },
+    { name: 'J4_finger_R', order: 'G1', type: 'prismatic', axis: 'Z', parent: 'J3_viga_avance', originMeters: [1.03, 0.67, 0.271], limitsMeters: [0.0285, 0.081], homeMeters: 0.061, maxSpeedMetersPerSec: 0.05 },
+  ],
+  gripper: { type: 'parallel_2_finger', axis: 'Z', openMeters: 0.081, closedMeters: 0.0285, strokeMeters: 0.105 },
+  clips: [
+    {
+      name: 'Demo_Pick_Place', durationSec: 8.8, loop: true,
+      description: 'Trayectoria documentada de recogida y deposito del brazo cilindrico.',
+      keys: [
+        { t: 0, phase: 'home', J1: 0, J2: 1.1, J3: 0.25, grip: 1 },
+        { t: 1.1, phase: 'sobre_recogida', J1: -1.2, J2: 1.1, J3: 0.45, grip: 1 },
+        { t: 2.2, phase: 'bajar_recogida', J1: -1.2, J2: 0.5, J3: 0.45, grip: 1 },
+        { t: 3.3, phase: 'cerrar_pinza', J1: -1.2, J2: 0.5, J3: 0.45, grip: 0 },
+        { t: 4.4, phase: 'subir_con_pieza', J1: -1.2, J2: 1.3, J3: 0.45, grip: 0 },
+        { t: 5.5, phase: 'girar_a_deposito', J1: 1.4, J2: 1.3, J3: -0.2, grip: 0 },
+        { t: 6.6, phase: 'bajar_deposito', J1: 1.4, J2: 0.7, J3: -0.2, grip: 0 },
+        { t: 7.7, phase: 'abrir_pinza', J1: 1.4, J2: 0.7, J3: -0.2, grip: 1 },
+        { t: 8.8, phase: 'retirar', J1: 1.4, J2: 1.2, J3: -0.2, grip: 1 },
+      ],
+    },
+    {
+      name: 'Demo_Ejes_Cilindrico', durationSec: 8.8, loop: true,
+      description: 'Verificacion secuencial de giro, altura, avance y pinza.',
+      keys: [
+        { t: 0, J1: 0, J2: 1.1, J3: 0.25, grip: 1 },
+        { t: 1.1, J1: 2.2, J2: 1.1, J3: 0.25, grip: 1 },
+        { t: 2.2, J1: 0, J2: 1.1, J3: 0.25, grip: 1 },
+        { t: 3.3, J1: 0, J2: 0.5, J3: 0.25, grip: 1 },
+        { t: 4.4, J1: 0, J2: 1.1, J3: 0.25, grip: 1 },
+        { t: 5.5, J1: 0, J2: 1.1, J3: -0.5, grip: 1 },
+        { t: 6.6, J1: 0, J2: 1.1, J3: 0.25, grip: 1 },
+        { t: 7.7, J1: 0, J2: 1.1, J3: 0.25, grip: 0 },
+        { t: 8.8, J1: 0, J2: 1.1, J3: 0.25, grip: 1 },
+      ],
+    },
+  ],
+};
+
+const CYLINDRICAL_OBJ_STATIC_SPEC: StaticRigSpec = {
+  ...CYLINDRICAL_STATIC_SPEC,
+  filePattern: /brazo[_-]cilindrico[_-]4[_-]nodos\.obj$/i,
+  sourceSchema: 'robot-arm-rig/1.1-cylindrical-static-obj',
+  analysisVersion: 'professional-rig-1.2-cylindrical-obj',
+  parts: [
+    { name: 'BASE_fixed', static: true, meshObjectIds: ['base_placa_anclaje', 'base_perno_1', 'base_perno_2', 'base_perno_3', 'base_perno_4', 'base_perno_5', 'base_perno_6', 'base_perno_7', 'base_perno_8', 'base_cuerpo', 'base_franja_aviso', 'base_rodamiento', 'base_motor_carcasa', 'base_motor_tapa'] },
+    { name: 'J1_base_rotate', meshObjectIds: ['giratorio_cuerpo', 'giratorio_tapa', 'indicador_nodo_1', 'columna_brida', 'columna_cartela', 'columna_perfil_cuerpo', 'columna_perfil_ranura', 'columna_remate', 'columna_cadena_cables'] },
+    { name: 'J2_carro_vertical', meshObjectIds: ['carro_cuerpo', 'carro_tapa_lateral', 'indicador_nodo_2', 'carro_puente'] },
+    { name: 'J3_viga_avance', meshObjectIds: ['manguito_cuerpo', 'indicador_nodo_3', 'manguito_motor_carcasa', 'manguito_motor_tapa', 'viga_perfil_cuerpo', 'viga_perfil_ranura', 'viga_tope', 'viga_franja', 'bajante_perfil_cuerpo', 'bajante_perfil_ranura', 'bajante_brida', 'pinza_cuerpo', 'indicador_nodo_4', 'pinza_guia'] },
+    { name: 'J4_finger_L', meshObjectIds: ['pinza_dedo_izquierdo_carro', 'pinza_dedo_izquierdo_lamina', 'pinza_dedo_izquierdo_goma'] },
+    { name: 'J4_finger_R', meshObjectIds: ['pinza_dedo_derecho_carro', 'pinza_dedo_derecho_lamina', 'pinza_dedo_derecho_goma'] },
+  ],
+};
+
+const CYLINDRICAL_NEW_PIVOT_Z = 0.006;
+const CYLINDRICAL_NEW_FINGER_RADIUS = 0.07 * 0.75;
+const cylindricalNewFingerAngle = (opening: number) =>
+  Math.asin(Math.max(-1, Math.min(1, (opening / 2 - CYLINDRICAL_NEW_PIVOT_Z) / CYLINDRICAL_NEW_FINGER_RADIUS)));
+const cylindricalNewFingerAngleDeg = (opening: number) => cylindricalNewFingerAngle(opening) / DEG_TO_RAD;
+const CYLINDRICAL_NEW_FINGER_ANGLE_MAX_DEG = cylindricalNewFingerAngleDeg(0.07);
+const CYLINDRICAL_NEW_FINGER_HOME_DEG = cylindricalNewFingerAngleDeg(0.05);
+
+const CYLINDRICAL_NEW_JOINTS: RobotArmRigJointMetadata[] = [
+  {
+    name: 'J1_base_rotate', order: 'J1', type: 'revolute', axis: 'Y', parent: 'BASE_fixed',
+    originMeters: [0, 0.036, 0], limitsDeg: [-171, 171], homeDeg: 0, maxSpeedDegPerSec: 45.84,
+    manualOriginOverride: true,
+  },
+  {
+    name: 'J2_carro_vertical', order: 'J2', type: 'prismatic', axis: 'Y', parent: 'J1_base_rotate',
+    // Static hierarchy pivots are seeded in root coordinates. The source GLB
+    // places this node at J1's 0.036 m offset plus its 0.30 m local travel.
+    originMeters: [0, 0.336, 0], limitsMeters: [0.13, 0.36], homeMeters: 0.30, maxSpeedMetersPerSec: 0.02,
+    manualOriginOverride: true,
+  },
+  {
+    name: 'J3_viga_avance', order: 'J3', type: 'prismatic', axis: 'X', parent: 'J2_carro_vertical',
+    // Includes the parent J1/J2 world height so the nested local pivot is
+    // restored to the GLB's [0.04, 0, 0.035] transform.
+    originMeters: [0.04, 0.336, 0.035], limitsMeters: [0, 0.18], homeMeters: 0.06, maxSpeedMetersPerSec: 0.02,
+    manualOriginOverride: true,
+  },
+  {
+    name: 'J4_finger_L', order: 'G1', type: 'revolute', axis: 'Y', parent: 'J3_viga_avance',
+    // J3's source child is at x=0.22; the finger pivot adds x=0.035 and
+    // remains at the source finger y/z offsets.
+    originMeters: [0.295, 0.261, -0.006 + 0.035], limitsDeg: [0, CYLINDRICAL_NEW_FINGER_ANGLE_MAX_DEG],
+    homeDeg: CYLINDRICAL_NEW_FINGER_HOME_DEG, maxSpeedDegPerSec: 35, manualOriginOverride: true, gripperSide: 'left',
+  },
+  {
+    name: 'J4_finger_R', order: 'G1', type: 'revolute', axis: 'Y', parent: 'J3_viga_avance',
+    originMeters: [0.295, 0.261, 0.006 + 0.035], limitsDeg: [-CYLINDRICAL_NEW_FINGER_ANGLE_MAX_DEG, 0],
+    homeDeg: -CYLINDRICAL_NEW_FINGER_HOME_DEG, maxSpeedDegPerSec: 35, manualOriginOverride: true, gripperSide: 'right',
+  },
+];
+
+const CYLINDRICAL_NEW_GRIPPER: NonNullable<RobotArmRigMetadata['gripper']> = {
+  type: 'parallel_2_finger',
+  axis: 'Y',
+  openMeters: cylindricalNewFingerAngle(0.06),
+  closedMeters: cylindricalNewFingerAngle(0.025),
+  strokeMeters: cylindricalNewFingerAngle(0.06) - cylindricalNewFingerAngle(0.025),
+  openValue: cylindricalNewFingerAngle(0.06),
+  closedValue: cylindricalNewFingerAngle(0.025),
+  jointToValue: cylindricalNewFingerAngle,
+};
+
+const CYLINDRICAL_NEW_CLIPS: NonNullable<StaticRigSpec['clips']> = [
+  {
+    name: 'Demo_Pick_Place', durationSec: 17.6, loop: true,
+    description: 'Trayectoria documentada del brazo cilíndrico nuevo: recogida y depósito.',
+    keys: [
+      { t: 0, phase: 'home', J1: 0, J2: 0.30, J3: 0.06, J4: 0.05 },
+      { t: 1.1, phase: 'sobre_recogida', J1: -1.2, J2: 0.30, J3: 0.18, J4: 0.06 },
+      { t: 2.2, phase: 'bajar_recogida', J1: -1.2, J2: 0.15, J3: 0.18, J4: 0.06 },
+      { t: 3.3, phase: 'cerrar_pinza', J1: -1.2, J2: 0.15, J3: 0.18, J4: 0.025 },
+      { t: 4.4, phase: 'subir_con_pieza', J1: -1.2, J2: 0.32, J3: 0.18, J4: 0.025 },
+      { t: 5.5, phase: 'girar_a_deposito', J1: 1.4, J2: 0.32, J3: 0.00, J4: 0.025 },
+      { t: 6.6, phase: 'bajar_deposito', J1: 1.4, J2: 0.18, J3: 0.00, J4: 0.025 },
+      { t: 7.7, phase: 'abrir_pinza', J1: 1.4, J2: 0.18, J3: 0.00, J4: 0.06 },
+      { t: 8.8, phase: 'retirar', J1: 1.4, J2: 0.30, J3: 0.00, J4: 0.06 },
+      { t: 9.9, phase: 'retorno_bajar', J1: 1.4, J2: 0.18, J3: 0.00, J4: 0.06 },
+      { t: 11.0, phase: 'retorno_cerrar', J1: 1.4, J2: 0.18, J3: 0.00, J4: 0.025 },
+      { t: 12.1, phase: 'retorno_subir', J1: 1.4, J2: 0.32, J3: 0.00, J4: 0.025 },
+      { t: 13.2, phase: 'retorno_giro', J1: -1.2, J2: 0.32, J3: 0.18, J4: 0.025 },
+      { t: 14.3, phase: 'retorno_bajar_recogida', J1: -1.2, J2: 0.15, J3: 0.18, J4: 0.025 },
+      { t: 15.4, phase: 'retorno_abrir', J1: -1.2, J2: 0.15, J3: 0.18, J4: 0.06 },
+      { t: 16.5, phase: 'retorno_recogida', J1: -1.2, J2: 0.30, J3: 0.18, J4: 0.06 },
+      { t: 17.6, phase: 'home_retorno', J1: 0, J2: 0.30, J3: 0.06, J4: 0.05 },
+    ],
+  },
+  {
+    name: 'Demo_Ejes_Cilindrico', durationSec: 8.8, loop: true,
+    description: 'Verificación secuencial de giro, altura, avance y pinza dentro de sus límites.',
+    keys: [
+      { t: 0, J1: 0, J2: 0.30, J3: 0.06, J4: 0.05 },
+      { t: 1.1, J1: 2.2, J2: 0.30, J3: 0.06, J4: 0.05 },
+      { t: 2.2, J1: 0, J2: 0.30, J3: 0.06, J4: 0.05 },
+      { t: 3.3, J1: 0, J2: 0.13, J3: 0.00, J4: 0.05 },
+      { t: 4.4, J1: 0, J2: 0.30, J3: 0.06, J4: 0.05 },
+      { t: 5.5, J1: 0, J2: 0.30, J3: 0.18, J4: 0.05 },
+      { t: 6.6, J1: 0, J2: 0.30, J3: 0.06, J4: 0.05 },
+      { t: 7.7, J1: 0, J2: 0.30, J3: 0.06, J4: 0.025 },
+      { t: 8.8, J1: 0, J2: 0.30, J3: 0.06, J4: 0.05 },
+    ],
+  },
+];
+
+const CYLINDRICAL_NEW_GLTF_STATIC_SPEC: StaticRigSpec = {
+  filePattern: /brazo[_-]cilindrico[_-]4[_-]nodos\.glb$/i,
+  assetName: 'brazo_cilindrico_4_nodos',
+  rootName: 'brazo_cilindrico_4_nodos',
+  sourceSchema: 'robot-arm-rig/1.2-cylindrical-new-glb',
+  analysisVersion: 'professional-rig-1.3-cylindrical-glb-new-model',
+  rootPartName: 'BASE_fixed',
+  angleUnit: 'radians',
+  parts: [
+    { name: 'BASE_fixed', static: true, meshObjectIds: ['base_fija'] },
+    { name: 'J1_base_rotate', meshObjectIds: ['nodo1_giratorio'] },
+    { name: 'J2_carro_vertical', meshObjectIds: ['nodo2_carro_vertical'] },
+    { name: 'J3_viga_avance', meshObjectIds: ['nodo3_brazo'] },
+    { name: 'J4_finger_L', meshObjectIds: ['pinza_mordaza_izquierda'] },
+    { name: 'J4_finger_R', meshObjectIds: ['pinza_mordaza_derecha'] },
+  ],
+  joints: CYLINDRICAL_NEW_JOINTS,
+  gripper: CYLINDRICAL_NEW_GRIPPER,
+  clips: CYLINDRICAL_NEW_CLIPS,
+};
+
+const CYLINDRICAL_NEW_OBJ_STATIC_SPEC: StaticRigSpec = {
+  ...CYLINDRICAL_NEW_GLTF_STATIC_SPEC,
+  filePattern: /brazo[_-]cilindrico[_-]4[_-]nodos\.obj$/i,
+  sourceSchema: 'robot-arm-rig/1.2-cylindrical-new-obj',
+  analysisVersion: 'professional-rig-1.3-cylindrical-obj-new-model',
+  parts: [
+    { name: 'BASE_fixed', static: true, meshObjectIds: [], meshObjectPatterns: [/^base_/i] },
+    { name: 'J1_base_rotate', meshObjectIds: [], meshObjectPatterns: [/^(giratorio_|columna_|cabezal_)/i] },
+    { name: 'J2_carro_vertical', meshObjectIds: [], meshObjectPatterns: [/^carro_/i] },
+    { name: 'J3_viga_avance', meshObjectIds: [], meshObjectPatterns: [/^brazo_/i, /^pinza_(?!mordaza_)/i] },
+    { name: 'J4_finger_L', meshObjectIds: [], meshObjectPatterns: [/^pinza_mordaza_izquierda_/i] },
+    { name: 'J4_finger_R', meshObjectIds: [], meshObjectPatterns: [/^pinza_mordaza_derecha_/i] },
+  ],
+};
+
 const CONVEYOR_STATIC_SPEC: StaticRigSpec = {
   filePattern: /conveyor-belt-2400\.obj$/i,
   assetName: 'conveyor-belt-2400',
@@ -408,7 +620,7 @@ const CONVEYOR_STATIC_SPEC: StaticRigSpec = {
   ],
 };
 
-const CELL_STATIC_RIG_SPECS = [COBOT_STATIC_SPEC, CELL_INDUSTRIAL_STATIC_SPEC, CONVEYOR_STATIC_SPEC];
+const CELL_STATIC_RIG_SPECS = [COBOT_STATIC_SPEC, CELL_INDUSTRIAL_STATIC_SPEC, CYLINDRICAL_STATIC_SPEC, CYLINDRICAL_OBJ_STATIC_SPEC, CONVEYOR_STATIC_SPEC];
 
 const STATIC_OBJ_JOINTS: RobotArmRigJointMetadata[] = [
   { order: 'J1', name: 'J1_base_yaw', type: 'revolute', axis: 'Y', parent: 'BASE_fixed', originMeters: [0, 0.38, 0], limitsDeg: [-170, 170], homeDeg: 0, maxSpeedDegPerSec: 180 },
@@ -590,19 +802,30 @@ const valueForGenericKey = (
   key: GenericRigPoseKey,
   restValueByJointId: Map<string, number>,
   gripper?: NonNullable<RobotArmRigMetadata['gripper']>,
+  angleUnit: NonNullable<StaticRigSpec['angleUnit']> = 'degrees',
 ) => {
   const order = joint.evidence[0]?.metadata?.order;
   const restValue = restValueByJointId.get(joint.id) ?? 0;
   if (typeof order === 'string' && order !== 'G1') {
     const raw = key[order];
     if (!Number.isFinite(raw)) return undefined;
-    return joint.type === 'prismatic' ? (raw as number) - restValue : (raw as number) * DEG_TO_RAD - restValue;
+    return joint.type === 'prismatic'
+      ? (raw as number) - restValue
+      : (raw as number) * (angleUnit === 'radians' ? 1 : DEG_TO_RAD) - restValue;
   }
   if (order === 'G1' && Number.isFinite(key.grip)) {
-    const open = gripper?.openMeters ?? 0.048;
-    const closed = gripper?.closedMeters ?? 0.014;
+    const open = gripper?.openValue ?? gripper?.openMeters ?? 0.048;
+    const closed = gripper?.closedValue ?? gripper?.closedMeters ?? 0.014;
     const x = closed + (open - closed) * (key.grip as number);
-    const absolute = /finger_l$/i.test(joint.name) ? -x : x;
+    const side = joint.evidence[0]?.metadata?.gripperSide ?? (/finger_l$/i.test(joint.name) ? 'left' : 'right');
+    const absolute = side === 'left' ? x : -x;
+    return absolute - restValue;
+  }
+  if (order === 'G1' && Number.isFinite(key.J4)) {
+    const raw = key.J4 as number;
+    const x = gripper?.jointToValue ? gripper.jointToValue(raw) : raw;
+    const side = joint.evidence[0]?.metadata?.gripperSide ?? (/finger_l$/i.test(joint.name) ? 'left' : 'right');
+    const absolute = side === 'left' ? x : -x;
     return absolute - restValue;
   }
   return undefined;
@@ -613,6 +836,7 @@ const motionClipsFromPoseKeys = (
   restValueByJointId: Map<string, number>,
   clips: NonNullable<StaticRigSpec['clips']>,
   gripper?: NonNullable<RobotArmRigMetadata['gripper']>,
+  angleUnit: NonNullable<StaticRigSpec['angleUnit']> = 'degrees',
 ): KinematicMotionClip[] =>
   clips.map((clip) => ({
     id: id('clip', clip.name),
@@ -626,7 +850,7 @@ const motionClipsFromPoseKeys = (
       label: typeof key.phase === 'string' ? key.phase : undefined,
       jointValues: Object.fromEntries(
         joints
-          .map((joint) => [joint.id, valueForGenericKey(joint, key, restValueByJointId, gripper)] as const)
+          .map((joint) => [joint.id, valueForGenericKey(joint, key, restValueByJointId, gripper, angleUnit)] as const)
           .filter((entry): entry is readonly [string, number] => Number.isFinite(entry[1])),
       ),
     })),
@@ -691,10 +915,38 @@ const motionClipsFromThreeAnimations = (
     });
 };
 
+const applyIndustrialJ3Lift = (
+  joints: KinematicJoint[],
+  homeJointValues: Record<string, number>,
+  motionClips: KinematicMotionClip[] | undefined,
+  enabled: boolean,
+) => {
+  if (!enabled) return { homeJointValues, motionClips };
+  const j3 = joints.find((joint) => joint.name === 'J3_elbow_pitch');
+  if (!j3) return { homeJointValues, motionClips };
+
+  const correctedHomeJointValues = {
+    ...homeJointValues,
+    [j3.id]: (homeJointValues[j3.id] ?? 0) + INDUSTRIAL_J3_LIFT_OFFSET_RAD,
+  };
+  const correctedMotionClips = motionClips?.map((clip) => ({
+    ...clip,
+    keyframes: clip.keyframes.map((keyframe) => ({
+      ...keyframe,
+      jointValues: Object.prototype.hasOwnProperty.call(keyframe.jointValues, j3.id)
+        ? { ...keyframe.jointValues, [j3.id]: keyframe.jointValues[j3.id] + INDUSTRIAL_J3_LIFT_OFFSET_RAD }
+        : keyframe.jointValues,
+    })),
+  }));
+
+  return { homeJointValues: correctedHomeJointValues, motionClips: correctedMotionClips };
+};
+
 const buildStaticRig = (scene: THREE.Object3D, spec: StaticRigSpec): ProfessionalRigImport | undefined => {
   scene.updateMatrixWorld(true);
   const objects = objectMapByName(scene);
-  const hasAnyPartMesh = spec.parts.some((part) => part.meshObjectIds.some((name) => objects.has(name)));
+  const resolvedPartNames = new Map(spec.parts.map((part) => [part.name, resolveStaticPartObjectNames(part, objects)]));
+  const hasAnyPartMesh = [...resolvedPartNames.values()].some((names) => names.length > 0);
   if (!hasAnyPartMesh) return undefined;
 
   const rootPartId = id('part', spec.rootPartName);
@@ -702,7 +954,7 @@ const buildStaticRig = (scene: THREE.Object3D, spec: StaticRigSpec): Professiona
   const parts: MechanicalPart[] = spec.parts.map((part) => {
     const partId = part.name === spec.rootPartName ? rootPartId : id('part', part.name);
     partIdByName.set(part.name, partId);
-    return makeStaticObjPart(partId, part.name, part.meshObjectIds, objects, Boolean(part.static), spec.sourceSchema);
+    return makeStaticObjPart(partId, part.name, resolvedPartNames.get(part.name) ?? [], objects, Boolean(part.static), spec.sourceSchema);
   });
 
   const importedJoints: ImportedJointPose[] = [];
@@ -766,6 +1018,8 @@ const buildStaticRig = (scene: THREE.Object3D, spec: StaticRigSpec): Professiona
             useJointAxisVector: Boolean(metadata.axisVector),
             morphology: metadata.morphology,
             pivotObjectName: metadata.pivotObjectName,
+            manualOriginOverride: metadata.manualOriginOverride,
+            gripperSide: metadata.gripperSide,
             absoluteLimits: absoluteLimits(metadata),
             absoluteHome: restValue,
             restValue,
@@ -780,6 +1034,12 @@ const buildStaticRig = (scene: THREE.Object3D, spec: StaticRigSpec): Professiona
   const left = joints.find((joint) => /finger_l$/i.test(joint.name));
   const right = joints.find((joint) => /finger_r$/i.test(joint.name));
   if (left && right) right.coupling = { driverJointId: left.id, multiplier: -1, offset: 0 };
+  const correctedMotion = applyIndustrialJ3Lift(
+    joints,
+    homeJointValues,
+    spec.clips ? motionClipsFromPoseKeys(joints, restValueByJointId, spec.clips, spec.gripper, spec.angleUnit) : undefined,
+    spec.assetName === 'industrial-arm-6dof',
+  );
 
   return {
     joints: importedJoints,
@@ -800,10 +1060,10 @@ const buildStaticRig = (scene: THREE.Object3D, spec: StaticRigSpec): Professiona
               },
             ]
           : undefined,
-      motionClips: spec.clips ? motionClipsFromPoseKeys(joints, restValueByJointId, spec.clips, spec.gripper) : undefined,
+      motionClips: correctedMotion.motionClips,
       analysisVersion: spec.analysisVersion,
     },
-    kinematicState: { homeJointValues, jointValues: { ...homeJointValues } },
+    kinematicState: { homeJointValues: correctedMotion.homeJointValues, jointValues: { ...correctedMotion.homeJointValues } },
     rigRootName: spec.rootName,
     sourceSchema: spec.sourceSchema,
   };
@@ -1100,6 +1360,12 @@ const inferStaticObjRigFrame = (objects: Map<string, THREE.Object3D>) => {
 
 const makeStaticObjPart = (partId: string, name: string, meshObjectIds: string[], objects: Map<string, THREE.Object3D>, staticPart: boolean, sourceSchema: string): MechanicalPart => {
   const meshObjects = meshObjectIds.map((meshName) => objects.get(meshName)).filter((object): object is THREE.Object3D => Boolean(object));
+  const selectionMeshObjectIds = new Set<string>();
+  meshObjects.forEach((object) => {
+    object.traverse((candidate) => {
+      if (candidate.name) selectionMeshObjectIds.add(candidate.name);
+    });
+  });
   return {
     id: partId,
     name,
@@ -1113,9 +1379,20 @@ const makeStaticObjPart = (partId: string, name: string, meshObjectIds: string[]
       sourceSchema,
       professionalRig: true,
       recoveredFromStaticObj: true,
+      selectionMeshObjectIds: [...selectionMeshObjectIds],
     },
   };
 };
+
+const resolveStaticPartObjectNames = (
+  part: StaticRigSpec['parts'][number],
+  objects: Map<string, THREE.Object3D>,
+) => [
+  ...new Set([
+    ...part.meshObjectIds,
+    ...(part.meshObjectPatterns ?? []).flatMap((pattern) => [...objects.keys()].filter((name) => pattern.test(name))),
+  ]),
+].filter((name) => objects.has(name));
 
 const staticObjMotionClips = (joints: KinematicJoint[], restValueByJointId: Map<string, number>, gripper: NonNullable<RobotArmRigMetadata['gripper']>): KinematicMotionClip[] => {
   const valueForKey = (joint: KinematicJoint, key: RobotArmPoseKey) => {
@@ -1549,11 +1826,38 @@ const buildOldRobotRig = (scene: THREE.Object3D, fileName: string): Professional
   return undefined;
 };
 
+const compactRigFileName = (fileName: string) =>
+  fileName
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, '');
+
+const cylindricalSpecFromFileName = (fileName: string): StaticRigSpec | undefined => {
+  const compact = compactRigFileName(fileName);
+  if (compact.endsWith('brazocilindrico4nodosglb')) return CYLINDRICAL_STATIC_SPEC;
+  if (compact.endsWith('brazocilindrico4nodosobj')) return CYLINDRICAL_OBJ_STATIC_SPEC;
+  return undefined;
+};
+
+const cylindricalNewSpecFromScene = (scene: THREE.Object3D, fileName: string): StaticRigSpec | undefined => {
+  const compact = compactRigFileName(fileName);
+  if (!compact.endsWith('brazocilindrico4nodosglb') && !compact.endsWith('brazocilindrico4nodosobj')) return undefined;
+  const names = new Set(objectMapByName(scene).keys());
+  const hasGltfHierarchy = ['base_fija', 'nodo1_giratorio', 'nodo2_carro_vertical', 'nodo3_brazo', 'nodo4_pinza'].every((name) => names.has(name));
+  if (compact.endsWith('glb') && hasGltfHierarchy) return CYLINDRICAL_NEW_GLTF_STATIC_SPEC;
+  const hasObjParts = ['base_zocalo', 'brazo_perfil_cuerpo', 'pinza_mordaza_izquierda_brazo', 'pinza_mordaza_derecha_brazo'].every((name) => names.has(name));
+  if (compact.endsWith('obj') && hasObjParts) return CYLINDRICAL_NEW_OBJ_STATIC_SPEC;
+  return undefined;
+};
+
 export const createProfessionalRobotRigFromStaticObj = (scene: THREE.Object3D, fileName: string): ProfessionalRigImport | undefined => {
   const oldRobot = buildOldRobotRig(scene, fileName);
   if (oldRobot) return oldRobot;
 
-  const cellSpec = CELL_STATIC_RIG_SPECS.find((spec) => spec.filePattern.test(fileName));
+  const cellSpec = cylindricalNewSpecFromScene(scene, fileName)
+    ?? CELL_STATIC_RIG_SPECS.find((spec) => spec.filePattern.test(fileName))
+    ?? cylindricalSpecFromFileName(fileName);
   if (cellSpec) {
     applyCellStaticRigMaterials(scene, fileName);
     const recovered = buildStaticRig(scene, cellSpec);
@@ -1849,6 +2153,12 @@ export const extractProfessionalRobotRig = (scene: THREE.Object3D, animations: T
             ),
           })),
         }));
+  const correctedMotion = applyIndustrialJ3Lift(
+    joints,
+    homeJointValues,
+    motionClips,
+    /industrialarm6dof/i.test(rig.root.name) || (rig.root.userData as { asset?: unknown }).asset === 'industrial-arm-6dof',
+  );
 
   return {
     joints: importedJoints,
@@ -1869,12 +2179,12 @@ export const extractProfessionalRobotRig = (scene: THREE.Object3D, animations: T
               },
             ]
           : undefined,
-      motionClips,
+      motionClips: correctedMotion.motionClips,
       analysisVersion: /^robot-arm-rig\/1\.1/i.test(sourceSchema) ? 'professional-rig-1.1' : 'professional-rig-1',
     },
     kinematicState: {
-      homeJointValues,
-      jointValues: { ...homeJointValues },
+      homeJointValues: correctedMotion.homeJointValues,
+      jointValues: { ...correctedMotion.homeJointValues },
     },
     rigRootName: rig.root.name || 'ProfessionalRobotRig',
     sourceSchema,

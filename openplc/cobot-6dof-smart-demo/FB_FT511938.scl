@@ -1,0 +1,415 @@
+// UN SOLO BLOQUE SCL: 4 ejes + IoT + manual JOG + posicion + demo + Q1..Q8.
+// VERSION DE PRECOMISIONADO / SIMULACION - NO APROBADA PARA MOVIMIENTO REAL.
+// FISCHERTECHNIK 511938 CONECTOR 26 POLOS; NO energizar por fotografia.
+// LAS SALIDAS Q1..Q8 SON BOOL LOGICOS, NO DIRECCIONES PLC AUTOMATICAS.
+// * El fabricante NO documenta aqui el circuito electrico interior de la placa;
+//   verificar si la interfaz necesita control 24V y tipo de cargas/aislamiento.
+// * Este FB NO implementa: HSC, homing, realimentacion, bornes de potencia,
+//   parada funcional segura certificada, enclavamiento fisico ni guardas.
+// * Se exige WiringVerified y PhysicalOutputEnable FALSE por defecto.
+// * NUNCA ejecutar JOG remoto sin watchdog real para CommFresh y JogEnable.
+// * Parar antes de invertir motor; verificar tiempo muerto de reles fuera del FB.
+// * Salidas de contacto seco Siemens requieren comunes 1L/2L cableados;
+//   no suministran 24V por si mismas.
+// * No aplicar 24V a L1/N CPU AC/DC/RELÉ: L1/N = 120-240VAC.
+
+// FORGE-DT - Control cilindrico R-P-P + pinza, S7-1200 / TIA Portal SCL
+// VERSION V2 CON DATASHEET FISCHERTECHNIK 511938 - INGENIERIA SIN VALIDAR.
+// 0 STOP; 1 DEMO (flanco); 2 RESET; 3 JOG (mantenido); 4 GOTO (flanco).
+// IoT: politica original, criticidad e invalidacion bloquean el movimiento.
+// En degradacion se bloquea: los reles no ofrecen control de velocidad 55%.
+// Pos[1] grados; Pos[2..4] mm. Pos DEBE ser MEDIDA, NO estimada de consignas.
+// Run y DirectionPositive son mandos LOGICOS; no conectar a placa sin identificarla.
+// Homing, HSC/encoders, E-stop y limites de seguridad se implementan externamente.
+// *** DATASHEET: terminales 15..22 = Q1..Q8 de SENTIDO; NO marcha/sentido.
+// Ver FB_FT511938_OutputAdapter para convertir Run/DirectionPositive en 8 ordenes.
+FUNCTION_BLOCK "FB_FT511938_Unificado"
+VAR_INPUT
+    WiringVerified : Bool;                 // Debe validarse externamente; FALSE por defecto
+    PhysicalOutputEnable : Bool;           // Comisionado formal y circuito externo verificado
+    Cmd : Int;                          // 0 Stop, 1 demo, 2 reset, 3 jog, 4 posicion
+    Enable : Bool;
+    SafetyOK : Bool;                    // supervisión externa; NO sustituye hardware de seguridad
+    DrivesReady : Bool;
+    CommFresh : Bool;                   // timeout verificable de heartbeat desde FORGE-DT
+    SensorOK : Bool;                    // realimentación plausible
+    Homed : Array[1..4] of Bool;
+    Pos : Array[1..4] of Real;          // posicion medida y referenciada
+    MinLimit : Array[1..4] of Bool;     // limites operativos por sentido
+    MaxLimit : Array[1..4] of Bool;
+    JogAxis : Int;                      // 1..4
+    JogDirection : Int;                 // -1 o +1
+    JogEnable : Bool;                   // mantener mientras tecla pulsada
+    ManualTarget : Array[1..4] of Real;// [grados,mm,mm,mm]
+    // Mapear estas entradas desde RobotHolding.Struct en OB1.
+    TemperatureCx100 : Int;
+    HumidityRHx100 : UInt;
+    GyroDpsx100 : UInt;
+    SensorPolicy : UInt;             // 0: movimiento no obligatorio; 1: vigilar giroscopio
+    SensorValid : UInt;              // 1: lectura valida
+    SensorQualityBits : UInt;        // bit 0 dato valido; bit 4 giroscopio disponible
+    SensorAgeMs : UInt;
+
+END_VAR
+VAR_OUTPUT
+    CmdQ1toQ8 : Array[1..8] of Bool;      // SOLO comandos logicos; no asignar a %Q antes de validacion
+    Run : Array[1..4] of Bool;         // bobina logica de marcha, un motor
+    DirectionPositive : Array[1..4] of Bool;
+    Target : Array[1..4] of Real;
+    ActiveStep : Int;                   // 1..9 en demo
+    Status : Int;                       // 0 detenido;1 moviendo;2 terminado;3 fallo
+    AlarmCode : Int;                    // 1 permiso;2 homing;3 posicion;4 limite;5 timeout;6 comunicacion;7 comando
+    Done : Bool;                        // pulso de un ciclo al acabar DEMO o GOTO
+    ActiveMode : Int;                   // 0 detenido;1 demo;3 jog;4 goto
+    ConditionState : UInt;             // 0 normal, 1 degradado, 2 critico, 3 sensor invalido
+    IoTAlarmCode : UInt;              // alarmas originales 1..6 (separadas del Fault de movimiento)
+    SpeedPermille : UInt;             // 1000/550/0; indicador, NO regula motores con reles
+
+END_VAR
+VAR
+    ModeState : Int := 0;
+    Step : Int := 0;
+    LastCmd : Int := 0;
+    Fault : Int := 0;
+    i : Int;
+    Delta : Real;
+    MinPos : Array[1..4] of Real;
+    MaxPos : Array[1..4] of Real;
+    Tol : Array[1..4] of Real;
+    CapturedTarget : Array[1..4] of Real;
+    AllHomed : Bool;
+    PosValid : Bool;
+    Permitted : Bool;
+    StartDemo : Bool;
+    StartGoto : Bool;
+    AtTarget : Bool;
+    AnyMoving : Bool;
+    NeedsPosition : Bool;
+    ActionAllowed : Bool;
+    TimeoutEnable : Bool;
+    SettleEnable : Bool;
+    ResetTimers : Bool := FALSE;
+    MotionTimeout : TON;
+    SettleTimer : TON;
+    MotionIdleTimer : TON;
+    TemperatureC : Real;
+    HumidityRH : Real;
+    GyroDps : Real;
+    MotionPresent : Bool;
+    IoTBlock : Bool;
+    IoTDegraded : Bool;
+    TurnLeft : Bool;
+    OutputGate : Bool;
+    q : Int;
+
+END_VAR
+BEGIN
+    // 1. Estado seguro por defecto: desenergizar cada scan.
+    FOR #i := 1 TO 4 DO
+        #Run[#i] := FALSE;
+        #DirectionPositive[#i] := FALSE;
+        #Target[#i] := #Pos[#i];
+    END_FOR;
+    FOR #q := 1 TO 8 DO #CmdQ1toQ8[#q] := FALSE; END_FOR;
+    #Done := FALSE;
+    #AnyMoving := FALSE;
+    #AtTarget := TRUE;
+    #NeedsPosition := FALSE;
+    #ResetTimers := FALSE;
+
+    #MinPos[1] := -171.0; #MaxPos[1] := 171.0; #Tol[1] := 1.0;
+    #MinPos[2] := 130.0;  #MaxPos[2] := 360.0; #Tol[2] := 2.0;
+    #MinPos[3] := 0.0;    #MaxPos[3] := 180.0; #Tol[3] := 2.0;
+    #MinPos[4] := 12.0;   #MaxPos[4] := 70.0;  #Tol[4] := 2.0;
+
+    // Supervisor IoT. Nunca utilizar SpeedPermille como PWM de reles.
+    #TemperatureC := INT_TO_REAL(#TemperatureCx100) / 100.0;
+    #HumidityRH := UINT_TO_REAL(#HumidityRHx100) / 100.0;
+    #GyroDps := UINT_TO_REAL(#GyroDpsx100) / 100.0;
+    #MotionPresent := #GyroDps >= 3.0;
+    // Temporizador siempre invocado. La politica 1 reproduce el criterio original.
+    #MotionIdleTimer(IN := (#SensorPolicy = UINT#1) AND (NOT #MotionPresent), PT := T#2s);
+    #ConditionState := UINT#0;
+    #IoTAlarmCode := UINT#0;
+    #SpeedPermille := UINT#1000;
+    IF (#SensorValid = UINT#0) OR
+       ((#SensorQualityBits AND UINT#1) = UINT#0) OR
+       (#SensorAgeMs > UINT#2500) THEN
+        #ConditionState := UINT#3;
+        #IoTAlarmCode := UINT#4;
+    ELSIF (#SensorPolicy = UINT#1) AND
+          ((#SensorQualityBits AND UINT#16) = UINT#0) THEN
+        #ConditionState := UINT#3;
+        #IoTAlarmCode := UINT#6;
+    ELSIF (#SensorPolicy = UINT#1) AND #MotionIdleTimer.Q THEN
+        #ConditionState := UINT#2;
+        #IoTAlarmCode := UINT#5;
+    ELSIF (#TemperatureC >= 55.0) OR (#HumidityRH >= 85.0) OR (#GyroDps >= 220.0) THEN
+        #ConditionState := UINT#2;
+        IF #TemperatureC >= 55.0 THEN
+            #IoTAlarmCode := UINT#1;
+        ELSIF #HumidityRH >= 85.0 THEN
+            #IoTAlarmCode := UINT#2;
+        ELSE
+            #IoTAlarmCode := UINT#3;
+        END_IF;
+    ELSIF (#TemperatureC >= 45.0) OR (#HumidityRH >= 75.0) OR (#GyroDps >= 120.0) THEN
+        #ConditionState := UINT#1;
+        #SpeedPermille := UINT#550;
+    END_IF;
+    #IoTBlock := #ConditionState >= UINT#2;
+    #IoTDegraded := #ConditionState = UINT#1;
+    IF #IoTBlock THEN #SpeedPermille := UINT#0; END_IF;
+
+    // Motores ON/OFF: en degradacion se INHIBE movimiento en lugar de simular 55%.
+    #Permitted := #WiringVerified AND #PhysicalOutputEnable AND #Enable AND #SafetyOK AND #DrivesReady AND #SensorOK AND
+                  #CommFresh AND (NOT #IoTBlock) AND (NOT #IoTDegraded);
+    #AllHomed := TRUE;
+    #PosValid := TRUE;
+    FOR #i := 1 TO 4 DO
+        IF NOT #Homed[#i] THEN #AllHomed := FALSE; END_IF;
+        IF (#Pos[#i] <> #Pos[#i]) OR (#Pos[#i] < #MinPos[#i] - 2.0)
+           OR (#Pos[#i] > #MaxPos[#i] + 2.0) THEN
+            #PosValid := FALSE;
+        END_IF;
+    END_FOR;
+
+    #StartDemo := (#Cmd = 1) AND (#LastCmd <> 1);
+    #StartGoto := (#Cmd = 4) AND (#LastCmd <> 4);
+    #LastCmd := #Cmd;
+
+    // RESET exige salida deshabilitada. No usar RESET para omitir fallo físico.
+    IF (#Cmd = 2) AND NOT #Enable AND #SafetyOK AND #CommFresh THEN
+        #Fault := 0;
+        #ModeState := 0;
+        #Step := 0;
+        #ResetTimers := TRUE;
+    END_IF;
+
+    IF (#ModeState <> 0) THEN
+        IF NOT #CommFresh THEN
+            #Fault := 6;
+        ELSIF #IoTBlock THEN
+            #Fault := 8;  // bloqueo IoT critico/sensor invalido
+        ELSIF #IoTDegraded THEN
+            #Fault := 9;  // reles no pueden reducir velocidad al 55%
+        ELSIF NOT #Permitted THEN
+            #Fault := 1;
+        ELSIF NOT #AllHomed THEN
+            #Fault := 2;
+        ELSIF NOT #PosValid THEN
+            #Fault := 3;
+        END_IF;
+    END_IF;
+
+    // STOP es dominante; JOG no queda enganchado tras soltar el pulsador.
+    IF #Cmd = 0 THEN
+        #ModeState := 0;
+        #Step := 0;
+        #ResetTimers := TRUE;
+    ELSIF (#ModeState = 3) AND ((#Cmd <> 3) OR NOT #JogEnable) THEN
+        #ModeState := 0;
+        #ResetTimers := TRUE;
+    ELSIF ((#ModeState = 1) AND (#Cmd <> 1)) OR
+          ((#ModeState = 4) AND (#Cmd <> 4)) THEN
+        // Cambiar de modo invalida el ciclo: detener antes de otro comando.
+        #ModeState := 0;
+        #Step := 0;
+        #ResetTimers := TRUE;
+    END_IF;
+
+    IF (#Fault = 0) AND (#ModeState = 0) AND (#Cmd <> 0) THEN
+        IF #StartDemo OR #StartGoto OR ((#Cmd = 3) AND #JogEnable) THEN
+            IF #IoTBlock THEN
+                #Fault := 8;
+            ELSIF #IoTDegraded THEN
+                #Fault := 9;
+            ELSIF NOT #Permitted THEN
+                #Fault := 1;
+            ELSIF NOT #AllHomed THEN
+                #Fault := 2;
+            ELSIF NOT #PosValid THEN
+                #Fault := 3;
+            ELSIF #StartDemo THEN
+                IF (ABS(#Pos[1]) <= 2.0) AND (ABS(#Pos[2] - 300.0) <= 3.0)
+                    AND (ABS(#Pos[3] - 60.0) <= 3.0) AND (ABS(#Pos[4] - 50.0) <= 3.0) THEN
+                    #ModeState := 1;
+                    #Step := 1;
+                    #ResetTimers := TRUE;
+                ELSE
+                    #Fault := 3; // demo arranca solo desde Home medido
+                END_IF;
+            ELSIF #StartGoto THEN
+                // Capturar consignas para impedir cambios a mitad de trayectoria.
+                #ActionAllowed := TRUE;
+                FOR #i := 1 TO 4 DO
+                    IF (#ManualTarget[#i] <> #ManualTarget[#i]) OR
+                        (#ManualTarget[#i] < #MinPos[#i]) OR
+                        (#ManualTarget[#i] > #MaxPos[#i]) THEN
+                        #ActionAllowed := FALSE;
+                    END_IF;
+                END_FOR;
+                IF #ActionAllowed THEN
+                    FOR #i := 1 TO 4 DO
+                        #CapturedTarget[#i] := #ManualTarget[#i];
+                    END_FOR;
+                    #ModeState := 4;
+                    #ResetTimers := TRUE;
+                ELSE
+                    #Fault := 4;
+                END_IF;
+            ELSE
+                IF (#JogAxis >= 1) AND (#JogAxis <= 4) AND
+                   ((#JogDirection = -1) OR (#JogDirection = 1)) THEN
+                    #ModeState := 3;
+                    #ResetTimers := TRUE;
+                ELSE
+                    #Fault := 7;
+                END_IF;
+            END_IF;
+        END_IF;
+    END_IF;
+
+    // 2. Programa de nueve puntos (separando la apertura de pinza para evitar simultaneidad prohibida) (coordenadas absolutas).
+    IF #ModeState = 1 THEN
+        CASE #Step OF
+            1: #Target[1] := -68.8; #Target[2] := 300.0; #Target[3] := 140.0; #Target[4] := 50.0; // giro + extension, pinza quieta
+            2: #Target[1] := -68.8; #Target[2] := 300.0; #Target[3] := 140.0; #Target[4] := 60.0; // abrir arriba
+            3: #Target[1] := -68.8; #Target[2] := 150.0; #Target[3] := 140.0; #Target[4] := 60.0; // bajar
+            4: #Target[1] := -68.8; #Target[2] := 150.0; #Target[3] := 140.0; #Target[4] := 25.0; // cerrar
+            5: #Target[1] := -68.8; #Target[2] := 320.0; #Target[3] := 140.0; #Target[4] := 25.0; // subir
+            6: #Target[1] := 80.2;  #Target[2] := 320.0; #Target[3] := 40.0;  #Target[4] := 25.0; // girar + recoger
+            7: #Target[1] := 80.2;  #Target[2] := 180.0; #Target[3] := 40.0;  #Target[4] := 25.0; // bajar
+            8: #Target[1] := 80.2;  #Target[2] := 180.0; #Target[3] := 40.0;  #Target[4] := 60.0; // abrir
+            9: #Target[1] := 80.2;  #Target[2] := 300.0; #Target[3] := 40.0;  #Target[4] := 60.0; // subir
+            ELSE #Fault := 7;
+        END_CASE;
+    ELSIF #ModeState = 4 THEN
+        FOR #i := 1 TO 4 DO #Target[#i] := #CapturedTarget[#i]; END_FOR;
+    END_IF;
+
+    // 3. Calcular mandos. GOTO y DEMO exigen altura >=280 para giro/extension.
+    // Pinza nunca se mueve a la vez que otro eje.
+    IF (#Fault = 0) AND #Permitted AND #AllHomed AND #PosValid THEN
+        IF (#ModeState = 1) OR (#ModeState = 4) THEN
+            FOR #i := 1 TO 4 DO
+                #Delta := #Target[#i] - #Pos[#i];
+                IF ABS(#Delta) > #Tol[#i] THEN
+                    #AtTarget := FALSE;
+                    IF (#Target[#i] < #MinPos[#i]) OR (#Target[#i] > #MaxPos[#i]) THEN
+                        #Fault := 4;
+                    ELSIF ((#i = 1) OR (#i = 3)) AND
+                       ((#Pos[2] < 280.0) OR (#Target[2] < 280.0)) THEN
+                        #Fault := 4;
+                    ELSIF (#i = 4) AND
+                       ((ABS(#Target[1] - #Pos[1]) > #Tol[1]) OR
+                        (ABS(#Target[2] - #Pos[2]) > #Tol[2]) OR
+                        (ABS(#Target[3] - #Pos[3]) > #Tol[3])) THEN
+                        #Fault := 4;
+                    ELSIF ((#Delta > 0.0) AND #MaxLimit[#i]) OR
+                          ((#Delta < 0.0) AND #MinLimit[#i]) THEN
+                        #Fault := 4;
+                    ELSE
+                        #DirectionPositive[#i] := (#Delta > 0.0);
+                        #Run[#i] := TRUE;
+                        #AnyMoving := TRUE;
+                    END_IF;
+                END_IF;
+            END_FOR;
+        ELSIF (#ModeState = 3) AND (#Cmd = 3) AND #JogEnable THEN
+            // Un solo eje; el pulso JOG debe permanecer activo y fresco.
+            IF (#JogAxis < 1) OR (#JogAxis > 4) OR
+               ((#JogDirection <> -1) AND (#JogDirection <> 1)) THEN
+                #Fault := 7;
+            ELSE
+                #i := #JogAxis;
+                IF (((#i = 1) OR (#i = 3)) AND (#Pos[2] < 280.0)) OR
+                   ((#JogDirection > 0) AND (#MaxLimit[#i] OR (#Pos[#i] >= #MaxPos[#i]))) OR
+                   ((#JogDirection < 0) AND (#MinLimit[#i] OR (#Pos[#i] <= #MinPos[#i]))) THEN
+                    #Fault := 4;
+                ELSE
+                    #DirectionPositive[#i] := (#JogDirection > 0);
+                    #Run[#i] := TRUE;
+                    #AnyMoving := TRUE;
+                END_IF;
+            END_IF;
+        END_IF;
+    END_IF;
+
+    // 4. Limite máximo para cada tramo/JOG. Temporizadores TON llamados en cada scan.
+    #TimeoutEnable := (#ModeState <> 0) AND #AnyMoving AND NOT #ResetTimers AND (#Fault = 0);
+    #MotionTimeout(IN := #TimeoutEnable, PT := T#30s); // MAXIMO PROVISIONAL; calibrar por eje
+    IF #MotionTimeout.Q AND (#Fault = 0) THEN #Fault := 5; END_IF;
+
+    #SettleEnable := ((#ModeState = 1) OR (#ModeState = 4)) AND
+                     #AtTarget AND #Permitted AND (#Fault = 0) AND NOT #ResetTimers;
+    #SettleTimer(IN := #SettleEnable, PT := T#200ms);
+    IF #SettleTimer.Q AND (#Fault = 0) THEN
+        IF (#ModeState = 4) OR (#Step = 9) THEN
+            #ModeState := 0;
+            #Step := 0;
+            #Done := TRUE;
+        ELSE
+            #Step := #Step + 1;
+        END_IF;
+        #ResetTimers := TRUE;
+    END_IF;
+
+    IF #Fault <> 0 THEN
+        #ModeState := 0;
+        #Step := 0;
+    END_IF;
+
+    IF (#ModeState = 0) OR (#Fault <> 0) OR NOT #Permitted THEN
+        FOR #i := 1 TO 4 DO #Run[#i] := FALSE; END_FOR;
+    END_IF;
+
+    // 5. ADAPTADOR INTEGRADO DEL FABRICANTE (NO HAY SEGUNDO FB).
+    // Los pares Q1/Q2 etc son mandos de sentido, NO marcha/sentido.
+    // Signo positivo: giro izquierda, altura arriba, brazo adelante, pinza abierta.
+    // Entra al circuito de salida SOLO tras validacion fisica y permisos.
+    #OutputGate := #Permitted AND (#Fault = 0) AND #AllHomed AND #PosValid
+                 AND #WiringVerified AND #PhysicalOutputEnable;
+    IF #OutputGate THEN
+        IF #Run[4] THEN
+            #CmdQ1toQ8[1] := #DirectionPositive[4];
+            #CmdQ1toQ8[2] := NOT #DirectionPositive[4];
+        END_IF;
+        IF #Run[3] THEN
+            #CmdQ1toQ8[3] := #DirectionPositive[3];
+            #CmdQ1toQ8[4] := NOT #DirectionPositive[3];
+        END_IF;
+        IF #Run[2] THEN
+            #CmdQ1toQ8[5] := NOT #DirectionPositive[2];
+            #CmdQ1toQ8[6] := #DirectionPositive[2];
+        END_IF;
+        IF #Run[1] THEN
+            #CmdQ1toQ8[7] := NOT #DirectionPositive[1];
+            #CmdQ1toQ8[8] := #DirectionPositive[1];
+        END_IF;
+    END_IF;
+    // Inhibicion cruzada suplementaria (independiente de bloque hardware).
+    IF #CmdQ1toQ8[1] AND #CmdQ1toQ8[2] THEN #Fault := 10; END_IF;
+    IF #CmdQ1toQ8[3] AND #CmdQ1toQ8[4] THEN #Fault := 10; END_IF;
+    IF #CmdQ1toQ8[5] AND #CmdQ1toQ8[6] THEN #Fault := 10; END_IF;
+    IF #CmdQ1toQ8[7] AND #CmdQ1toQ8[8] THEN #Fault := 10; END_IF;
+    IF #Fault <> 0 THEN
+        FOR #q := 1 TO 8 DO #CmdQ1toQ8[#q] := FALSE; END_FOR;
+        FOR #i := 1 TO 4 DO #Run[#i] := FALSE; END_FOR;
+        #ModeState := 0;
+        #Step := 0;
+    END_IF;
+
+    #ActiveMode := #ModeState;
+    #ActiveStep := #Step;
+    #AlarmCode := #Fault;
+    IF #Fault <> 0 THEN
+        #Status := 3;
+    ELSIF #Done THEN
+        #Status := 2;
+    ELSIF #AnyMoving AND (#ModeState <> 0) THEN
+        #Status := 1;
+    ELSE
+        #Status := 0;
+    END_IF;
+END_FUNCTION_BLOCK

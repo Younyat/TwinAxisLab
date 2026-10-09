@@ -6,10 +6,11 @@ VAR
   AlarmCode AT %QW94 : UINT := 0;
   ConditionState AT %QW95 : UINT := 3;
   SpeedPermille AT %QW96 : UINT := 0;
+  ProgramSignature AT %QW97 : UINT := 2101;
   J1Raw AT %QW100 : INT := 0;
-  J2Raw AT %QW101 : INT := -6109;
-  J3Raw AT %QW102 : INT := 13090;
-  J4Raw AT %QW103 : INT := 8727;
+  J2Raw AT %QW101 : INT := 0;
+  J3Raw AT %QW102 : INT := 0;
+  J4Raw AT %QW103 : INT := 0;
   J5Raw AT %QW104 : INT := 0;
   J6Raw AT %QW105 : INT := 0;
   TemperatureCx100 AT %QW120 : INT := 0;
@@ -44,10 +45,21 @@ VAR
   TargetJ4 : REAL := 50.0;
   TargetJ5 : REAL := 0.0;
   TargetJ6 : REAL := 0.0;
+  SegmentStartJ1 : REAL := 0.0;
+  SegmentStartJ2 : REAL := -35.0;
+  SegmentStartJ3 : REAL := 75.0;
+  SegmentStartJ4 : REAL := 50.0;
+  SegmentStartJ5 : REAL := 0.0;
+  SegmentStartJ6 : REAL := 0.0;
+  PreviousStep : UINT := 0;
+  PreviousP : REAL := 0.0;
+  ProgressDelta : REAL := 0.0;
   MotionPresent : BOOL := FALSE;
   DegToRadScaled : REAL := 174.5329;
 END_VAR
 
+
+ProgramSignature := 2101;
 
 TemperatureC := INT_TO_REAL(TemperatureCx100) / 100.0;
 HumidityRH := UINT_TO_REAL(HumidityRHx100) / 100.0;
@@ -104,22 +116,28 @@ IF Command = 2 THEN
   J4Deg := 50.0;
   J5Deg := 0.0;
   J6Deg := 0.0;
+  PreviousStep := 0;
+  PreviousP := 0.0;
 ELSIF Command = 0 THEN
   TimerEnabled := FALSE;
   ResetTimer := TRUE;
   Status := 0;
   ActiveStep := 0;
-  J1Deg := INT_TO_REAL(J1Raw) / DegToRadScaled;
-  J2Deg := INT_TO_REAL(J2Raw) / DegToRadScaled;
-  J3Deg := INT_TO_REAL(J3Raw) / DegToRadScaled;
-  J4Deg := INT_TO_REAL(J4Raw) / DegToRadScaled;
-  J5Deg := INT_TO_REAL(J5Raw) / DegToRadScaled;
-  J6Deg := INT_TO_REAL(J6Raw) / DegToRadScaled;
+  J1Deg := 0.0 + (INT_TO_REAL(J1Raw) / DegToRadScaled);
+  J2Deg := -35.0 + (INT_TO_REAL(J2Raw) / DegToRadScaled);
+  J3Deg := 75.0 + (INT_TO_REAL(J3Raw) / DegToRadScaled);
+  J4Deg := 50.0 + (INT_TO_REAL(J4Raw) / DegToRadScaled);
+  J5Deg := 0.0 + (INT_TO_REAL(J5Raw) / DegToRadScaled);
+  J6Deg := 0.0 + (INT_TO_REAL(J6Raw) / DegToRadScaled);
+  PreviousStep := 0;
+  PreviousP := 0.0;
 ELSIF ConditionState >= 2 THEN
   TimerEnabled := FALSE;
   ResetTimer := TRUE;
   Status := 3;
   ActiveStep := 0;
+  PreviousStep := 0;
+  PreviousP := 0.0;
 ELSE
   Status := 1;
   IF ResetTimer THEN
@@ -129,47 +147,87 @@ ELSE
     TimerEnabled := TRUE;
   END_IF;
 
-  CycleTimer(IN := TimerEnabled, PT := T#12s);
+  CycleTimer(IN := TimerEnabled, PT := T#10s);
   ElapsedMs := TIME_TO_DINT(CycleTimer.ET);
-  IF ElapsedMs > 12000 THEN ElapsedMs := 12000; END_IF;
+  IF ElapsedMs > 10000 THEN ElapsedMs := 10000; END_IF;
   ElapsedMsOut := DINT_TO_UINT(ElapsedMs);
 
-  IF ElapsedMs < 3000 THEN
-    ActiveStep := 1; SegmentStartMs := 0; SegmentDurationMs := 3000;
-    TargetJ1 := -90.0; TargetJ2 := -10.0; TargetJ3 := 105.0;
-    TargetJ4 := 10.0; TargetJ5 := -45.0; TargetJ6 := -90.0;
-  ELSIF ElapsedMs < 6000 THEN
-    ActiveStep := 2; SegmentStartMs := 3000; SegmentDurationMs := 3000;
-    TargetJ1 := 90.0; TargetJ2 := 40.0; TargetJ3 := 125.0;
-    TargetJ4 := -70.0; TargetJ5 := 60.0; TargetJ6 := 120.0;
-  ELSIF ElapsedMs < 9000 THEN
-    ActiveStep := 3; SegmentStartMs := 6000; SegmentDurationMs := 3000;
-    TargetJ1 := -55.0; TargetJ2 := -75.0; TargetJ3 := 45.0;
-    TargetJ4 := 120.0; TargetJ5 := -80.0; TargetJ6 := -140.0;
+  IF ElapsedMs < 1400 THEN
+    ActiveStep := 1; SegmentStartMs := 0; SegmentDurationMs := 1400;
+  ELSIF ElapsedMs < 2400 THEN
+    ActiveStep := 2; SegmentStartMs := 1400; SegmentDurationMs := 1000;
+  ELSIF ElapsedMs < 3200 THEN
+    ActiveStep := 3; SegmentStartMs := 2400; SegmentDurationMs := 800;
+  ELSIF ElapsedMs < 5600 THEN
+    ActiveStep := 4; SegmentStartMs := 3200; SegmentDurationMs := 2400;
+  ELSIF ElapsedMs < 7600 THEN
+    ActiveStep := 5; SegmentStartMs := 5600; SegmentDurationMs := 2000;
   ELSE
-    ActiveStep := 4; SegmentStartMs := 9000; SegmentDurationMs := 3000;
-    TargetJ1 := 0.0; TargetJ2 := -35.0; TargetJ3 := 75.0;
-    TargetJ4 := 50.0; TargetJ5 := 0.0; TargetJ6 := 0.0;
+    ActiveStep := 6; SegmentStartMs := 7600; SegmentDurationMs := 2400;
+  END_IF;
+
+  IF ActiveStep <> PreviousStep THEN
+    SegmentStartJ1 := J1Deg;
+    SegmentStartJ2 := J2Deg;
+    SegmentStartJ3 := J3Deg;
+    SegmentStartJ4 := J4Deg;
+    SegmentStartJ5 := J5Deg;
+    SegmentStartJ6 := J6Deg;
+    PreviousStep := ActiveStep;
+    PreviousP := 0.0;
   END_IF;
 
   P := DINT_TO_REAL(ElapsedMs - SegmentStartMs) / DINT_TO_REAL(SegmentDurationMs);
   IF P < 0.0 THEN P := 0.0; END_IF;
   IF P > 1.0 THEN P := 1.0; END_IF;
   P := P * P * (3.0 - (2.0 * P));
+  ProgressDelta := P - PreviousP;
+  IF ProgressDelta < 0.0 THEN ProgressDelta := 0.0; END_IF;
+  IF ProgressDelta > 1.0 THEN ProgressDelta := 1.0; END_IF;
+  PreviousP := P;
 
-  J1Deg := J1Deg + (((0.0 + ((TargetJ1 - 0.0) * MotionScale)) - J1Deg) * P);
-  J2Deg := J2Deg + (((-35.0 + ((TargetJ2 - (-35.0)) * MotionScale)) - J2Deg) * P);
-  J3Deg := J3Deg + (((75.0 + ((TargetJ3 - 75.0) * MotionScale)) - J3Deg) * P);
-  J4Deg := J4Deg + (((50.0 + ((TargetJ4 - 50.0) * MotionScale)) - J4Deg) * P);
-  J5Deg := J5Deg + (((0.0 + ((TargetJ5 - 0.0) * MotionScale)) - J5Deg) * P);
-  J6Deg := J6Deg + (((0.0 + ((TargetJ6 - 0.0) * MotionScale)) - J6Deg) * P);
+  IF ActiveStep = 1 THEN
+    TargetJ1 := -55.0; TargetJ2 := -10.0; TargetJ3 := 85.0; TargetJ4 := 25.0;
+    TargetJ5 := 0.0;
+    TargetJ6 := 0.0;
+  ELSIF ActiveStep = 2 THEN
+    TargetJ1 := -55.0;
+    TargetJ2 := 15.0; TargetJ3 := 80.0; TargetJ4 := -5.0;
+    TargetJ5 := 0.0;
+    TargetJ6 := 0.0;
+  ELSIF ActiveStep = 3 THEN
+    TargetJ1 := -55.0;
+    TargetJ2 := 15.0;
+    TargetJ3 := 80.0;
+    TargetJ4 := -5.0;
+    TargetJ5 := 0.0;
+    TargetJ6 := 90.0;
+  ELSIF ActiveStep = 4 THEN
+    TargetJ1 := 50.0; TargetJ2 := -10.0; TargetJ3 := 85.0; TargetJ4 := 25.0;
+    TargetJ5 := 0.0;
+    TargetJ6 := 90.0;
+  ELSIF ActiveStep = 5 THEN
+    TargetJ1 := 50.0;
+    TargetJ2 := 15.0; TargetJ3 := 80.0; TargetJ4 := -5.0;
+    TargetJ5 := 30.0; TargetJ6 := -90.0;
+  ELSE
+    TargetJ1 := 0.0; TargetJ2 := -35.0; TargetJ3 := 75.0;
+    TargetJ4 := 50.0; TargetJ5 := 0.0; TargetJ6 := 0.0;
+  END_IF;
+
+  J1Deg := J1Deg + ((TargetJ1 - SegmentStartJ1) * ProgressDelta * MotionScale);
+  J2Deg := J2Deg + ((TargetJ2 - SegmentStartJ2) * ProgressDelta * MotionScale);
+  J3Deg := J3Deg + ((TargetJ3 - SegmentStartJ3) * ProgressDelta * MotionScale);
+  J4Deg := J4Deg + ((TargetJ4 - SegmentStartJ4) * ProgressDelta * MotionScale);
+  J5Deg := J5Deg + ((TargetJ5 - SegmentStartJ5) * ProgressDelta * MotionScale);
+  J6Deg := J6Deg + ((TargetJ6 - SegmentStartJ6) * ProgressDelta * MotionScale);
 
   IF CycleTimer.Q THEN ResetTimer := TRUE; END_IF;
 END_IF;
 
-J1Raw := REAL_TO_INT(J1Deg * DegToRadScaled);
-J2Raw := REAL_TO_INT(J2Deg * DegToRadScaled);
-J3Raw := REAL_TO_INT(J3Deg * DegToRadScaled);
-J4Raw := REAL_TO_INT(J4Deg * DegToRadScaled);
-J5Raw := REAL_TO_INT(J5Deg * DegToRadScaled);
-J6Raw := REAL_TO_INT(J6Deg * DegToRadScaled);
+J1Raw := REAL_TO_INT((J1Deg - 0.0) * DegToRadScaled);
+J2Raw := REAL_TO_INT((J2Deg - (-35.0)) * DegToRadScaled);
+J3Raw := REAL_TO_INT((J3Deg - 75.0) * DegToRadScaled);
+J4Raw := REAL_TO_INT((J4Deg - 50.0) * DegToRadScaled);
+J5Raw := REAL_TO_INT((J5Deg - 0.0) * DegToRadScaled);
+J6Raw := REAL_TO_INT((J6Deg - 0.0) * DegToRadScaled);

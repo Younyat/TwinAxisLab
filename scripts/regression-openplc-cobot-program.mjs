@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 const source = await readFile(new URL('../openplc/cobot-6dof-smart-demo/cobot_6dof_smart_demo.st', import.meta.url), 'utf8');
 const required = [
   '%QW100', '%QW101', '%QW102', '%QW103', '%QW104', '%QW105',
+  'ProgramSignature AT %QW97 : UINT := 2101',
+  'ProgramSignature := 2101;',
   'T#10s', 'P := P * P * (3.0 - (2.0 * P))', 'ElapsedMs < 1400', 'ElapsedMs < 2400',
   'ElapsedMs < 3200', 'ElapsedMs < 5600', 'ElapsedMs < 7600',
 ];
@@ -21,6 +23,7 @@ const keys = [
   [7600, [50, 15, 80, -5, 30, -90]],
   [10000, [0, -35, 75, 50, 0, 0]],
 ];
+const home = keys[0][1];
 const smooth = (x) => x * x * (3 - 2 * x);
 const sample = (timeMs) => {
   const endIndex = keys.findIndex(([time]) => time >= timeMs);
@@ -34,10 +37,19 @@ for (const [time, expected] of keys) {
   const actual = sample(time);
   actual.forEach((value, index) => {
     if (Math.abs(value - expected[index]) > 1e-9) throw new Error(`Cycle mismatch at ${time} ms, J${index + 1}`);
-    const encoded = Math.round(value * Math.PI / 180 * 10000);
+    const encoded = Math.round((value - home[index]) * Math.PI / 180 * 10000);
     if (encoded < -32768 || encoded > 32767) throw new Error(`INT16 overflow at ${time} ms, J${index + 1}`);
   });
 }
+const relativeEncoding = [
+  'J2Raw := REAL_TO_INT((J2Deg - (-35.0)) * DegToRadScaled)',
+  'J3Raw := REAL_TO_INT((J3Deg - 75.0) * DegToRadScaled)',
+  'J4Raw := REAL_TO_INT((J4Deg - 50.0) * DegToRadScaled)',
+];
+for (const token of relativeEncoding) {
+  if (!source.includes(token)) throw new Error(`OpenPLC program does not encode KinematicGraph-relative motion: ${token}`);
+}
+if (/J[234]Raw AT %QW10[123] : INT := (?!0;)/.test(source)) throw new Error('OpenPLC Home registers must be zero in KinematicGraph-relative coordinates');
 
 const amplified = await readFile(new URL('../openplc/cobot-6dof-smart-demo/cobot_6dof_smart_demo_amplified.st', import.meta.url), 'utf8');
 const amplifiedRequired = [
@@ -71,15 +83,34 @@ for (const pose of amplifiedExtremes) {
 const iotProgram = await readFile(new URL('../openplc/cobot-6dof-smart-demo/cobot_6dof_iot_condition_monitoring.st', import.meta.url), 'utf8');
 const iotRequired = [
   '%QW120', '%QW121', '%QW122', '%QW123', '%QW124', '%QW125', '%QW126', '%QW127',
+  'ProgramSignature AT %QW97 : UINT := 2101',
+  'ProgramSignature := 2101;',
   'TemperatureC >= 55.0', 'HumidityRH >= 85.0', 'GyroDps >= 220.0',
   'TemperatureC >= 45.0', 'HumidityRH >= 75.0', 'GyroDps >= 120.0',
   'SensorAgeMs > 2500', 'MotionScale := 0.55', 'ConditionState >= 2',
   'MotionIdleTimer', 'SensorPolicy = 1', 'AlarmCode := 5',
+  'T#10s', 'ElapsedMs < 1400', 'ElapsedMs < 2400', 'ElapsedMs < 3200',
+  'ElapsedMs < 5600', 'ElapsedMs < 7600',
+  'TargetJ1 := -55.0',
+  'TargetJ6 := -90.0',
+  'SegmentStartJ1 := J1Deg',
+  'ProgressDelta := P - PreviousP',
+  'J1Deg := J1Deg + ((TargetJ1 - SegmentStartJ1) * ProgressDelta * MotionScale)',
+  'J2Raw := REAL_TO_INT((J2Deg - (-35.0)) * DegToRadScaled)',
+  'J3Raw := REAL_TO_INT((J3Deg - 75.0) * DegToRadScaled)',
+  'J4Raw := REAL_TO_INT((J4Deg - 50.0) * DegToRadScaled)',
 ];
 for (const token of iotRequired) {
   if (!iotProgram.includes(token)) throw new Error(`IoT condition-monitoring program is missing ${token}`);
 }
 if (!iotProgram.trimStart().startsWith('VAR') || !iotProgram.includes('END_VAR')) throw new Error('IoT OpenPLC POU has an invalid declaration block');
 if (/\bPROGRAM\b|\bCONFIGURATION\b|\bFUNCTION\b/.test(iotProgram)) throw new Error('IoT OpenPLC POU contains an unsupported wrapper');
+if (iotProgram.includes('T#12s') || iotProgram.includes('TargetJ1 := -90.0')) throw new Error('IoT OpenPLC POU still contains the obsolete amplified trajectory');
+if (/J[234]Raw AT %QW10[123] : INT := (?!0;)/.test(iotProgram)) throw new Error('IoT OpenPLC Home registers must be zero in KinematicGraph-relative coordinates');
+
+const physicalProgram = await readFile(new URL('../openplc/cobot-6dof-smart-demo/cobot_6dof_iot_condition_monitoring_s7_1200.scl', import.meta.url), 'utf8');
+for (const token of ['RobotHolding".Struct.ProgramSignature := 2101;', 'HR7..HR12', '#SegmentStartJ1 := #J1Deg;', '#ProgressDelta := #P - #PreviousP;', '#J1Deg := #J1Deg + ((#TargetJ1 - #SegmentStartJ1) * #ProgressDelta * #MotionScale);']) {
+  if (!physicalProgram.includes(token)) throw new Error(`S7-1200 physical program is missing ${token}`);
+}
 
 console.log('OpenPLC cobot programs regression passed: standard, amplified and IoT condition-monitoring profiles are valid.');

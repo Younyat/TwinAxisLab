@@ -503,47 +503,55 @@ export const acceptJointCandidate = (graph: KinematicGraph, jointId: string): Ki
 
 export const rejectJointCandidate = (graph: KinematicGraph, jointId: string): KinematicGraph => updateJoint(graph, jointId, { status: 'rejected' });
 
-const graphChildren = (graph: KinematicGraph) => {
-  const byParent = new Map<string, KinematicJoint[]>();
-  graph.joints.filter((joint) => joint.status !== 'rejected').forEach((joint) => {
-    byParent.set(joint.parentPartId, [...(byParent.get(joint.parentPartId) ?? []), joint]);
-  });
-  return byParent;
+export const partFollowsJointMotion = (part: MechanicalPart, jointId: string) => {
+  const participation = part.metadata?.motionParticipation;
+  if (!participation || typeof participation !== 'object' || Array.isArray(participation)) return true;
+  const state = (participation as Record<string, unknown>)[jointId];
+  return state !== false && state !== 'suspended' && state !== 'removed';
 };
 
 export const evaluateForwardKinematics = (graphInput: KinematicGraph, stateInput?: KinematicState): Record<string, EvaluatedPartPose> => {
   const graph = normalizeKinematicGraph(graphInput);
   const parts = new Map<string, MechanicalPart>(graph.parts.map((part) => [part.id, part]));
-  const children = graphChildren(graph);
   const state = stateInput ?? createHomeKinematicState(graph);
   const result: Record<string, EvaluatedPartPose> = {};
-  const visited = new Set<string>();
+  const incomingByChild = new Map<string, KinematicJoint>();
+  graph.joints.filter((joint) => joint.status !== 'rejected').forEach((joint) => incomingByChild.set(joint.childPartId, joint));
 
-  const evaluatePart = (partId: string, parentMatrix: number[]) => {
-    if (visited.has(partId)) return;
-    visited.add(partId);
+  const valueForJoint = (joint: KinematicJoint) => {
+    const baseValue = state.jointValues[joint.id] ?? state.homeJointValues[joint.id] ?? 0;
+    return joint.coupling
+      ? (state.jointValues[joint.coupling.driverJointId] ?? state.homeJointValues[joint.coupling.driverJointId] ?? 0) * joint.coupling.multiplier +
+          joint.coupling.offset
+      : baseValue;
+  };
+
+  const evaluatePartForTarget = (partId: string, targetPart: MechanicalPart, visiting = new Set<string>()): number[] | undefined => {
+    if (visiting.has(partId)) return undefined;
     const part = parts.get(partId);
-    if (!part) return;
-    const matrix = matrixMultiply(parentMatrix, transformToMatrix(part.localFrame));
-    result[partId] = {
-      partId,
+    if (!part) return undefined;
+    if (partId === graph.rootPartId) return transformToMatrix(part.localFrame);
+
+    const joint = incomingByChild.get(partId);
+    if (!joint) return undefined;
+    const nextVisiting = new Set(visiting).add(partId);
+    const parentMatrix = evaluatePartForTarget(joint.parentPartId, targetPart, nextVisiting);
+    if (!parentMatrix) return undefined;
+    const motion = partFollowsJointMotion(targetPart, joint.id) ? jointMotionMatrix(joint, valueForJoint(joint)) : identityMatrix();
+    return matrixMultiply(matrixMultiply(parentMatrix, motion), transformToMatrix(part.localFrame));
+  };
+
+  parts.forEach((part) => {
+    const matrix = evaluatePartForTarget(part.id, part);
+    if (!matrix) return;
+    result[part.id] = {
+      partId: part.id,
       matrix,
       position: matrixPosition(matrix),
       rotation: normalizeQuaternion(matrixQuaternion(matrix)) ?? [0, 0, 0, 1],
       scale: matrixScale(matrix),
     };
-
-    (children.get(partId) ?? []).forEach((joint) => {
-      const baseValue = state.jointValues[joint.id] ?? state.homeJointValues[joint.id] ?? 0;
-      const value = joint.coupling
-        ? (state.jointValues[joint.coupling.driverJointId] ?? state.homeJointValues[joint.coupling.driverJointId] ?? 0) * joint.coupling.multiplier +
-          joint.coupling.offset
-        : baseValue;
-      evaluatePart(joint.childPartId, matrixMultiply(matrix, jointMotionMatrix(joint, value)));
-    });
-  };
-
-  evaluatePart(graph.rootPartId, identityMatrix());
+  });
   return result;
 };
 

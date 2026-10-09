@@ -334,4 +334,14 @@ export const createImportedModelNode = async (file: File): Promise<SceneNode> =>
   };
 };
 
+export const reanalyzeImportedModelGeometry = async (geometry: ImportedModelGeometry): Promise<ImportedModelGeometry> => {
+  const response = await fetch(geometry.assetDataUrl);
+  if (!response.ok) throw new Error(`Stored model data could not be read (${response.status}).`);
+  const blob = await response.blob();
+  const file = new File([blob], geometry.assetName, { type: blob.type || `model/${geometry.sourceFormat}` });
+  const node = await createImportedModelNode(file);
+  if (node.geometry.kind !== 'imported-model') throw new Error('Stored model did not produce an imported geometry.');
+  return node.geometry;
+};
+
 export const createImportedGlbNode = createImportedModelNode;

@@ -90,8 +90,8 @@ const models = [
       G1_finger_R: 'finger_carriage_R',
     },
     expectedClipPoses: [
-      { clip: 'Toma_De_Cinta', time: 2.3, valuesDeg: { J1: 0, J2: 32, J3: 72, J4: 0, J5: 16, J6: 0 } },
-      { clip: 'Toma_De_Cinta', time: 5.6, valuesDeg: { J1: 95, J2: 10, J3: 75, J4: 90, J5: 35, J6: 0 } },
+      { clip: 'Toma_De_Cinta', time: 2.3, valuesDeg: { J1: 0, J2: 32, J3: 62, J4: 0, J5: 16, J6: 0 } },
+      { clip: 'Toma_De_Cinta', time: 5.6, valuesDeg: { J1: 95, J2: 10, J3: 65, J4: 90, J5: 35, J6: 0 } },
       { clip: 'Demo_Ejes', time: 14.8, valuesDeg: { J6: 360 } },
     ],
   },

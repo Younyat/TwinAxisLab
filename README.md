@@ -45,6 +45,23 @@ El `Twin Inspector` incorpora una capa operativa trazable: autoridad de control,
 
 El bloque `Live Twin Monitor` del inspector resume conexiones, eventos, comandos y alarmas del gemelo seleccionado. Los contadores proceden del `TwinProject` actual; si no existe telemetría o una regla activa se muestran valores vacíos o cero, nunca datos inventados.
 
+### Auditoria de comunicacion y sondas en vivo
+
+El panel `Deep Movement Traceability` incluye la pestana `Probes`. Esta pestana observa los estados decodificados por la plataforma y registra evidencia estructurada en cada frontera:
+
+```text
+BLE SensorTag -> IoT Controller -> Modbus FC16 -> PLC/OpenPLC
+                                      -> Modbus FC03 -> decoder -> KinematicGraph V2 -> Digital Twin
+```
+
+Las sondas son `iot-rx` (muestra BLE, edad, secuencia, calidad y sensores), `modbus-tx` (escritura de telemetria), `plc-rx` (lectura FC03, endpoint, rango y palabras), `plc-decision` (Command, ConditionState, AlarmCode, SpeedPermille y SensorPolicy), `joint-registers` (vector J1..J6 decodificado) y `kinematic-apply` (aplicacion del vector al gemelo). Cada evento contiene `timestampUtc`, secuencia de sesion, etapa, origen, destino, operacion, rango de registros, valores decodificados, estado y error cuando existe.
+
+La sesion conserva hasta 1000 eventos en memoria para la vista en vivo y los persiste en NDJSON en `project-telemetry/<session-id>/events.ndjson`. El servidor local crea tambien `manifest.json` y rota el archivo al superar 20 MiB. Estos artefactos estan excluidos de Git. Si el almacenamiento temporal no responde, el panel muestra `OFFLINE` y conserva los eventos pendientes para reintento.
+
+Para investigar una incidencia, abre `Deep Movement Traceability`, entra en `Probes`, mueve el SensorTag o cambia el modo PLC y observa el orden temporal de las filas. El NDJSON permite reconstruir si fallo la recepcion IoT, la escritura FC16, la lectura FC03, la decision PLC o la aplicacion cinemática. No se almacenan credenciales ni se modifica ningun registro por activar el auditor.
+
+En el perfil `Physical PLC`, cada lectura aceptada incluye ademas `latencyMs`, `sampleIntervalMs`, `maxJointJumpRad`, `stepTransition`, `statusTransition` y `conditionTransition`. Un intervalo grande con vector continuo apunta a red o carga del PLC; un intervalo normal con salto grande apunta a escala, offset, orden de joints o cambio de proceso; una transicion de `ConditionState` junto con `SensorAgeMs > 2500` apunta a la logica de seguridad del programa ST. El programa facilitado aplica precisamente `TRIP/HOLD` cuando el sensor es invalido, supera 2.5 s de edad, pierde la capacidad giroscopica o permanece quieto 2 s en `SensorPolicy = 1`; por eso esos campos deben compararse en la misma fila temporal antes de atribuir el problema a un delay.
+
 ### MQTT y OPC UA
 
 El `Connection Manager` de `TwinAxis Signal Mapping` incluye perfiles persistentes para OpenPLC/Modbus, MQTT y OPC UA. La edicion esta bloqueada hasta pulsar `Enable editing`: endpoint, activacion, alta y borrado permanecen en borrador y solo se guardan tras `Confirm and save`. `Test connection` usa el adaptador real y solo muestra `ONLINE` cuando el broker MQTT o el gateway OPC UA confirma la sesion. Un fallo queda como `FAILED` con diagnostico; no se simula una conexion correcta.
@@ -1004,6 +1021,10 @@ OpenPLC Runtime v3 esta fuera de mantenimiento. La integracion objetivo es Runti
 El perfil `Physical S7-1200 - HR0..20` usa el S7-1200 como servidor Modbus TCP y mantiene una unica secuencia de E/S para su puerto. Siemens especifica una sola conexion por puerto `MB_SERVER` y recomienda ejecutar el bloque en cada ciclo del programa. TwinAxis serializa lectura FC03, escritura FC16 y telemetria IoT para evitar competir por ese recurso, conserva la ultima imagen de proceso durante interrupciones breves y solo declara `OFFLINE` despues de fallos consecutivos. Consulte el [manual oficial SIMATIC S7-1200 V4.7](https://cache.industry.siemens.com/dl/files/302/109977302/att_1307432/v1/s71200_system_manual_en-US.pdf).
 
 `Run Start Demo` no salta segun el reloj del navegador: parte del vector real leido en `HR7..HR12`, interpola durante 1.2 segundos hacia el primer frame y avanza el clip solamente despues de confirmar cada escritura. El gemelo y la entidad fisica simulada reciben la misma muestra validada. `Stop PLC Demo` detiene la secuencia y mantiene la ultima consigna con `HR0=0`.
+
+La escritura fisica ordena los joints mediante sus metadatos `J1..J6`, nunca mediante el orden incidental del array de KinematicGraph. La regresion del puente verifica cada frame `HR7..HR12` contra `Ciclo_Asistencia`, incluida la entrada suave de 1,2 segundos. El modo `Auto` interno del S7-1200 sigue dependiendo del programa cargado en el propio PLC; `Run Start Demo` es la ruta TwinAxis que garantiza el mismo clip del Inspector.
+
+Al perder la red OT, tres fallos Modbus consecutivos cambian el enlace a `CONNECTING / PLC DISCONNECTED`. TwinAxis conserva la ultima imagen como `STALE RAW` solo para continuidad visual y no la presenta como telemetria viva. El polling permanece activo y recupera automaticamente `ONLINE` cuando vuelve a estar disponible el S7-1200.
 
 Mapa RobotHolding del perfil fisico:
 
