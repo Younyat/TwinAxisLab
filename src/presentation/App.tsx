@@ -1031,6 +1031,85 @@ const loadPlcEndpoint = (): Partial<PersistedPlcEndpoint> => {
   }
 };
 
+type Ft511938Detection = {
+  accepted: boolean;
+  snapshot: ReturnType<typeof decodeFt511938Registers>;
+  reasons: string[];
+  identityEvidence: string[];
+};
+
+const assessFt511938AdapterImage = (words: number[]): Ft511938Detection => {
+  const snapshot = decodeFt511938Registers(words);
+  const reasons: string[] = [];
+  const identityEvidence: string[] = [];
+  const inRange = (value: number, lower: number, upper: number) => Number.isFinite(value) && value >= lower && value <= upper;
+  const unsigned = (offset: number) => Number(words[offset] ?? 0) & 0xffff;
+  const signed = (offset: number) => {
+    const value = unsigned(offset);
+    return value & 0x8000 ? value - 0x10000 : value;
+  };
+
+  // Identification is deliberately independent from motion permission. An
+  // invalid IoT sample, an unhomed axis, or a disabled physical output means
+  // the PLC must not move, but none of those states means it is not FT511938.
+  if (words.length < FT511938_HR_COUNT) reasons.push(`HR0..60 incomplete (${words.length}/${FT511938_HR_COUNT})`);
+  if (!inRange(signed(0), 0, 4)) reasons.push(`Cmd=${signed(0)} outside 0..4`);
+  if (!inRange(unsigned(1), 0, 1)) reasons.push(`Enable=${unsigned(1)} is not a boolean word`);
+  if (!inRange(signed(2), 0, 4)) reasons.push(`JogAxis=${signed(2)} outside 0..4`);
+  if (!inRange(signed(3), -1, 1)) reasons.push(`JogDirection=${signed(3)} outside -1..1`);
+  if (!inRange(unsigned(4), 0, 1)) reasons.push(`JogEnable=${unsigned(4)} is not a boolean word`);
+  if (!inRange(unsigned(5), 0, 65535)) reasons.push(`HeartbeatSequence=${unsigned(5)} outside UINT range`);
+  if (!inRange(signed(46), 0, 3)) reasons.push(`Status=${signed(46)} outside 0..3`);
+  if (![0, 1, 3, 4].includes(signed(47))) reasons.push(`ActiveMode=${signed(47)} outside 0,1,3,4`);
+  if (!inRange(signed(48), 0, 9)) reasons.push(`ActiveStep=${signed(48)} outside 0..9`);
+  if (!inRange(signed(49), 0, 10)) reasons.push(`AlarmCode=${signed(49)} outside 0..10`);
+  if (!inRange(unsigned(52), 0, 3)) reasons.push(`ConditionState=${unsigned(52)} outside 0..3`);
+  if (![0, 550, 1000].includes(unsigned(53))) reasons.push(`SpeedPermille=${unsigned(53)} outside 0,550,1000`);
+  if (![0, 1].includes(unsigned(58))) reasons.push(`SimulationMode=${unsigned(58)} outside 0,1`);
+  if (!inRange(unsigned(14), 0, 1)) reasons.push(`SensorPolicy=${unsigned(14)} outside 0,1`);
+  if (!inRange(unsigned(15), 0, 1)) reasons.push(`SensorValid=${unsigned(15)} is not a boolean word`);
+  if (!inRange(unsigned(16), 0, 31)) reasons.push(`SensorQualityBits=${unsigned(16)} outside the five-bit mask`);
+  if (!inRange(unsigned(17), 0, 65535)) reasons.push(`SensorAgeMs=${unsigned(17)} outside UINT range`);
+  if (!inRange(signed(18), -4000, 12500)) reasons.push(`TemperatureCx100=${signed(18)} outside sensor range`);
+  if (!inRange(unsigned(19), 0, 10000)) reasons.push(`HumidityRHx100=${unsigned(19)} outside 0..100%`);
+  if (!inRange(unsigned(20), 0, 65535)) reasons.push(`GyroDpsx100=${unsigned(20)} outside UINT range`);
+  if (!inRange(unsigned(21), 0, 1)) reasons.push(`SafetyOK=${unsigned(21)} is not a boolean word`);
+  if (!inRange(unsigned(22), 0, 1)) reasons.push(`DrivesReady=${unsigned(22)} is not a boolean word`);
+  if (!inRange(unsigned(23), 0, 1)) reasons.push(`CommFresh=${unsigned(23)} is not a boolean word`);
+  if (!inRange(unsigned(24), 0, 1)) reasons.push(`SensorOK=${unsigned(24)} is not a boolean word`);
+  if (!inRange(unsigned(28), 0, 1)) reasons.push(`WiringVerified=${unsigned(28)} is not a boolean word`);
+  if (!inRange(unsigned(29), 0, 1)) reasons.push(`PhysicalOutputEnable=${unsigned(29)} is not a boolean word`);
+  if (unsigned(25) > 15) reasons.push(`HomedMask=${unsigned(25)} outside four-axis mask`);
+  if (unsigned(26) > 15) reasons.push(`MinLimitMask=${unsigned(26)} outside four-axis mask`);
+  if (unsigned(27) > 15) reasons.push(`MaxLimitMask=${unsigned(27)} outside four-axis mask`);
+  if (unsigned(59) !== 0) reasons.push(`Reserved HR59=${unsigned(59)} is not zero`);
+  if (snapshot.manualTargets.length !== 4) reasons.push(`ManualTarget vector length=${snapshot.manualTargets.length}, expected 4`);
+  if (snapshot.positions.length !== 4) reasons.push(`Position vector length=${snapshot.positions.length}, expected 4`);
+  if (snapshot.targets.length !== 4) reasons.push(`Target vector length=${snapshot.targets.length}, expected 4`);
+  const hasCommandImageEvidence = unsigned(1) !== 0 || unsigned(5) !== 0 || signed(2) !== 0 || signed(3) !== 0;
+  if (!hasCommandImageEvidence && unsigned(25) !== 15 && unsigned(58) !== 1) reasons.push('Command image has no enable, heartbeat, jog or homing evidence');
+  const hasMeasuredReal32Evidence = words.slice(30, 46).some((value) => (Number(value) & 0xffff) !== 0);
+  const hasManualTargetEvidence = snapshot.manualTargets.some((value, index) => inRange(value, index === 0 ? -180 : 0, index === 0 ? 180 : 500));
+  if (unsigned(25) === 15) identityEvidence.push('HomedMask=15');
+  if (hasMeasuredReal32Evidence) identityEvidence.push('HR30..45 contains measured REAL32 data');
+  if (unsigned(58) === 1) identityEvidence.push('SimulationMode=1');
+  if (unsigned(60) !== 0) identityEvidence.push(`DoneCounter=${unsigned(60)}`);
+  if (hasManualTargetEvidence) identityEvidence.push('HR6..13 contains valid manual REAL32 targets');
+  const hasFtIdentityEvidence = identityEvidence.length > 0;
+  if (!hasFtIdentityEvidence) reasons.push('No FT identity evidence in homing, measured REAL32, simulation or done counter fields');
+  snapshot.manualTargets.forEach((value, index) => {
+    if (!inRange(value, index === 0 ? -180 : 0, index === 0 ? 180 : 500)) reasons.push(`ManualTarget[${index + 1}]=${value} outside FT range`);
+  });
+  snapshot.positions.forEach((value, index) => {
+    if (!inRange(value, index === 0 ? -180 : 0, index === 0 ? 180 : 500)) reasons.push(`Pos[${index + 1}]=${value} outside FT range`);
+  });
+  snapshot.targets.forEach((value, index) => {
+    if (!inRange(value, index === 0 ? -180 : 0, index === 0 ? 180 : 500)) reasons.push(`Target[${index + 1}]=${value} outside FT range`);
+  });
+
+  return { accepted: reasons.length === 0, snapshot, reasons, identityEvidence };
+};
+
 const defaultConnectionProfiles = (): ConnectionProfile[] => [
   { id: 'openplc-main', name: 'OpenPLC Runtime', protocol: 'modbus', endpoint: '127.0.0.1:502', enabled: true, autoReconnect: true, reconnectDelayMs: 1500, metadata: { managedBy: 'openplc-dashboard', unitId: 1 } },
   { id: 'mqtt-main', name: 'MQTT Broker', protocol: 'mqtt', endpoint: 'ws://127.0.0.1:9001', enabled: false, autoReconnect: true, reconnectDelayMs: 1500, metadata: { clientIdPrefix: 'twinaxis' } },
@@ -5606,14 +5685,9 @@ export const App = () => {
           });
           const ftPayload = await readRegisters(ftQuery);
           const words = ftPayload.registers ?? [];
-          const ftCandidate = decodeFt511938Registers(words);
-          const ftAdapterSignature = words.length >= FT511938_HR_COUNT
-            && ftCandidate.valid
-            && ftCandidate.sensorValid === 1
-            && ftCandidate.homedMask === 15
-            && words[57] === words[5]
-            && [0, 1].includes(ftCandidate.simulationMode);
-          if (ftAdapterSignature) {
+          const ftDetection = assessFt511938AdapterImage(words);
+          const ftCandidate = ftDetection.snapshot;
+          if (ftDetection.accepted) {
             recordCommunicationEvent({
               stage: 'plc-rx',
               status: 'ok',
@@ -5625,7 +5699,7 @@ export const App = () => {
               registerRange: `HR0..HR${FT511938_HR_COUNT - 1}`,
               registers: words,
               decoded: { simulationMode: ftCandidate.simulationMode, homedMask: ftCandidate.homedMask, heartbeat: ftCandidate.heartbeatSequence },
-              metadata: { previousProfile: 'openplc', nextProfile: FT511938_ENDPOINT_PROFILE, reason: 'legacy %QW97 mismatch with valid FT adapter image' },
+              metadata: { previousProfile: 'openplc', nextProfile: FT511938_ENDPOINT_PROFILE, reason: 'legacy %QW97 mismatch with structurally valid FT adapter image', identityEvidence: ftDetection.identityEvidence.join(' | ') },
             });
             setPlcDashboard((state) => {
               if (state.openPlc.endpointProfile !== 'openplc' || state.openPlc.host !== config.host || state.openPlc.port !== config.port) return state;
@@ -5655,6 +5729,21 @@ export const App = () => {
             });
             return;
           }
+          recordCommunicationEvent({
+            stage: 'plc-rx',
+            status: 'warning',
+            source: `OpenPLC legacy profile ${config.host}:${config.port}`,
+            destination: 'TwinAxis FT511938 profile selector',
+            operation: 'automatic FT511938 adapter detection',
+            endpoint: `${config.host}:${config.port}`,
+            protocol: 'Modbus TCP',
+            registerRange: `HR0..HR${FT511938_HR_COUNT - 1}`,
+            registers: words,
+            error: `FT image rejected: ${ftDetection.reasons.join('; ')}`,
+            metadata: { previousProfile: 'openplc', expectedProfile: FT511938_ENDPOINT_PROFILE, signatureValue: programSignature ?? 0, identityEvidence: ftDetection.identityEvidence.join(' | ') || 'none' },
+            dedupeKey: `ft-detection-rejected-${legacyFtAutoDetectKey}-${ftDetection.reasons.join('|')}`,
+            minIntervalMs: 5000,
+          });
         } catch {
           // Keep the legacy mismatch when HR0..HR60 is not a valid FT image.
         }
