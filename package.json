@@ -32,6 +32,7 @@
     "test:modbus-controller": "node scripts/modbus_visual_controller.mjs --self-test && node scripts/regression-modbus-visual-controller.mjs",
     "test:modbus-launcher": "node scripts/regression-modbus-launcher.mjs",
     "test:openplc": "node scripts/regression-openplc-bridge.mjs",
+    "test:openplc:ft-manual": "node scripts/regression-ft511938-manual.mjs",
     "test:observability": "node scripts/regression-observability.mjs",
     "test:openplc:program": "node scripts/regression-openplc-cobot-program.mjs",
     "audit:iot-plc": "node scripts/capture-live-iot-plc-audit.mjs",

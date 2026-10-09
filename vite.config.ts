@@ -70,6 +70,7 @@ type ModbusRequest = {
   address: number;
   quantity?: number;
   values?: number[];
+  priority?: 'control' | 'telemetry';
   timeoutMs?: number;
   deviceLabel?: string;
 };
@@ -94,15 +95,22 @@ class PersistentModbusSession {
   request(options: ModbusRequest) {
     return new Promise<Buffer>((resolveRequest, rejectRequest) => {
       const item = { ...options, resolve: resolveRequest, reject: rejectRequest };
-      // FC03 is the process image. It must be served before telemetry writes;
-      // otherwise a slow IoT write can make the robot appear to jump.
-      if (options.functionCode === 3) this.queue.unshift(item);
-      else {
-        // Only the newest queued write is useful for live telemetry.
-        const staleWrites = this.queue.filter((queued) => queued.functionCode !== 3);
-        this.queue = this.queue.filter((queued) => queued.functionCode === 3);
+      // Keep process-image reads fresh, but never let continuous FC03 polling
+      // starve a control write. A queued FC06/FC16 is a PLC command and must
+      // be sent before another stale read is accepted.
+      if (options.functionCode === 3) {
+        const controlWritePending = this.queue.some((queued) => queued.functionCode !== 3);
+        if (controlWritePending) this.queue.push(item);
+        else this.queue.unshift(item);
+      } else {
+        const controlWrite = options.priority === 'control';
+        // Telemetry is replaceable; a control command is not. Otherwise a
+        // 200 ms IoT forwarder can supersede Cmd=0/Cmd=4 before it is sent.
+        const staleWrites = this.queue.filter((queued) => queued.functionCode !== 3 && queued.priority !== 'control');
+        this.queue = this.queue.filter((queued) => queued.functionCode === 3 || queued.priority === 'control');
         staleWrites.forEach((stale) => stale.reject(new Error('Superseded by a newer Modbus request.')));
-        this.queue.push(item);
+        if (controlWrite || !this.queue.some((queued) => queued.functionCode !== 3)) this.queue.unshift(item);
+        else this.queue.push(item);
       }
       void this.drain();
     });
@@ -379,9 +387,10 @@ const openPlcPlugin = () => ({
           const unitId = Number(parsed.unitId ?? 1);
           const address = Number(parsed.address ?? 100);
           const values = Array.isArray(parsed.values) ? parsed.values.map(Number) : [];
+          const priority = parsed.priority === 'control' ? 'control' : 'telemetry';
           if (!validOpenPlcHost(host) || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(address) || address < 0 || address > 65535 || !values.length || values.length > 123 || values.some((word) => !Number.isInteger(word) || word < 0 || word > 65535)) throw new Error('Invalid OpenPLC write request');
           const functionCode = values.length === 1 ? 6 : 16;
-          const frame = await openPlcRequest({ host, port, unitId, functionCode, address, values });
+          const frame = await openPlcRequest({ host, port, unitId, functionCode, address, values, priority });
           response.end(JSON.stringify({ ok: true, functionCode, transactionId: frame.readUInt16BE(0), receivedAt: new Date().toISOString() }));
         } catch (error) {
           response.statusCode = 502;
