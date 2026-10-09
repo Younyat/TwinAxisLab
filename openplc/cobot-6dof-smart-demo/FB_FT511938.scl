@@ -16,8 +16,8 @@
 // FORGE-DT - Control cilindrico R-P-P + pinza, S7-1200 / TIA Portal SCL
 // VERSION V2 CON DATASHEET FISCHERTECHNIK 511938 - INGENIERIA SIN VALIDAR.
 // 0 STOP; 1 DEMO (flanco); 2 RESET; 3 JOG (mantenido); 4 GOTO (flanco).
-// IoT: politica original, criticidad e invalidacion bloquean el movimiento.
-// En degradacion se bloquea: los reles no ofrecen control de velocidad 55%.
+// IoT: solo gobierna AUTO. JOG/GOTO manual ignora validez, frescura y
+// movimiento del sensor, pero conserva todos los permisos fisicos y limites.
 // Pos[1] grados; Pos[2..4] mm. Pos DEBE ser MEDIDA, NO estimada de consignas.
 // Run y DirectionPositive son mandos LOGICOS; no conectar a placa sin identificarla.
 // Homing, HSC/encoders, E-stop y limites de seguridad se implementan externamente.
@@ -45,7 +45,7 @@ VAR_INPUT
     TemperatureCx100 : Int;
     HumidityRHx100 : UInt;
     GyroDpsx100 : UInt;
-    SensorPolicy : UInt;             // 0: movimiento no obligatorio; 1: vigilar giroscopio
+    SensorPolicy : UInt;             // 0: AUTO con IoT quieto; 1: AUTO con IoT en movimiento; manual ignora IoT
     SensorValid : UInt;              // 1: lectura valida
     SensorQualityBits : UInt;        // bit 0 dato valido; bit 4 giroscopio disponible
     SensorAgeMs : UInt;
@@ -98,6 +98,10 @@ VAR
     MotionPresent : Bool;
     IoTBlock : Bool;
     IoTDegraded : Bool;
+    PhysicalPermitted : Bool;
+    ManualPermitted : Bool;
+    AutoPermitted : Bool;
+    AutoMotionAllowed : Bool;
     TurnLeft : Bool;
     OutputGate : Bool;
     q : Int;
@@ -127,8 +131,8 @@ BEGIN
     #HumidityRH := UINT_TO_REAL(#HumidityRHx100) / 100.0;
     #GyroDps := UINT_TO_REAL(#GyroDpsx100) / 100.0;
     #MotionPresent := #GyroDps >= 3.0;
-    // Temporizador siempre invocado. La politica 1 reproduce el criterio original.
-    #MotionIdleTimer(IN := (#SensorPolicy = UINT#1) AND (NOT #MotionPresent), PT := T#2s);
+    // Temporizador comun para la politica AUTO de IoT quieto.
+    #MotionIdleTimer(IN := NOT #MotionPresent, PT := T#2s);
     #ConditionState := UINT#0;
     #IoTAlarmCode := UINT#0;
     #SpeedPermille := UINT#1000;
@@ -137,13 +141,10 @@ BEGIN
        (#SensorAgeMs > UINT#2500) THEN
         #ConditionState := UINT#3;
         #IoTAlarmCode := UINT#4;
-    ELSIF (#SensorPolicy = UINT#1) AND
+    ELSIF ((#SensorPolicy = UINT#0) OR (#SensorPolicy = UINT#1)) AND
           ((#SensorQualityBits AND UINT#16) = UINT#0) THEN
         #ConditionState := UINT#3;
         #IoTAlarmCode := UINT#6;
-    ELSIF (#SensorPolicy = UINT#1) AND #MotionIdleTimer.Q THEN
-        #ConditionState := UINT#2;
-        #IoTAlarmCode := UINT#5;
     ELSIF (#TemperatureC >= 55.0) OR (#HumidityRH >= 85.0) OR (#GyroDps >= 220.0) THEN
         #ConditionState := UINT#2;
         IF #TemperatureC >= 55.0 THEN
@@ -156,14 +157,20 @@ BEGIN
     ELSIF (#TemperatureC >= 45.0) OR (#HumidityRH >= 75.0) OR (#GyroDps >= 120.0) THEN
         #ConditionState := UINT#1;
         #SpeedPermille := UINT#550;
+    ELSIF (#SensorPolicy = UINT#0) AND (NOT #MotionPresent) AND (NOT #MotionIdleTimer.Q) THEN
+        #ConditionState := UINT#2;
+        #IoTAlarmCode := UINT#5;
+    ELSIF (#SensorPolicy = UINT#0) AND #MotionPresent THEN
+        #ConditionState := UINT#2;
+        #IoTAlarmCode := UINT#5;
+    ELSIF (#SensorPolicy = UINT#1) AND (NOT #MotionPresent) THEN
+        #ConditionState := UINT#2;
+        #IoTAlarmCode := UINT#5;
     END_IF;
     #IoTBlock := #ConditionState >= UINT#2;
     #IoTDegraded := #ConditionState = UINT#1;
     IF #IoTBlock THEN #SpeedPermille := UINT#0; END_IF;
 
-    // Motores ON/OFF: en degradacion se INHIBE movimiento en lugar de simular 55%.
-    #Permitted := #WiringVerified AND #PhysicalOutputEnable AND #Enable AND #SafetyOK AND #DrivesReady AND #SensorOK AND
-                  #CommFresh AND (NOT #IoTBlock) AND (NOT #IoTDegraded);
     #AllHomed := TRUE;
     #PosValid := TRUE;
     FOR #i := 1 TO 4 DO
@@ -173,6 +180,32 @@ BEGIN
             #PosValid := FALSE;
         END_IF;
     END_FOR;
+
+    // Manual permission contains only PLC/physical authority. IoT inputs are
+    // intentionally absent so JOG/GOTO cannot be revoked by telemetry.
+    #PhysicalPermitted := #WiringVerified AND #PhysicalOutputEnable AND #Enable AND
+                          #SafetyOK AND #DrivesReady;
+    #ManualPermitted := #PhysicalPermitted AND #AllHomed AND #PosValid;
+
+    #AutoMotionAllowed := FALSE;
+    IF #SensorPolicy = UINT#0 THEN
+        #AutoMotionAllowed := (NOT #MotionPresent) AND #MotionIdleTimer.Q;
+    ELSIF #SensorPolicy = UINT#1 THEN
+        #AutoMotionAllowed := #MotionPresent;
+    END_IF;
+
+    #AutoPermitted := #ManualPermitted AND #SensorOK AND #CommFresh AND
+                      (#SensorValid <> UINT#0) AND
+                      ((#SensorQualityBits AND UINT#1) <> UINT#0) AND
+                      ((#SensorQualityBits AND UINT#16) <> UINT#0) AND
+                      (#SensorAgeMs <= UINT#2500) AND NOT #IoTBlock AND
+                      NOT #IoTDegraded AND #AutoMotionAllowed;
+
+    IF #ModeState = 1 THEN
+        #Permitted := #AutoPermitted;
+    ELSE
+        #Permitted := #ManualPermitted;
+    END_IF;
 
     #StartDemo := (#Cmd = 1) AND (#LastCmd <> 1);
     #StartGoto := (#Cmd = 4) AND (#LastCmd <> 4);
@@ -187,18 +220,12 @@ BEGIN
     END_IF;
 
     IF (#ModeState <> 0) THEN
-        IF NOT #CommFresh THEN
-            #Fault := 6;
-        ELSIF #IoTBlock THEN
-            #Fault := 8;  // bloqueo IoT critico/sensor invalido
-        ELSIF #IoTDegraded THEN
-            #Fault := 9;  // reles no pueden reducir velocidad al 55%
-        ELSIF NOT #Permitted THEN
+        IF (#ModeState = 1) THEN
+            // AUTO remains latched in HOLD while the selected IoT policy is
+            // false. It resumes without a new command or a Home jump.
+            IF NOT #PhysicalPermitted THEN #Fault := 1; END_IF;
+        ELSIF NOT #ManualPermitted THEN
             #Fault := 1;
-        ELSIF NOT #AllHomed THEN
-            #Fault := 2;
-        ELSIF NOT #PosValid THEN
-            #Fault := 3;
         END_IF;
     END_IF;
 
@@ -220,18 +247,16 @@ BEGIN
 
     IF (#Fault = 0) AND (#ModeState = 0) AND (#Cmd <> 0) THEN
         IF #StartDemo OR #StartGoto OR ((#Cmd = 3) AND #JogEnable) THEN
-            IF #IoTBlock THEN
-                #Fault := 8;
-            ELSIF #IoTDegraded THEN
-                #Fault := 9;
-            ELSIF NOT #Permitted THEN
-                #Fault := 1;
-            ELSIF NOT #AllHomed THEN
-                #Fault := 2;
-            ELSIF NOT #PosValid THEN
-                #Fault := 3;
-            ELSIF #StartDemo THEN
-                IF (ABS(#Pos[1]) <= 2.0) AND (ABS(#Pos[2] - 300.0) <= 3.0)
+            IF #StartDemo THEN
+                // AUTO may be selected while its IoT gate is waiting. The
+                // mode stays latched and starts when the policy is true.
+                IF NOT #ManualPermitted THEN
+                    #Fault := 1;
+                ELSIF NOT #AllHomed THEN
+                    #Fault := 2;
+                ELSIF NOT #PosValid THEN
+                    #Fault := 3;
+                ELSIF (ABS(#Pos[1]) <= 2.0) AND (ABS(#Pos[2] - 300.0) <= 3.0)
                     AND (ABS(#Pos[3] - 60.0) <= 3.0) AND (ABS(#Pos[4] - 50.0) <= 3.0) THEN
                     #ModeState := 1;
                     #Step := 1;
@@ -240,26 +265,40 @@ BEGIN
                     #Fault := 3; // demo arranca solo desde Home medido
                 END_IF;
             ELSIF #StartGoto THEN
-                // Capturar consignas para impedir cambios a mitad de trayectoria.
-                #ActionAllowed := TRUE;
-                FOR #i := 1 TO 4 DO
-                    IF (#ManualTarget[#i] <> #ManualTarget[#i]) OR
-                        (#ManualTarget[#i] < #MinPos[#i]) OR
-                        (#ManualTarget[#i] > #MaxPos[#i]) THEN
-                        #ActionAllowed := FALSE;
-                    END_IF;
-                END_FOR;
-                IF #ActionAllowed THEN
-                    FOR #i := 1 TO 4 DO
-                        #CapturedTarget[#i] := #ManualTarget[#i];
-                    END_FOR;
-                    #ModeState := 4;
-                    #ResetTimers := TRUE;
+                IF NOT #ManualPermitted THEN
+                    #Fault := 1;
+                ELSIF NOT #AllHomed THEN
+                    #Fault := 2;
+                ELSIF NOT #PosValid THEN
+                    #Fault := 3;
                 ELSE
-                    #Fault := 4;
+                    // Capturar consignas para impedir cambios a mitad de trayectoria.
+                    #ActionAllowed := TRUE;
+                    FOR #i := 1 TO 4 DO
+                        IF (#ManualTarget[#i] <> #ManualTarget[#i]) OR
+                            (#ManualTarget[#i] < #MinPos[#i]) OR
+                            (#ManualTarget[#i] > #MaxPos[#i]) THEN
+                            #ActionAllowed := FALSE;
+                        END_IF;
+                    END_FOR;
+                    IF #ActionAllowed THEN
+                        FOR #i := 1 TO 4 DO
+                            #CapturedTarget[#i] := #ManualTarget[#i];
+                        END_FOR;
+                        #ModeState := 4;
+                        #ResetTimers := TRUE;
+                    ELSE
+                        #Fault := 4;
+                    END_IF;
                 END_IF;
             ELSE
-                IF (#JogAxis >= 1) AND (#JogAxis <= 4) AND
+                IF NOT #ManualPermitted THEN
+                    #Fault := 1;
+                ELSIF NOT #AllHomed THEN
+                    #Fault := 2;
+                ELSIF NOT #PosValid THEN
+                    #Fault := 3;
+                ELSIF (#JogAxis >= 1) AND (#JogAxis <= 4) AND
                    ((#JogDirection = -1) OR (#JogDirection = 1)) THEN
                     #ModeState := 3;
                     #ResetTimers := TRUE;
@@ -268,6 +307,13 @@ BEGIN
                 END_IF;
             END_IF;
         END_IF;
+    END_IF;
+
+    // Re-evaluate authority after a command changes ModeState in this scan.
+    IF #ModeState = 1 THEN
+        #Permitted := #AutoPermitted;
+    ELSE
+        #Permitted := #ManualPermitted;
     END_IF;
 
     // 2. Programa de nueve puntos (separando la apertura de pinza para evitar simultaneidad prohibida) (coordenadas absolutas).
