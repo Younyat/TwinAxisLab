@@ -160,10 +160,18 @@ class VisualModbusState {
     const finite = (value, fallback) => Number.isFinite(Number(value)) ? Number(value) : fallback;
     this.iotSequence += 1;
     const receivedAtUtc = new Date().toISOString();
+    const temperatureC = finite(sample.temperatureC, this.iotTelemetry.temperatureC);
+    const humidityPercent = clamp(finite(sample.humidityPercent, this.iotTelemetry.humidityPercent), 0, 100);
+    const environmentRequested = sample.hasEnvironment ?? this.iotTelemetry.hasEnvironment;
+    // A CC2650 can expose the environmental characteristic while returning
+    // raw zero bytes. Its standard conversion is -40 C / 0 %RH, which is a
+    // sentinel for unavailable data rather than a valid process measurement.
+    const environmentAvailable = Boolean(environmentRequested)
+      && !(temperatureC <= -39.9 && humidityPercent === 0);
     this.iotTelemetry = {
       valid: sample.valid !== false,
-      temperatureC: finite(sample.temperatureC, this.iotTelemetry.temperatureC),
-      humidityPercent: clamp(finite(sample.humidityPercent, this.iotTelemetry.humidityPercent), 0, 100),
+      temperatureC: environmentAvailable ? temperatureC : 0,
+      humidityPercent: environmentAvailable ? humidityPercent : 0,
       gyroDps: Math.max(0, finite(sample.gyroDps, this.iotTelemetry.gyroDps)),
       accelX: finite(sample.accelX, this.iotTelemetry.accelX),
       accelY: finite(sample.accelY, this.iotTelemetry.accelY),
@@ -177,7 +185,7 @@ class VisualModbusState {
       hasAcceleration: sample.hasAcceleration ?? this.iotTelemetry.hasAcceleration,
       hasGyroscope: sample.hasGyroscope ?? this.iotTelemetry.hasGyroscope,
       hasMagnetometer: sample.hasMagnetometer ?? this.iotTelemetry.hasMagnetometer,
-      hasEnvironment: sample.hasEnvironment ?? this.iotTelemetry.hasEnvironment,
+      hasEnvironment: environmentAvailable,
       source: String(sample.source ?? this.iotTelemetry.source ?? ''),
       updatedAtMs: Date.now(),
       sequence: this.iotSequence,
@@ -2268,6 +2276,11 @@ const selfTest = async () => {
     throw new Error('IoT motion vectors were not preserved by the telemetry contract.');
   }
   if (traced.iotTrace.length !== 1 || traced.iotTrace[0].quality !== 'GOOD') throw new Error('IoT telemetry trace history is invalid.');
+  const sentinelState = new VisualModbusState();
+  sentinelState.updateIotTelemetry({ valid: true, temperatureC: -40, humidityPercent: 0, hasEnvironment: true, source: 'sentinel-test' });
+  if (sentinelState.iotTelemetry.hasEnvironment || sentinelState.iotTelemetry.temperatureC !== 0 || sentinelState.iotTelemetry.humidityPercent !== 0) {
+    throw new Error('CC2650 environmental sentinel was stored as a valid measurement.');
+  }
   console.log('visual modbus controller self-test passed');
 };
 
