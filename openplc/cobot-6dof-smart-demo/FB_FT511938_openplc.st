@@ -138,11 +138,44 @@ VAR
   ManualSafeHeightReady : BOOL := FALSE;
   ManualHeightReady : BOOL := FALSE;
   ManualGripperReady : BOOL := FALSE;
+  StartupDefaultsApplied : BOOL := FALSE;
 END_VAR
 
 
 // 1. Simulated process image and IoT condition monitor.
 // Cmd=0 is deliberately a hold state. It never writes Home values.
+// OpenPLC can start a newly compiled POU with zeroed mapped output words
+// instead of applying the declarations' initial values. The FT511938 file is
+// explicitly the local OpenPLC simulator adapter, so recover its safe
+// commissioning defaults once at the first scan. This block is deliberately
+// absent from the S7-1200 program: a physical PLC must receive measured
+// safety, homing and encoder values from its real I/O and must never bootstrap
+// those permits in application logic.
+IF NOT StartupDefaultsApplied THEN
+  IF (Enable = 0) AND (HomedMask = 0) AND (SimulationMode = 0)
+     AND (SafetyOK = 0) AND (DrivesReady = 0)
+     AND (WiringVerified = 0) AND (PhysicalOutputEnable = 0) THEN
+    Enable := 1;
+    HomedMask := 15;
+    SimulationMode := 1;
+    Current1 := 0.0;
+    Current2 := 300.0;
+    Current3 := 60.0;
+    Current4 := 50.0;
+    Captured1 := 0.0;
+    Captured2 := 300.0;
+    Captured3 := 60.0;
+    Captured4 := 50.0;
+    DemoTarget1 := 0.0;
+    DemoTarget2 := 300.0;
+    DemoTarget3 := 60.0;
+    DemoTarget4 := 50.0;
+    AxisTarget2 := 300.0;
+    ManualAxisTarget2 := 300.0;
+  END_IF;
+  StartupDefaultsApplied := TRUE;
+END_IF;
+
 HeartbeatEcho := HeartbeatSequence;
 TemperatureC := INT_TO_REAL(TemperatureCx100) / 100.0;
 HumidityRH := UINT_TO_REAL(HumidityRHx100) / 100.0;
