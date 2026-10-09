@@ -266,7 +266,7 @@ flowchart LR
 | %QW121 | 40122 | Humedad | UINT16, %RH x100 |
 | %QW122 | 40123 | Magnitud giroscopio | UINT16, grados/s x100 |
 | %QW123..126 | 40124..40127 | Age, valid, sequence, quality bits | UINT16 |
-| %QW127 | 40128 | SensorPolicy | 0 condition monitor, 1 motion permit |
+| %QW127 | 40128 | SensorPolicy | 0 AUTO with IoT stillness, 1 AUTO with IoT motion; manual ignores IoT |
 
 Las direcciones de la columna HR usan notacion humana 40001-based. Las tramas utilizan direcciones wire 0-based. La captura ejecuta FC03 sobre wire 90 con 38 registros y conserva request/response hexadecimal y Transaction ID en el JSON.
 
@@ -312,7 +312,7 @@ Cada muestra incluye la trama Modbus TCP FC16 de escritura, la trama FC03 de lec
 const startedAt = new Date();
 await mkdir(outputDirectory, { recursive: true });
 const initial = await capture('preflight');
-if (initial.plc.sensorPolicy !== 1) throw new Error(`Preflight failed: %QW127=${initial.plc.sensorPolicy}. Select Motion permit demo first.`);
+if (initial.plc.sensorPolicy !== 1) throw new Error(`Preflight failed: %QW127=${initial.plc.sensorPolicy}. Select AUTO with IoT motion first.`);
 if (initial.plc.command !== 1) throw new Error(`Preflight failed: %QW90=${initial.plc.command}. Select Auto first.`);
 console.log(`PREFLIGHT PASS | ${initial.iot.source} | sample ${initial.iot.sampleId} | OpenPLC ${host}:${port} | policy=${initial.plc.sensorPolicy} | command=${initial.plc.command}`);
 console.log(`KEEP SENSOR STILL | baseline starts now for ${countdownSeconds}s`);

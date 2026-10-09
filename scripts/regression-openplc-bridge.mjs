@@ -157,7 +157,7 @@ try {
   rejectedReadCount = 0;
   await connector.getByText(/ONLINE.*SCAN ACTIVE/).waitFor({ timeout: 10000 });
   await dashboard.getByRole('button', { name: /^Auto$/ }).click();
-  await dashboard.getByRole('button', { name: /Motion permit/ }).click();
+  await dashboard.getByRole('button', { name: /IoT en movimiento/ }).click();
   await page.waitForFunction(() => document.querySelector('.openplc-command-control')?.textContent?.includes('HR0'));
   if (!writes.some((write) => write.address === 0 && write.words[0] === 1)) throw new Error('Physical PLC AUTO did not write Command=1 to HR0.');
   if (!writes.some((write) => write.address === 20 && write.words[0] === 1)) throw new Error('Physical PLC motion policy did not write SensorPolicy=1 to HR20.');

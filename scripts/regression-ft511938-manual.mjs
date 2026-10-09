@@ -285,6 +285,21 @@ try {
   if (reads < 2) throw new Error(`FT process image was not polled in real time: ${reads} reads.`);
   await page.waitForTimeout(1000);
 
+  const idlePolicyButton = dashboard.getByRole('button', { name: 'Auto · IoT sin movimiento', exact: true });
+  const motionPolicyButton = dashboard.getByRole('button', { name: 'Auto · IoT en movimiento', exact: true });
+  if (!(await idlePolicyButton.isVisible()) || !(await motionPolicyButton.isVisible())) throw new Error(`The two AUTO IoT policies are not visible in the dashboard. Dashboard: ${await dashboard.innerText()}`);
+
+  // Deliberately make the IoT sample invalid. Manual PLC must remain
+  // available because this gate belongs to AUTO only.
+  writeWord(15, 0);
+  writeWord(16, 0);
+  writeWord(17, 65535);
+  writeWord(20, 0);
+  writeWord(24, 0);
+  writeWord(52, 3);
+  writeWord(53, 0);
+  await page.waitForTimeout(350);
+
   const before = await canvasSample(page);
   const manualButton = dashboard.getByRole('button', { name: 'Manual PLC', exact: true });
   if (await manualButton.isDisabled()) throw new Error(`FT manual command button is disabled after connection. Dashboard: ${await dashboard.innerText()}`);
@@ -341,6 +356,7 @@ try {
     heldPosition: positionAfterRelease,
     changedPixels,
     manualHold: true,
+    manualIgnoresInvalidIoT: true,
     feedbackMode: 4,
     processImage: 'HR0..HR60',
   }, null, 2));

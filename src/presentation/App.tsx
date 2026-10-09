@@ -980,8 +980,6 @@ const ft511938MotionPermissionReasons = (config: PlcDashboardState['openPlc']) =
   const reasons: string[] = [];
   if (!config.enabled) reasons.push('endpoint disabled');
   if (!config.online) reasons.push('FC03 offline');
-  if (config.commFresh !== true) reasons.push('CommFresh=0');
-  if (config.sensorOk !== true) reasons.push('SensorOK=0');
   if ((config.homedMask ?? 0) !== 15) reasons.push(`HomedMask=${config.homedMask ?? '--'}`);
   const localSimulation = config.simulationMode === 1 && /^(localhost|127\.0\.0\.1|::1)$/i.test(config.host);
   const physicalPermit = config.wiringVerified === true
@@ -5435,7 +5433,7 @@ export const App = () => {
         await writeCylindrical4IntegratedBlock(14, [encodeCylindrical4IntegratedWord(sensorPolicy)], 'Integrated FB SensorPolicy write');
         const heartbeat = nextCylindrical4IntegratedHeartbeat();
         await writeCylindrical4IntegratedBlock(5, [encodeCylindrical4IntegratedWord(heartbeat)], 'Integrated FB heartbeat renewal');
-        setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, sensorPolicy, heartbeatSequence: heartbeat }, message: sensorPolicy === 1 ? 'Integrated motion-permit policy written to HR14. Use the explicit Auto/Demo control to start.' : 'Integrated condition-monitor policy written to HR14.' }));
+        setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, sensorPolicy, heartbeatSequence: heartbeat }, message: sensorPolicy === 1 ? 'Integrated AUTO policy written to HR14: run while IoT motion is present. Manual control ignores IoT.' : 'Integrated AUTO policy written to HR14: run after two seconds without IoT motion. Manual control ignores IoT.' }));
       } catch (error) {
         const detail = error instanceof Error ? error.message : 'Integrated IoT policy write failed';
         setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, error: detail }, message: detail }));
@@ -5451,7 +5449,7 @@ export const App = () => {
         await writeFt511938Block(ft511938Wire['iot-policy'], [encodeFt511938Word(sensorPolicy)], 'FT511938 SensorPolicy write');
         const heartbeat = nextCylindrical4IntegratedHeartbeat();
         await writeFt511938Block(ft511938Wire['cylindrical-heartbeat'], [encodeFt511938Word(heartbeat)], 'FT511938 heartbeat renewal');
-        setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, sensorPolicy, heartbeatSequence: heartbeat }, message: sensorPolicy === 1 ? 'FT511938 motion-permit policy written. Start Demo remains separately gated by PLC permits.' : 'FT511938 condition-monitor policy written.' }));
+        setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, sensorPolicy, heartbeatSequence: heartbeat }, message: sensorPolicy === 1 ? 'FT511938 AUTO policy written: run while IoT motion is present. Manual control ignores IoT.' : 'FT511938 AUTO policy written: run after two seconds without IoT motion. Manual control ignores IoT.' }));
       } catch (error) {
         const detail = error instanceof Error ? error.message : 'FT511938 IoT policy write failed';
         setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, error: detail }, message: detail }));
@@ -5491,10 +5489,10 @@ export const App = () => {
         platformManualActive: false,
         openPlc: { ...current.openPlc, sensorPolicy, command: 1 },
         message: sensorPolicy === 1
-          ? `Motion permit active: ${config.endpointProfile === 's7-1200-robot-holding' ? 'HR20' : '%QW127'}=1 and AUTO ${config.endpointProfile === 's7-1200-robot-holding' ? `HR${commandWire}` : `%QW${commandWire}`}=1. Move the IoT sensor to release HOLD.`
-          : `Condition monitor active: ${config.endpointProfile === 's7-1200-robot-holding' ? 'HR20' : '%QW127'}=0 and AUTO=1. The robot cycle is independent of IoT motion unless telemetry reaches warning/trip limits.`,
+          ? `AUTO policy active: ${config.endpointProfile === 's7-1200-robot-holding' ? 'HR20' : '%QW127'}=1. Robot moves while IoT motion is present; manual control ignores IoT.`
+          : `AUTO policy active: ${config.endpointProfile === 's7-1200-robot-holding' ? 'HR20' : '%QW127'}=0. Robot moves after two seconds without IoT motion; manual control ignores IoT.`,
       }));
-      setStatus(sensorPolicy === 1 ? 'IoT motion permit armed in AUTO' : 'IoT condition monitor enabled');
+      setStatus(sensorPolicy === 1 ? 'AUTO: move with IoT motion' : 'AUTO: move without IoT motion');
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'IoT policy write failed';
       setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, error: detail }, message: detail }));
@@ -10168,6 +10166,7 @@ const TraceAuditDashboard = ({ node, state, onClose }: { node?: SceneNode; state
   const conditionLabel = conditionLabels[conditionState] ?? 'UNKNOWN';
   const gyroDps = telemetry?.valid && telemetry.hasGyroscope ? telemetry.gyroDps : 0;
   const motionPermit = state.openPlc.sensorPolicy === 1;
+  const autoPolicyLabel = motionPermit ? 'AUTO: IoT motion required' : 'AUTO: IoT stillness required';
   const sensorMoving = gyroDps >= 3;
   const chainLive = Boolean(telemetry?.valid && state.externalBridgeServerOnline && state.openPlc.online && state.openPlc.runtimeRunning !== false);
 
@@ -10217,7 +10216,7 @@ const TraceAuditDashboard = ({ node, state, onClose }: { node?: SceneNode; state
     { wire: '%QW121', hr: '40122', semantic: 'Relative humidity', encoding: 'UINT16, %RH x100', value: telemetry?.hasEnvironment ? `${telemetry.humidityPercent.toFixed(2)} %RH` : '--' },
     { wire: '%QW122', hr: '40123', semantic: 'Gyroscope magnitude', encoding: 'UINT16, deg/s x100', value: `${fixedTrace(gyroDps)} deg/s` },
     { wire: '%QW123..126', hr: '40124..40127', semantic: 'Age, valid, sequence, quality bits', encoding: 'UINT16', value: `${telemetry?.ageMs ?? '--'} ms, ${telemetry?.valid ? 1 : 0}, ${telemetry?.sequence ?? '--'}, ${qualityBits}` },
-    { wire: '%QW127', hr: '40128', semantic: 'SensorPolicy', encoding: '0 condition monitor, 1 motion permit', value: state.openPlc.sensorPolicy ?? '--' },
+    { wire: '%QW127', hr: '40128', semantic: 'AUTO policy: 0 IoT stillness, 1 IoT motion; manual ignores IoT', encoding: 'UINT16', value: state.openPlc.sensorPolicy ?? '--' },
   ];
 
   return (
@@ -10260,7 +10259,7 @@ const TraceAuditDashboard = ({ node, state, onClose }: { node?: SceneNode; state
               <b className={telemetry?.valid ? 'live' : ''}>BLE GATT</b>
               <div className={`trace-stage ${state.externalBridgeServerOnline ? 'live' : 'offline'}`}><span>2</span><strong>IoT Controller</strong><code>age {telemetry?.ageMs ?? '--'} ms</code><small>127.0.0.1:8765</small></div>
               <b className={state.externalBridgeServerOnline ? 'live' : ''}>FC16</b>
-              <div className={`trace-stage ${state.openPlc.online && state.openPlc.runtimeRunning !== false ? 'live' : 'offline'}`}><span>3</span><strong>OpenPLC</strong><code>%QW127 = {state.openPlc.sensorPolicy ?? '--'}</code><small>{state.openPlc.runtimeRunning === false ? 'scan stopped' : motionPermit ? 'motion permit' : 'condition monitor'}</small></div>
+              <div className={`trace-stage ${state.openPlc.online && state.openPlc.runtimeRunning !== false ? 'live' : 'offline'}`}><span>3</span><strong>OpenPLC</strong><code>%QW127 = {state.openPlc.sensorPolicy ?? '--'}</code><small>{state.openPlc.runtimeRunning === false ? 'scan stopped' : autoPolicyLabel}</small></div>
               <b className={state.openPlc.online && state.openPlc.runtimeRunning !== false ? 'live' : ''}>ST logic</b>
               <div className={`trace-stage condition-${conditionState}`}><span>4</span><strong>PLC reaction</strong><code>{conditionLabel}</code><small>alarm {alarmCode} · speed {speedPermille}</small></div>
               <b className={state.frame ? 'live' : ''}>FC03</b>
@@ -10291,7 +10290,7 @@ const TraceAuditDashboard = ({ node, state, onClose }: { node?: SceneNode; state
         {layer === 'plc' && (
           <div className="trace-plc-layer">
             <section className={`trace-plc-decision condition-${conditionState}`}><span>OpenPLC decision</span><strong>{conditionLabel}</strong><code>alarm {alarmCode} · speed {speedPermille} permille</code></section>
-            <div className="trace-rule-list"><div><span>Telemetry valid</span><strong>{telemetry?.valid ? 'PASS' : 'FAIL'}</strong></div><div><span>Gyroscope available</span><strong>{telemetry?.hasGyroscope ? 'PASS' : 'FAIL'}</strong></div><div><span>Motion threshold</span><strong>{sensorMoving ? 'PASS' : 'WAIT'}</strong></div><div><span>Motion permit policy</span><strong>{motionPermit ? 'ACTIVE' : 'OFF'}</strong></div><div><span>Robot command</span><strong>{state.openPlc.command === 1 ? 'AUTO' : state.openPlc.command === 2 ? 'HOME' : 'MANUAL'}</strong></div></div>
+            <div className="trace-rule-list"><div><span>Telemetry valid</span><strong>{telemetry?.valid ? 'PASS' : 'FAIL'}</strong></div><div><span>Gyroscope available</span><strong>{telemetry?.hasGyroscope ? 'PASS' : 'FAIL'}</strong></div><div><span>Motion threshold</span><strong>{sensorMoving ? 'DETECTED' : 'STILL'}</strong></div><div><span>{autoPolicyLabel}</span><strong>{motionPermit ? (sensorMoving ? 'RUN' : 'HOLD') : (sensorMoving ? 'HOLD' : 'RUN')}</strong></div><div><span>Manual IoT influence</span><strong>NONE</strong></div><div><span>Robot command</span><strong>{state.openPlc.command === 1 ? 'AUTO' : state.openPlc.command === 2 ? 'HOME' : 'MANUAL'}</strong></div></div>
             <section className="trace-timeline"><h3>Live evidence window</h3><div>{history.slice(-50).map((sample) => <i key={`${sample.sequence}-${sample.capturedAt}`} className={`condition-${sample.conditionState}`} style={{ height: `${Math.max(8, Math.min(100, sample.gyroDps / Math.max(gyroPeak, 1) * 100))}%` }} title={`seq ${sample.sequence}: ${sample.gyroDps.toFixed(2)} deg/s, state ${sample.conditionState}`} />)}</div></section>
           </div>
         )}
@@ -10702,6 +10701,15 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
                 <code>Target[1..4] [{state.openPlc.integratedTargets?.map((value) => value.toFixed(2)).join(', ') ?? '--'}] · HR38..45</code>
                 <code>CmdQ1..Q8 mask {state.openPlc.cmdQMask === undefined ? '--' : `0x${state.openPlc.cmdQMask.toString(16).padStart(2, '0').toUpperCase()}`} · Run mask {state.openPlc.runMask ?? '--'} · Dir mask {state.openPlc.directionMask ?? '--'}</code>
               </div>
+              <div className={`openplc-iot-reaction condition-${state.openPlc.conditionState ?? 3}`}>
+                <div>
+                  <span>AUTO IoT policy Â· HR14</span>
+                  <strong>{state.openPlc.sensorPolicy === 1 ? 'RUN WITH IoT MOTION' : 'RUN WITH IoT STILLNESS'}</strong>
+                  <code>Manual PLC JOG/GOTO ignores IoT validity, freshness and motion gates.</code>
+                </div>
+                <button type="button" className={state.openPlc.sensorPolicy === 0 ? 'active' : ''} disabled={!state.openPlc.enabled} title="AUTO runs after two seconds without IoT gyro motion. Manual PLC ignores IoT." onClick={() => onOpenPlcSensorPolicy(0)}>Auto · IoT sin movimiento</button>
+                <button type="button" className={state.openPlc.sensorPolicy === 1 ? 'active' : ''} disabled={!state.openPlc.enabled} title="AUTO runs while IoT gyro motion is present. Manual PLC ignores IoT." onClick={() => onOpenPlcSensorPolicy(1)}>Auto · IoT en movimiento</button>
+              </div>
               <div className="ft511938-permissions" aria-label="FT511938 PLC permissions">
                 <code className={state.openPlc.safetyOk ? 'permission-ok' : ''}>SafetyOK {state.openPlc.safetyOk ? '1' : '0'}</code>
                 <code className={state.openPlc.drivesReady ? 'permission-ok' : ''}>DrivesReady {state.openPlc.drivesReady ? '1' : '0'}</code>
@@ -10752,8 +10760,8 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
               <strong>{['NORMAL', 'WARNING / DERATE', 'TRIP / HOLD', 'STALE / HOLD'][state.openPlc.conditionState ?? 3] ?? 'UNKNOWN'}</strong>
               <code>alarm {state.openPlc.alarmCode ?? '--'} · speed {state.openPlc.speedPermille ?? '--'} permille · step {state.openPlc.activeStep ?? '--'}</code>
             </div>
-            <button type="button" className={state.openPlc.sensorPolicy === 0 ? 'active' : ''} disabled={!state.openPlc.enabled} onClick={() => onOpenPlcSensorPolicy(0)}>Condition monitor</button>
-            <button type="button" className={state.openPlc.sensorPolicy === 1 ? 'active' : ''} disabled={!state.openPlc.enabled} title="Writes SensorPolicy=1 and Command=AUTO. Sensor motion releases HOLD; two seconds without motion stops the cycle." onClick={() => onOpenPlcSensorPolicy(1)}>Motion permit + Auto</button>
+            <button type="button" className={state.openPlc.sensorPolicy === 0 ? 'active' : ''} disabled={!state.openPlc.enabled} title="AUTO runs when the IoT gyro has been still for two seconds. Manual PLC ignores this gate." onClick={() => onOpenPlcSensorPolicy(0)}>Auto · IoT sin movimiento</button>
+            <button type="button" className={state.openPlc.sensorPolicy === 1 ? 'active' : ''} disabled={!state.openPlc.enabled} title="AUTO runs while the IoT gyro detects motion. Manual PLC ignores this gate." onClick={() => onOpenPlcSensorPolicy(1)}>Auto · IoT en movimiento</button>
             <code>{state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'HR20' : '%QW127'} = {state.openPlc.sensorPolicy ?? 0}</code>
           </div>}
           {cylindrical4LegacyActive && <div className="openplc-iot-reaction condition-0">
@@ -10770,8 +10778,8 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
               <strong>{['NORMAL', 'DEGRADED', 'CRITICAL / HOLD', 'INVALID / HOLD'][state.openPlc.conditionState ?? 3] ?? 'UNKNOWN'}</strong>
               <code>axis alarm {state.openPlc.alarmCode ?? '--'} · IoT alarm {state.openPlc.ioTAlarmCode ?? '--'} · speed {state.openPlc.speedPermille ?? '--'} · heartbeat {state.openPlc.heartbeatSequence ?? '--'}</code>
             </div>
-            <button type="button" className={state.openPlc.sensorPolicy === 0 ? 'active' : ''} disabled={!state.openPlc.enabled} onClick={() => onOpenPlcSensorPolicy(0)}>Condition monitor</button>
-            <button type="button" className={state.openPlc.sensorPolicy === 1 ? 'active' : ''} disabled={!state.openPlc.enabled} onClick={() => onOpenPlcSensorPolicy(1)}>Motion permit</button>
+            <button type="button" className={state.openPlc.sensorPolicy === 0 ? 'active' : ''} disabled={!state.openPlc.enabled} title="AUTO runs when the IoT gyro has been still for two seconds. Manual PLC ignores this gate." onClick={() => onOpenPlcSensorPolicy(0)}>Auto · IoT sin movimiento</button>
+            <button type="button" className={state.openPlc.sensorPolicy === 1 ? 'active' : ''} disabled={!state.openPlc.enabled} title="AUTO runs while the IoT gyro detects motion. Manual PLC ignores this gate." onClick={() => onOpenPlcSensorPolicy(1)}>Auto · IoT en movimiento</button>
             <code>IoT inputs HR14..20 · feedback HR32..60 · no implicit AUTO start</code>
           </div>}
         </div>

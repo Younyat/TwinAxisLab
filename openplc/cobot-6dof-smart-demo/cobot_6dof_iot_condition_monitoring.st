@@ -20,7 +20,7 @@ VAR
   SensorValid AT %QW124 : UINT := 0;
   SensorSequence AT %QW125 : UINT := 0;
   SensorQualityBits AT %QW126 : UINT := 0;
-  SensorPolicy AT %QW127 : UINT := 1;
+  SensorPolicy AT %QW127 : UINT := 0;
   CycleTimer : TON;
   MotionIdleTimer : TON;
   TimerEnabled : BOOL := FALSE;
@@ -65,7 +65,7 @@ TemperatureC := INT_TO_REAL(TemperatureCx100) / 100.0;
 HumidityRH := UINT_TO_REAL(HumidityRHx100) / 100.0;
 GyroDps := UINT_TO_REAL(GyroDpsx100) / 100.0;
 MotionPresent := GyroDps >= 3.0;
-MotionIdleTimer(IN := (SensorPolicy = 1) AND (NOT MotionPresent), PT := T#2s);
+MotionIdleTimer(IN := NOT MotionPresent, PT := T#2s);
 
 ConditionState := 0;
 AlarmCode := 0;
@@ -77,14 +77,9 @@ IF (SensorValid = 0) OR ((SensorQualityBits AND 1) = 0) OR (SensorAgeMs > 2500) 
   AlarmCode := 4;
   MotionScale := 0.0;
   SpeedPermille := 0;
-ELSIF (SensorPolicy = 1) AND ((SensorQualityBits AND 16) = 0) THEN
+ELSIF ((SensorPolicy = 0) OR (SensorPolicy = 1)) AND ((SensorQualityBits AND 16) = 0) THEN
   ConditionState := 3;
   AlarmCode := 6;
-  MotionScale := 0.0;
-  SpeedPermille := 0;
-ELSIF (SensorPolicy = 1) AND MotionIdleTimer.Q THEN
-  ConditionState := 2;
-  AlarmCode := 5;
   MotionScale := 0.0;
   SpeedPermille := 0;
 ELSIF (TemperatureC >= 55.0) OR (HumidityRH >= 85.0) OR (GyroDps >= 220.0) THEN
@@ -102,6 +97,21 @@ ELSIF (TemperatureC >= 45.0) OR (HumidityRH >= 75.0) OR (GyroDps >= 120.0) THEN
   ConditionState := 1;
   MotionScale := 0.55;
   SpeedPermille := 550;
+ELSIF (SensorPolicy = 0) AND (NOT MotionPresent) AND (NOT MotionIdleTimer.Q) THEN
+  ConditionState := 2;
+  AlarmCode := 5;
+  MotionScale := 0.0;
+  SpeedPermille := 0;
+ELSIF (SensorPolicy = 0) AND MotionPresent THEN
+  ConditionState := 2;
+  AlarmCode := 5;
+  MotionScale := 0.0;
+  SpeedPermille := 0;
+ELSIF (SensorPolicy = 1) AND (NOT MotionPresent) THEN
+  ConditionState := 2;
+  AlarmCode := 5;
+  MotionScale := 0.0;
+  SpeedPermille := 0;
 END_IF;
 
 IF Command = 2 THEN

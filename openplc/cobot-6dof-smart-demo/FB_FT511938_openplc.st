@@ -9,7 +9,8 @@
 // HR0 Cmd: 0 manual hold, 1 demo, 2 home, 3 maintained jog, 4 goto
 // HR1 Enable, HR2 JogAxis, HR3 JogDirection, HR4 JogEnable, HR5 heartbeat
 // HR6..13 ManualTarget[1..4] REAL32, big endian high word first
-// HR14..20 IoT policy, validity, quality, age, temperature, humidity, gyro
+// HR14..20 AUTO IoT policy (0=stillness, 1=motion), validity, quality, age,
+// temperature, humidity, gyro. Manual Cmd=3/4 ignores this gate.
 // HR21..29 PLC permits and diagnostic masks
 // HR30..37 measured position REAL32, HR38..45 active target REAL32
 // HR46..60 status, mode, step, alarms, masks and counters
@@ -94,6 +95,10 @@ VAR
   DonePulse : BOOL := FALSE;
   IoTBlock : BOOL := FALSE;
   IoTDegraded : BOOL := FALSE;
+  PhysicalPermitted : BOOL := FALSE;
+  ManualPermitted : BOOL := FALSE;
+  AutoPermitted : BOOL := FALSE;
+  AutoMotionAllowed : BOOL := FALSE;
   Permitted : BOOL := FALSE;
   MotionPresent : BOOL := FALSE;
   TemperatureC : REAL := 0.0;
@@ -143,7 +148,7 @@ TemperatureC := INT_TO_REAL(TemperatureCx100) / 100.0;
 HumidityRH := UINT_TO_REAL(HumidityRHx100) / 100.0;
 GyroDps := UINT_TO_REAL(GyroDpsx100) / 100.0;
 MotionPresent := GyroDps >= 3.0;
-MotionIdleTimer(IN := (SensorPolicy = 1) AND (NOT MotionPresent), PT := T#2s);
+MotionIdleTimer(IN := NOT MotionPresent, PT := T#2s);
 
 ConditionState := 0;
 IoTAlarmCode := 0;
@@ -154,14 +159,9 @@ IF (SensorValid = 0) OR ((SensorQualityBits AND 1) = 0) OR (SensorAgeMs > 2500) 
   IoTAlarmCode := 4;
   MotionScale := 0.0;
   SpeedPermille := 0;
-ELSIF (SensorPolicy = 1) AND ((SensorQualityBits AND 16) = 0) THEN
+ELSIF ((SensorPolicy = 0) OR (SensorPolicy = 1)) AND ((SensorQualityBits AND 16) = 0) THEN
   ConditionState := 3;
   IoTAlarmCode := 6;
-  MotionScale := 0.0;
-  SpeedPermille := 0;
-ELSIF (SensorPolicy = 1) AND MotionIdleTimer.Q THEN
-  ConditionState := 2;
-  IoTAlarmCode := 5;
   MotionScale := 0.0;
   SpeedPermille := 0;
 ELSIF (TemperatureC >= 55.0) OR (HumidityRH >= 85.0) OR (GyroDps >= 220.0) THEN
@@ -179,15 +179,62 @@ ELSIF (TemperatureC >= 45.0) OR (HumidityRH >= 75.0) OR (GyroDps >= 120.0) THEN
   ConditionState := 1;
   MotionScale := 0.0;
   SpeedPermille := 550;
+ELSIF (SensorPolicy = 0) AND (NOT MotionPresent) AND (NOT MotionIdleTimer.Q) THEN
+  ConditionState := 2;
+  IoTAlarmCode := 5;
+  MotionScale := 0.0;
+  SpeedPermille := 0;
+ELSIF (SensorPolicy = 0) AND MotionPresent THEN
+  ConditionState := 2;
+  IoTAlarmCode := 5;
+  MotionScale := 0.0;
+  SpeedPermille := 0;
+ELSIF (SensorPolicy = 1) AND NOT MotionPresent THEN
+  ConditionState := 2;
+  IoTAlarmCode := 5;
+  MotionScale := 0.0;
+  SpeedPermille := 0;
 END_IF;
 
 IoTBlock := ConditionState >= 2;
 IoTDegraded := ConditionState = 1;
-Permitted := (Enable <> 0) AND (CommFresh <> 0) AND (SensorOK <> 0)
-             AND (HomedMask = 15) AND NOT IoTBlock AND NOT IoTDegraded
-             AND ((SimulationMode <> 0)
-                  OR ((SafetyOK <> 0) AND (DrivesReady <> 0)
-                      AND (WiringVerified <> 0) AND (PhysicalOutputEnable <> 0)));
+PhysicalPermitted := (Enable <> 0) AND (HomedMask = 15)
+                     AND ((SimulationMode <> 0)
+                          OR ((SafetyOK <> 0) AND (DrivesReady <> 0)
+                              AND (WiringVerified <> 0) AND (PhysicalOutputEnable <> 0)));
+
+// Manual control is owned by the operator/platform. IoT validity, freshness,
+// temperature, humidity and gyro motion never revoke a manual JOG or GOTO.
+ManualPermitted := PhysicalPermitted;
+
+// AUTO has two explicit IoT gates. Policy 0 runs only after the sensor has
+// been still for two seconds; policy 1 runs only while sensor motion exists.
+AutoMotionAllowed := FALSE;
+IF SensorPolicy = 0 THEN
+  AutoMotionAllowed := (NOT MotionPresent) AND MotionIdleTimer.Q;
+ELSIF SensorPolicy = 1 THEN
+  AutoMotionAllowed := MotionPresent;
+END_IF;
+
+AutoPermitted := PhysicalPermitted
+                 AND (CommFresh <> 0)
+                 AND (SensorOK <> 0)
+                 AND (SensorValid <> 0)
+                 AND ((SensorQualityBits AND 1) <> 0)
+                 AND ((SensorQualityBits AND 16) <> 0)
+                 AND (SensorAgeMs <= 2500)
+                 AND (NOT IoTBlock)
+                 AND (NOT IoTDegraded)
+                 AND AutoMotionAllowed;
+
+// The active mode selects the permission used by the motion engine. AUTO can
+// remain latched in a safe hold while its IoT gate is false; manual remains
+// independent of the IoT gate.
+IF ModeState = 1 THEN
+  Permitted := AutoPermitted;
+ELSE
+  Permitted := ManualPermitted;
+END_IF;
 
 // 2. Copy current simulated position into the public feedback image.
 Pos1 := Current1;
@@ -233,7 +280,9 @@ ELSIF Cmd = 0 THEN
   ManualTargetError := FALSE;
   LastActiveAxis := 0;
 ELSIF (Cmd = 1) AND (LastCmd <> 1) THEN
-  IF Permitted THEN
+  // Starting AUTO only requires physical authority. Its IoT policy may be
+  // waiting; the cycle remains held and resumes when the gate is satisfied.
+  IF ManualPermitted THEN
     ModeState := 1;
     Step := 1;
     LastActiveAxis := 0;
@@ -248,7 +297,7 @@ ELSIF Cmd = 4 THEN
                  AND (ManualTarget3 >= 0.0) AND (ManualTarget3 <= 180.0)
                  AND (ManualTarget4 >= 12.0) AND (ManualTarget4 <= 70.0);
   ManualTargetError := NOT ManualValid;
-  IF Permitted AND ManualValid THEN
+  IF ManualPermitted AND ManualValid THEN
     // A new plan is started on the first Cmd=4 scan, after Cmd=0, or when
     // any target changes. The current feedback is never replaced by Home.
     IF (LastCmd <> 4) OR (ModeState <> 4)
@@ -277,7 +326,7 @@ ELSIF Cmd = 4 THEN
     Fault := 4;
   END_IF;
 ELSIF (Cmd = 3) AND (LastCmd <> 3) THEN
-  IF Permitted AND (JogAxis >= 1) AND (JogAxis <= 4)
+  IF ManualPermitted AND (JogAxis >= 1) AND (JogAxis <= 4)
      AND ((JogDirection = -1) OR (JogDirection = 1)) THEN
     ModeState := 3;
     Step := 0;
@@ -288,8 +337,17 @@ ELSIF (Cmd = 3) AND (LastCmd <> 3) THEN
 END_IF;
 LastCmd := Cmd;
 
-IF (ModeState <> 0) AND NOT Permitted THEN
-  IF IoTBlock OR IoTDegraded THEN Fault := 8; ELSE Fault := 1; END_IF;
+IF ModeState = 1 THEN
+  Permitted := AutoPermitted;
+ELSE
+  Permitted := ManualPermitted;
+END_IF;
+
+// Only physical authority faults cancel a mode. A temporary IoT gate loss
+// leaves AUTO latched in HOLD so it can resume without a new command edge.
+IF ((ModeState <> 0) AND (ModeState <> 1) AND NOT ManualPermitted)
+   OR ((ModeState = 1) AND NOT ManualPermitted) THEN
+  Fault := 1;
   ModeState := 0;
   Step := 0;
   ManualPhase := 0;
@@ -589,7 +647,9 @@ IF Fault <> 0 THEN
   Status := 3;
 ELSIF DonePulse THEN
   Status := 2;
-ELSIF (ModeState <> 0) AND (AnyMoving OR (ActiveAxis <> 0)) THEN
+ELSIF (ModeState = 1) AND NOT Permitted THEN
+  Status := 3;
+ELSIF (ModeState <> 0) AND Permitted AND (AnyMoving OR (ActiveAxis <> 0)) THEN
   Status := 1;
 ELSE
   Status := 0;
