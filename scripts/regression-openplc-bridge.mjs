@@ -8,6 +8,8 @@ const openPlcPort = Number(process.env.OPENPLC_TEST_MODBUS_PORT ?? 15020);
 const cobotPath = resolve('3d imported models', 'celda_robotica', 'cobot-6dof.glb');
 const values = [1.25, -0.5, 0.75, -1.1, 0.2, 2.4];
 const writes = [];
+const int16Word = (value) => (Math.round(value * 10000) & 0xffff);
+let legacyJointWords = values.map(int16Word);
 let scanElapsedMs = 0;
 let freezePhysicalScanImage = false;
 let rejectedReadCount = 0;
@@ -17,7 +19,6 @@ const floatWords = (value) => {
   buffer.writeFloatBE(value, 0);
   return [buffer.readUInt16BE(0), buffer.readUInt16BE(2)];
 };
-const int16Word = (value) => (Math.round(value * 10000) & 0xffff);
 const signed16 = (word) => (word & 0x8000 ? word - 0x10000 : word);
 const smoothstep = (value) => value * value * (3 - (2 * value));
 const sampleClip = (clip, time) => {
@@ -46,9 +47,11 @@ const modbusServer = net.createServer((socket) => {
       if (!freezePhysicalScanImage) scanElapsedMs = (scanElapsedMs + 250) % 12000;
       const address = request.readUInt16BE(8);
       const quantity = request.readUInt16BE(10);
-      const profile = [1, 1, 3, scanElapsedMs, 0, 0, 1000, 0, 0, 0, ...values.map(int16Word)];
+      // The legacy cobot POU is identified by %QW97=2101. A zero here is
+      // intentionally reserved for a mismatch test, not for this fixture.
+      const profile = [1, 1, 3, scanElapsedMs, 0, 0, 1000, 2101, 0, 0, ...values.map(int16Word)];
       const physicalProfile = [1, 1, 2, scanElapsedMs, 0, 0, 1000, ...values.map(int16Word), 2500, 5000, 500, 100, 1, 4, 17, 1];
-      const words = (address === 0 ? physicalProfile : address === 7 ? values.map(int16Word) : address === 90 ? profile : quantity === 6 ? values.map(int16Word) : values.flatMap(floatWords)).slice(0, quantity);
+      const words = (address === 0 ? physicalProfile : address === 7 ? values.map(int16Word) : address === 90 ? profile : address === 100 ? legacyJointWords : quantity === 6 ? values.map(int16Word) : values.flatMap(floatWords)).slice(0, quantity);
       while (words.length < quantity) words.push(0);
       const pdu = Buffer.from([3, words.length * 2, ...words.flatMap((word) => [word >> 8, word & 0xff])]);
       socket.write(Buffer.concat([Buffer.from([transactionId >> 8, transactionId & 0xff, 0, 0, 0, pdu.length + 1, unitId]), pdu]));
@@ -59,6 +62,7 @@ const modbusServer = net.createServer((socket) => {
       const quantity = functionCode === 6 ? 1 : request.readUInt16BE(10);
       const words = functionCode === 6 ? [request.readUInt16BE(10)] : Array.from({ length: quantity }, (_, index) => request.readUInt16BE(13 + index * 2));
       writes.push({ functionCode, address, words });
+      if (address === 100) legacyJointWords = [...words];
       const pdu = Buffer.from([functionCode, address >> 8, address & 0xff, quantity >> 8, quantity & 0xff]);
       socket.write(Buffer.concat([Buffer.from([transactionId >> 8, transactionId & 0xff, 0, 0, 0, pdu.length + 1, unitId]), pdu]));
     }
@@ -98,6 +102,7 @@ try {
   const connector = dashboard.locator('.openplc-connector');
   await connector.locator('label').filter({ hasText: 'IP / host' }).locator('input').fill('127.0.0.1');
   await connector.locator('label').filter({ hasText: 'Port' }).locator('input').fill(String(openPlcPort));
+  await connector.locator('label').filter({ hasText: 'Port' }).locator('input').fill(String(openPlcPort));
   await connector.locator('label').filter({ hasText: 'Unit ID' }).locator('input').fill('1');
   await connector.locator('label').filter({ hasText: 'HR start' }).locator('input').fill('100');
   await connector.locator('label').filter({ hasText: 'Data' }).locator('select').selectOption('float32-be');
@@ -114,6 +119,22 @@ try {
   page.once('dialog', (dialog) => void dialog.accept());
   await dashboard.getByRole('button', { name: /Manual PLC|Local Manual/ }).click();
   await page.waitForFunction(() => document.querySelectorAll('.plc-register-control input:not([disabled])').length >= 6, undefined, { timeout: 10000 });
+  const twinJoint = await page.evaluate(() => {
+    const documentState = window.__assetForgeDocument;
+    const node = documentState?.nodes?.find((candidate) => candidate.geometry?.kinematicGraph?.joints?.some((joint) => joint.type !== 'fixed'));
+    const joint = node?.geometry?.kinematicGraph?.joints?.find((candidate) => candidate.type !== 'fixed');
+    return node && joint ? { nodeId: node.id, jointId: joint.id, value: (node.geometry.kinematicState?.jointValues?.[joint.id] ?? 0) + 0.1 } : undefined;
+  });
+  if (!twinJoint) throw new Error('No graph joint was available for the OpenPLC twin-to-PLC test.');
+  await page.evaluate(({ nodeId, jointId, value }) => {
+    window.__assetForgeSetKinematicJointValues?.(nodeId, { [jointId]: value });
+  }, twinJoint);
+  const bidirectionalDeadline = Date.now() + 5000;
+  while (Date.now() < bidirectionalDeadline && !writes.some((write) => write.address === 100 && write.words.length >= 2)) {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+  }
+  if (!writes.some((write) => write.address === 90 && write.words[0] === 0)) throw new Error('OpenPLC twin-to-PLC manual HOLD write was not observed.');
+  if (!writes.some((write) => write.address === 100 && write.words.length >= 2)) throw new Error('OpenPLC twin-to-PLC joint vector write was not observed.');
   await controls.nth(0).fill('2.1');
   if (Math.abs(Number(await controls.nth(0).inputValue()) - 2.1) > 0.011) throw new Error('Local Manual did not accept the J1 command.');
 
@@ -136,6 +157,7 @@ try {
   await dashboard.getByRole('button', { name: 'Disconnect OpenPLC' }).click();
   await connector.locator('label').filter({ hasText: 'PLC profile' }).locator('select').selectOption('s7-1200-robot-holding');
   await connector.locator('label').filter({ hasText: 'IP / host' }).locator('input').fill('127.0.0.1');
+  await connector.locator('label').filter({ hasText: 'Port' }).locator('input').fill(String(openPlcPort));
   if (await connector.locator('label').filter({ hasText: 'HR start' }).locator('input').inputValue() !== '0') throw new Error('Physical PLC profile did not select process image HR0..20.');
   page.once('dialog', (dialog) => dialog.accept());
   await connector.getByRole('button', { name: 'Auto Detect Map' }).click();

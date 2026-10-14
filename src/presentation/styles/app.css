@@ -1174,6 +1174,15 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
+  .plc-twin-split {
+    grid-auto-rows: minmax(calc(var(--plc-mirror-height, 330px) + 92px), auto);
+    align-items: start;
+  }
+
+  .plc-robot-screen {
+    min-height: calc(var(--plc-mirror-height, 330px) + 92px);
+  }
+
   .plc-dashboard-head {
     display: grid;
   }
@@ -4388,6 +4397,14 @@ html,
     border-bottom: 0;
     border-left: 0;
     border-radius: 0;
+  }
+
+  .plc-twin-split {
+    grid-auto-rows: minmax(calc(var(--plc-mirror-height, 330px) + 200px), auto);
+  }
+
+  .plc-robot-screen {
+    min-height: calc(var(--plc-mirror-height, 330px) + 200px);
   }
 
   .plc-flow,

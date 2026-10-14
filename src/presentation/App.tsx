@@ -1,5 +1,6 @@
 import { ChangeEvent, type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
+import { diagnoseFtImage, compareFtWrite, ftWriteAllowed } from '../application/twin/ft511938Diagnostics';
 import {
   ArrowDown,
   ArrowUp,
@@ -133,9 +134,23 @@ import {
   encodeFt511938Command,
   encodeFt511938Float32,
   encodeFt511938Word,
+  ft511938GraphPoseFromTargets,
   ft511938PoseForGraph,
   ft511938SnapshotSummary,
+  ft511938TargetsFromGraphPose,
 } from '../application/twin/ft511938PlcContract';
+import {
+  bidirectionalPermissionReasons,
+  buildManualPoseWritePlan,
+  clonePoseValues,
+  diagnosticForPlan,
+  graphValuesToFourAxisTargets,
+  mergeGraphJointValues,
+  summarizeVerification,
+  verifyFourAxisTargetReadback,
+  verifyLegacyTargetReadback,
+  type BidirectionalPose,
+} from '../application/twin/plcBidirectionalControl';
 import {
   createVirtualPlcRuntime,
   executeVirtualPlcScan,
@@ -478,37 +493,25 @@ const orderedPlcJoints = (graph: KinematicGraph) => graph.joints
   .filter((joint) => joint.type !== 'fixed')
   .sort((left, right) => plcJointOrder(left) - plcJointOrder(right) || left.name.localeCompare(right.name));
 
+const ft511938TargetIndexForJoint = (joint: KinematicJoint): 0 | 1 | 2 | 3 | undefined => {
+  const descriptor = `${joint.name} ${joint.evidence.map((item) => item.metadata?.order ?? '').join(' ')}`.toLowerCase();
+  if (/finger|gripper|pinza/.test(descriptor)) return 3;
+  if (/\bj1\b|base.*rot|rot.*base|giro/.test(descriptor)) return 0;
+  if (/\bj2\b|vertical|altura|lift/.test(descriptor)) return 1;
+  if (/\bj3\b|avance|viga|extension|linear/.test(descriptor)) return 2;
+  return undefined;
+};
+
 const ft511938TargetsFromGraphValues = (
   graph: KinematicGraph,
   base: [number, number, number, number],
   values: Record<string, number>,
-) => {
-  const target = [...base] as [number, number, number, number];
-  let mapped = false;
-  const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
-  for (const joint of graph.joints.filter((candidate) => candidate.type !== 'fixed')) {
-    const value = values[joint.id];
-    if (!Number.isFinite(value)) continue;
-    const descriptor = `${joint.name} ${joint.evidence.map((item) => item.metadata?.order ?? '').join(' ')}`.toLowerCase();
-    if (/finger|gripper|pinza/.test(descriptor)) {
-      const lower = joint.limits?.lower ?? -0.65;
-      const upper = joint.limits?.upper ?? 0.65;
-      const span = Math.max(Math.abs(lower), Math.abs(upper), 0.001);
-      target[3] = clamp(12 + (Math.abs(value) / span) * 58, 12, 70);
-      mapped = true;
-    } else if (/\bj1\b|base.*rot|rot.*base|giro/.test(descriptor)) {
-      target[0] = clamp(value * 180 / Math.PI, -171, 171);
-      mapped = true;
-    } else if (/\bj2\b|vertical|altura|lift/.test(descriptor)) {
-      target[1] = clamp(value * 1000, 130, 360);
-      mapped = true;
-    } else if (/\bj3\b|avance|viga|extension|linear/.test(descriptor)) {
-      target[2] = clamp(value * 1000, 0, 180);
-      mapped = true;
-    }
-  }
-  return mapped ? target : undefined;
-};
+) => ft511938TargetsFromGraphPose(graph, base, values);
+
+const ft511938GraphValuesFromTargets = (
+  graph: KinematicGraph,
+  targets: [number, number, number, number],
+) => ft511938GraphPoseFromTargets(graph, targets);
 
 type KinematicSceneGeometry = ImportedModelGeometry | Extract<GeometryDefinition, { kind: 'serialized-object' }> | Extract<GeometryDefinition, { generatorId: string }>;
 
@@ -925,7 +928,7 @@ type PlcDashboardState = {
     forwardedAt?: string;
   };
   openPlc: {
-    endpointProfile: 'openplc' | 's7-1200-robot-holding' | typeof CYLINDRICAL4_ENDPOINT_PROFILE | typeof CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE | typeof FT511938_ENDPOINT_PROFILE;
+    endpointProfile: 'openplc' | 's7-1200-robot-holding' | typeof CYLINDRICAL4_ENDPOINT_PROFILE | typeof CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE | typeof FT511938_ENDPOINT_PROFILE | 'openplc-ft511938';
     autoReconnect: boolean;
     connectionAuthorized: boolean;
     controlledNodeId?: string;
@@ -968,6 +971,8 @@ type PlcDashboardState = {
     wiringVerified?: boolean;
     physicalOutputEnable?: boolean;
     simulationMode?: number;
+    /** HR59 in the FT adapter. This is a scan-executed diagnostic, not a safety permit. */
+    startupReady?: boolean;
     cmdQMask?: number;
     rawRegisters?: number[];
     diagnostics?: string;
@@ -976,12 +981,28 @@ type PlcDashboardState = {
   };
 };
 
+const isFtProfile = (profile: unknown) => profile === FT511938_ENDPOINT_PROFILE || profile === 'openplc-ft511938';
+
 const ft511938MotionPermissionReasons = (config: PlcDashboardState['openPlc']) => {
   const reasons: string[] = [];
+  if (config.endpointProfile === 'openplc-ft511938' && config.simulationMode !== 1) {
+    reasons.push('OpenPLC simulation profile requires HR58=1; select the physical profile for a real PLC.');
+  }
+  if (config.endpointProfile === FT511938_ENDPOINT_PROFILE && config.simulationMode !== 0) {
+    reasons.push('Physical S7 profile requires HR58=0; simulation cannot grant physical authority.');
+  }
   if (!config.enabled) reasons.push('endpoint disabled');
   if (!config.online) reasons.push('FC03 offline');
+  if (config.runtimeRunning === false) reasons.push(config.startupReady === false
+    ? 'POU scan stopped (HR59 StartupReady=0)'
+    : config.runtimeIssue ?? 'PLC runtime feedback is invalid or its scan is not advancing');
+  if (isFtProfile(config.endpointProfile)
+      && config.runtimeRunning !== false
+      && config.runtimeIssue) {
+    reasons.push(`feedback contract invalid (${config.runtimeIssue})`);
+  }
   if ((config.homedMask ?? 0) !== 15) reasons.push(`HomedMask=${config.homedMask ?? '--'}`);
-  const localSimulation = config.simulationMode === 1 && /^(localhost|127\.0\.0\.1|::1)$/i.test(config.host);
+  const localSimulation = config.endpointProfile === 'openplc-ft511938' && config.simulationMode === 1 && /^(localhost|127\.0\.0\.1|::1)$/i.test(config.host);
   const physicalPermit = config.wiringVerified === true
     && config.physicalOutputEnable === true
     && config.safetyOk === true
@@ -994,6 +1015,30 @@ const ft511938MotionPermissionReasons = (config: PlcDashboardState['openPlc']) =
 
 const isFt511938MotionPermitted = (config: PlcDashboardState['openPlc']) =>
   ft511938MotionPermissionReasons(config).length === 0;
+
+// Manual authority is a HOLD ownership decision, not a motion permission.
+// It remains available while the PLC scans even if its feedback image is
+// uninitialized. JOG/GOTO keep the stricter motion permission below.
+const ft511938ManualAuthorityPermissionReasons = (config: PlcDashboardState['openPlc']) => {
+  const reasons: string[] = [];
+  if (!config.enabled) reasons.push('endpoint disabled');
+  if (!config.online) reasons.push('FC03 offline');
+  // Cmd=0 is a non-moving HOLD command. Homing, limits, feedback plausibility
+  // runtime state and physical output permits are evaluated by the motion
+  // permission used by JOG/GOTO, never by entry into Manual/HOLD.
+  return reasons;
+};
+
+const isFt511938ManualAuthorityPermitted = (config: PlcDashboardState['openPlc']) =>
+  ft511938ManualAuthorityPermissionReasons(config).length === 0;
+
+const ft511938SafeEditorTargets: [number, number, number, number] = [0, 300, 60, 50];
+
+const ft511938TargetVectorIsValid = (values: [number, number, number, number]) =>
+  Number.isFinite(values[0]) && values[0] >= -173 && values[0] <= 173
+  && Number.isFinite(values[1]) && values[1] >= 128 && values[1] <= 362
+  && Number.isFinite(values[2]) && values[2] >= -2 && values[2] <= 182
+  && Number.isFinite(values[3]) && values[3] >= 10 && values[3] <= 72;
 
 type RegisterEncoding = 'uint16' | 'int16' | 'int16-rad-x10000' | 'float32-be';
 type RegisterAccess = 'platform-to-plc' | 'plc-to-platform' | 'read-write';
@@ -1031,7 +1076,7 @@ const loadPlcEndpoint = (): Partial<PersistedPlcEndpoint> => {
   try {
     const parsed = JSON.parse(window.localStorage.getItem(PLC_ENDPOINT_KEY) ?? '{}') as Partial<PersistedPlcEndpoint>;
     if (!parsed || typeof parsed !== 'object') return {};
-    if (parsed.endpointProfile !== 'openplc' && parsed.endpointProfile !== 's7-1200-robot-holding' && parsed.endpointProfile !== CYLINDRICAL4_ENDPOINT_PROFILE && parsed.endpointProfile !== CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE && parsed.endpointProfile !== FT511938_ENDPOINT_PROFILE) return {};
+    if (parsed.endpointProfile !== 'openplc' && parsed.endpointProfile !== 's7-1200-robot-holding' && parsed.endpointProfile !== CYLINDRICAL4_ENDPOINT_PROFILE && parsed.endpointProfile !== CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE && !isFtProfile(parsed.endpointProfile)) return {};
     return parsed;
   } catch {
     return {};
@@ -1068,7 +1113,7 @@ const assessFt511938AdapterImage = (words: number[]): Ft511938Detection => {
   if (!inRange(unsigned(5), 0, 65535)) reasons.push(`HeartbeatSequence=${unsigned(5)} outside UINT range`);
   if (!inRange(signed(46), 0, 3)) reasons.push(`Status=${signed(46)} outside 0..3`);
   if (![0, 1, 3, 4].includes(signed(47))) reasons.push(`ActiveMode=${signed(47)} outside 0,1,3,4`);
-  if (!inRange(signed(48), 0, 9)) reasons.push(`ActiveStep=${signed(48)} outside 0..9`);
+  if (!inRange(signed(48), 0, 16)) reasons.push(`ActiveStep=${signed(48)} outside 0..16`);
   if (!inRange(signed(49), 0, 10)) reasons.push(`AlarmCode=${signed(49)} outside 0..10`);
   if (!inRange(unsigned(52), 0, 3)) reasons.push(`ConditionState=${unsigned(52)} outside 0..3`);
   if (![0, 550, 1000].includes(unsigned(53))) reasons.push(`SpeedPermille=${unsigned(53)} outside 0,550,1000`);
@@ -1089,7 +1134,7 @@ const assessFt511938AdapterImage = (words: number[]): Ft511938Detection => {
   if (unsigned(25) > 15) reasons.push(`HomedMask=${unsigned(25)} outside four-axis mask`);
   if (unsigned(26) > 15) reasons.push(`MinLimitMask=${unsigned(26)} outside four-axis mask`);
   if (unsigned(27) > 15) reasons.push(`MaxLimitMask=${unsigned(27)} outside four-axis mask`);
-  if (unsigned(59) !== 0) reasons.push(`Reserved HR59=${unsigned(59)} is not zero`);
+  if (!inRange(unsigned(59), 0, 1)) reasons.push(`StartupReady=${unsigned(59)} is not a boolean word`);
   if (snapshot.manualTargets.length !== 4) reasons.push(`ManualTarget vector length=${snapshot.manualTargets.length}, expected 4`);
   if (snapshot.positions.length !== 4) reasons.push(`Position vector length=${snapshot.positions.length}, expected 4`);
   if (snapshot.targets.length !== 4) reasons.push(`Target vector length=${snapshot.targets.length}, expected 4`);
@@ -1100,6 +1145,7 @@ const assessFt511938AdapterImage = (words: number[]): Ft511938Detection => {
   if (unsigned(25) === 15) identityEvidence.push('HomedMask=15');
   if (hasMeasuredReal32Evidence) identityEvidence.push('HR30..45 contains measured REAL32 data');
   if (unsigned(58) === 1) identityEvidence.push('SimulationMode=1');
+  if (unsigned(59) === 1) identityEvidence.push('StartupReady=1');
   if (unsigned(60) !== 0) identityEvidence.push(`DoneCounter=${unsigned(60)}`);
   if (hasManualTargetEvidence) identityEvidence.push('HR6..13 contains valid manual REAL32 targets');
   const hasFtIdentityEvidence = identityEvidence.length > 0;
@@ -1341,6 +1387,13 @@ export const App = () => {
   const ft511938ManualTargetPendingRef = useRef<[number, number, number, number]>();
   const ft511938ManualTargetTimerRef = useRef<number | undefined>();
   const ft511938ManualTargetWriteInFlightRef = useRef(false);
+  const ft511938ManualTargetAwaitingAckRef = useRef<{
+    targets: [number, number, number, number];
+    expiresAt: number;
+  }>();
+  const bidirectionalManualPendingRef = useRef<{ nodeId: string; graph: KinematicGraph; values: Record<string, number> }>();
+  const bidirectionalManualTimerRef = useRef<number | undefined>();
+  const bidirectionalManualWriteInFlightRef = useRef(false);
   const physicalPlcJogOriginRef = useRef<number[]>();
   const plcTimingRef = useRef<{ lastSuccessAt?: number; lastJoints?: number[]; lastStep?: number; lastStatus?: number; lastCondition?: number; sampleCount: number }>({ sampleCount: 0 });
   const [physicalPlcDemoActive, setPhysicalPlcDemoActive] = useState(false);
@@ -1376,6 +1429,19 @@ export const App = () => {
         externalPlcPoseTimerRef.current = undefined;
       }
     }, 16);
+  }, []);
+
+  // External feedback must never keep writing after the transport is released.
+  // Otherwise a stale PLC pose can overwrite a new local-manual pose on the
+  // next render and make the robot appear to jump back to its initial state.
+  const clearExternalPlcPose = useCallback(() => {
+    externalPlcTargetPoseRef.current = undefined;
+    externalPlcPoseRef.current = undefined;
+    if (externalPlcPoseTimerRef.current !== undefined) {
+      window.clearInterval(externalPlcPoseTimerRef.current);
+      externalPlcPoseTimerRef.current = undefined;
+    }
+    setExternalPlcRuntimePose(undefined);
   }, []);
 
   const toggleHistorianRecording = useCallback(() => {
@@ -3813,16 +3879,27 @@ export const App = () => {
 
   const setKinematicJointValueForNode = (nodeId: string, jointId: string, value: number) => {
     const plc = plcDashboardRef.current;
-    if (plc.platformManualActive && plc.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE && plc.openPlc.enabled && plc.openPlc.online) {
-      const controlledNode = assetDocumentRef.current.nodes.find((candidate) => candidate.id === nodeId);
-      const graph = controlledNode ? graphFromGeometry(controlledNode.geometry) : undefined;
-      const currentValues = controlledNode && graph && kinematicGeometryWithGraph(controlledNode.geometry)
-        ? controlledNode.geometry.kinematicState?.jointValues ?? createHomeKinematicState(graph).jointValues
-        : {};
-      const targets = graph
-        ? ft511938TargetsFromGraphValues(graph, plc.openPlc.integratedTargets ?? plc.openPlc.integratedPositions ?? [0, 300, 60, 50], { ...currentValues, [jointId]: value })
-        : undefined;
-      if (targets) scheduleFt511938ManualTarget(targets);
+    const controlledNode = assetDocumentRef.current.nodes.find((candidate) => candidate.id === nodeId);
+    const graph = controlledNode ? graphFromGeometry(controlledNode.geometry) : undefined;
+    let ftManualTargetScheduled = false;
+    const currentValues = controlledNode && graph && kinematicGeometryWithGraph(controlledNode.geometry)
+      ? controlledNode.geometry.kinematicState?.jointValues ?? createHomeKinematicState(graph).jointValues
+      : {};
+    if (plc.platformManualActive && graph && plc.openPlc.enabled && plc.openPlc.online) {
+      const requestedValues = { ...currentValues, [jointId]: value };
+      if (isFtProfile(plc.openPlc.endpointProfile)) {
+        const targets = ft511938TargetsFromGraphValues(graph, plc.openPlc.integratedTargets ?? plc.openPlc.integratedPositions ?? [0, 300, 60, 50], requestedValues);
+        if (targets) {
+          ftManualTargetScheduled = true;
+          scheduleFt511938ManualTarget(targets);
+        }
+      } else {
+        scheduleBidirectionalManualPose(nodeId, graph, requestedValues);
+      }
+    }
+    if (ftManualTargetScheduled) {
+      setStatus('FT511938 target queued; waiting for measured PLC feedback');
+      return;
     }
     setDemoMotionNodeId((current) => (current === nodeId ? undefined : current));
     setDocument((current) =>
@@ -3849,14 +3926,21 @@ export const App = () => {
 
   const setKinematicJointValuesForNode = useCallback((nodeId: string, values: Record<string, number>) => {
     const plc = plcDashboardRef.current;
-    if (plc.platformManualActive && plc.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE && plc.openPlc.enabled && plc.openPlc.online) {
-      const controlledNode = assetDocumentRef.current.nodes.find((candidate) => candidate.id === nodeId);
-      const graph = controlledNode ? graphFromGeometry(controlledNode.geometry) : undefined;
-      const targets = graph
-        ? ft511938TargetsFromGraphValues(graph, plc.openPlc.integratedTargets ?? plc.openPlc.integratedPositions ?? [0, 300, 60, 50], values)
-        : undefined;
-      if (targets) scheduleFt511938ManualTarget(targets);
+    const controlledNode = assetDocumentRef.current.nodes.find((candidate) => candidate.id === nodeId);
+    const graph = controlledNode ? graphFromGeometry(controlledNode.geometry) : undefined;
+    let ftManualTargetScheduled = false;
+    if (plc.platformManualActive && graph && plc.openPlc.enabled && plc.openPlc.online) {
+      if (isFtProfile(plc.openPlc.endpointProfile)) {
+        const targets = ft511938TargetsFromGraphValues(graph, plc.openPlc.integratedTargets ?? plc.openPlc.integratedPositions ?? [0, 300, 60, 50], values);
+        if (targets) {
+          ftManualTargetScheduled = true;
+          scheduleFt511938ManualTarget(targets);
+        }
+      } else {
+        scheduleBidirectionalManualPose(nodeId, graph, values);
+      }
     }
+    if (ftManualTargetScheduled) return;
     setDemoMotionNodeId((current) => (current === nodeId ? undefined : current));
     setDocument((current) =>
       touch({
@@ -4100,9 +4184,9 @@ export const App = () => {
 
   useEffect(() => {
     if (!plcDashboard.openPlc.enabled && !plcDashboard.externalBridgeEnabled) {
-      setExternalPlcRuntimePose(undefined);
+      clearExternalPlcPose();
     }
-  }, [plcDashboard.openPlc.enabled, plcDashboard.externalBridgeEnabled]);
+  }, [clearExternalPlcPose, plcDashboard.openPlc.enabled, plcDashboard.externalBridgeEnabled]);
 
   const startPlcDashboard = () => {
     if (!selectedKinematicNode) {
@@ -4363,7 +4447,7 @@ export const App = () => {
   };
 
   const configuredPlcWire = (config: PlcDashboardState['openPlc'], id: string, fallback: number) =>
-    config.endpointProfile === FT511938_ENDPOINT_PROFILE
+    isFtProfile(config.endpointProfile)
       ? config.address + (ft511938Wire[id] ?? fallback)
       : config.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE
       ? config.address + (cylindrical4IntegratedWire[id] ?? fallback)
@@ -4373,25 +4457,32 @@ export const App = () => {
       ? physicalPlcWire[id] ?? fallback
       : documentedOpenPlcWire[id] ?? fallback;
 
+  const endpointSettingsRef = useRef<Record<string, Partial<{ host: string; port: number; unitId: number; pollMs: number }>>>((() => { try { return JSON.parse(localStorage.getItem('twinaxis-plc-profile-endpoints-v1') ?? '{}'); } catch { return {}; } })());
   const updateOpenPlcConfig = (field: 'endpointProfile' | 'host' | 'port' | 'unitId' | 'address' | 'pollMs' | 'dataFormat' | 'autoReconnect', value: string | number | boolean) => {
-    setPlcDashboard((current) => ({
+    setPlcDashboard((current) => {
+      if (field === 'endpointProfile') endpointSettingsRef.current[current.openPlc.endpointProfile] = { host: current.openPlc.host, port: current.openPlc.port, unitId: current.openPlc.unitId, pollMs: current.openPlc.pollMs };
+      try { localStorage.setItem('twinaxis-plc-profile-endpoints-v1', JSON.stringify(endpointSettingsRef.current)); } catch { /* Storage may be disabled. */ }
+      return ({
       ...current,
+      platformManualActive: field === 'endpointProfile' ? false : current.platformManualActive,
+      localManualActive: field === 'endpointProfile' ? false : current.localManualActive,
       openPlc: {
         ...current.openPlc,
         [field]: field === 'autoReconnect' ? Boolean(value) : field === 'host' || field === 'dataFormat' || field === 'endpointProfile' ? String(value) : Number(value),
         ...(field === 'endpointProfile' ? {
-          address: value === 's7-1200-robot-holding' || value === CYLINDRICAL4_ENDPOINT_PROFILE || value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE || value === FT511938_ENDPOINT_PROFILE ? 0 : 100,
-          // Keep a local OpenPLC host when switching to the FT adapter. The
-          // FT POU is a separate process image and must not be redirected to
-          // the physical S7-1200 just because its profile is selected.
-          host: value === FT511938_ENDPOINT_PROFILE
-            ? current.openPlc.host
+          address: value === 's7-1200-robot-holding' || value === CYLINDRICAL4_ENDPOINT_PROFILE || value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE || isFtProfile(value) ? 0 : 100,
+          // Controller selection never infers a different implementation from data.
+          host: isFtProfile(value)
+            ? (value === 'openplc-ft511938' ? '127.0.0.1' : '192.168.0.20')
             : value === 's7-1200-robot-holding' || value === CYLINDRICAL4_ENDPOINT_PROFILE || value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE
               ? (current.openPlc.host === '127.0.0.1' ? '192.168.0.20' : current.openPlc.host)
               : (current.openPlc.host === '192.168.0.20' ? '127.0.0.1' : current.openPlc.host),
-          quantity: value === FT511938_ENDPOINT_PROFILE ? FT511938_HR_COUNT : value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE ? CYLINDRICAL4_INTEGRATED_HR_COUNT : value === CYLINDRICAL4_ENDPOINT_PROFILE ? CYLINDRICAL4_FB_HR_COUNT : 6,
-          dataFormat: value === FT511938_ENDPOINT_PROFILE ? 'ft511938-unified' as const : value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE ? 'cylindrical4-integrated' as const : value === CYLINDRICAL4_ENDPOINT_PROFILE ? 'cylindrical4-rpp' as const : 'int16-rad-x10000' as const,
-          connectionAuthorized: false,
+          quantity: isFtProfile(value) ? FT511938_HR_COUNT : value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE ? CYLINDRICAL4_INTEGRATED_HR_COUNT : value === CYLINDRICAL4_ENDPOINT_PROFILE ? CYLINDRICAL4_FB_HR_COUNT : 6,
+          dataFormat: isFtProfile(value) ? 'ft511938-unified' as const : value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE ? 'cylindrical4-integrated' as const : value === CYLINDRICAL4_ENDPOINT_PROFILE ? 'cylindrical4-rpp' as const : 'int16-rad-x10000' as const,
+          port: 502,
+          unitId: 1,
+          ...(endpointSettingsRef.current[String(value)] ?? {}),
+          enabled: false, connectionAuthorized: false,
           autoReconnect: false,
           online: false,
           runtimeRunning: undefined,
@@ -4402,33 +4493,37 @@ export const App = () => {
             ? 'S7-1200 RobotHolding selected: HR0..20, joints HR7..12.'
             : value === CYLINDRICAL4_ENDPOINT_PROFILE
               ? 'Cylindrical4 FB selected: adapter image HR0..22, measured axes HR15..18.'
-            : value === FT511938_ENDPOINT_PROFILE
-              ? 'FT511938 unified adapter selected: proposed HR0..60 image; wiring permissions remain PLC-owned.'
+            : isFtProfile(value)
+              ? 'FT511938 unified controller selected: HR0..60 process image; wiring permissions remain PLC-owned.'
             : value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE
                 ? 'Cylindrical4 Integrated IoT selected: HR0..20 command/IoT and HR32..60 feedback.'
             : 'OpenPLC %QW profile selected: control %QW90..96, joints %QW100..105.',
         } : {}),
-        quantity: field === 'dataFormat'
+        quantity: field === 'endpointProfile' ? (isFtProfile(value) ? FT511938_HR_COUNT : value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE ? CYLINDRICAL4_INTEGRATED_HR_COUNT : value === CYLINDRICAL4_ENDPOINT_PROFILE ? CYLINDRICAL4_FB_HR_COUNT : 6) : field === 'dataFormat'
           ? value === 'ft511938-unified' ? FT511938_HR_COUNT : value === 'cylindrical4-integrated' ? CYLINDRICAL4_INTEGRATED_HR_COUNT : value === 'cylindrical4-rpp' ? CYLINDRICAL4_FB_HR_COUNT : value === 'int16-rad-x10000' ? 6 : 12
           : current.openPlc.quantity,
         error: undefined,
       },
-    }));
+    });
+    });
   };
 
   const toggleOpenPlc = () => {
+    // Drop the last external pose before changing authority. The next local
+    // or PLC frame must be the only source allowed to update the viewport.
+    clearExternalPlcPose();
     setPlcDashboard((current) => {
       const enabled = !current.openPlc.enabled;
       let connectionAuthorized = current.openPlc.connectionAuthorized;
-      const realEndpoint = current.openPlc.endpointProfile === 's7-1200-robot-holding' || current.openPlc.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE || current.openPlc.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE || current.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE;
+      const realEndpoint = current.openPlc.endpointProfile === 's7-1200-robot-holding' || current.openPlc.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE || current.openPlc.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE || isFtProfile(current.openPlc.endpointProfile);
       if (enabled && realEndpoint && !connectionAuthorized) {
-        const contract = current.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE ? 'FT511938 proposed adapter image HR0..60' : current.openPlc.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE ? 'Cylindrical4 Integrated IoT process image HR0..60' : current.openPlc.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE ? 'Cylindrical4 FB adapter registers HR0..22' : 'RobotHolding registers HR0..20';
+        const contract = isFtProfile(current.openPlc.endpointProfile) ? 'FT511938 process image HR0..60' : current.openPlc.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE ? 'Cylindrical4 Integrated IoT process image HR0..60' : current.openPlc.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE ? 'Cylindrical4 FB adapter registers HR0..22' : 'RobotHolding registers HR0..20';
         const confirmed = window.confirm(`Connect to physical PLC ${current.openPlc.host}:${current.openPlc.port} Unit ${current.openPlc.unitId}?\n\nTwinAxis will read and may write the selected ${contract}.`);
         if (!confirmed) return current;
         connectionAuthorized = true;
       }
       if (enabled) plcBridgeDisconnectLockRef.current = true;
-      const endpointName = current.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE
+      const endpointName = isFtProfile(current.openPlc.endpointProfile)
         ? 'physical FT511938 PLC'
         : current.openPlc.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE
         ? 'physical Cylindrical4 Integrated IoT PLC'
@@ -4452,9 +4547,9 @@ export const App = () => {
     const physical = config.endpointProfile === 's7-1200-robot-holding';
     const cylindrical4 = config.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE;
     const cylindrical4Integrated = config.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE;
-    const ft511938 = config.endpointProfile === FT511938_ENDPOINT_PROFILE;
+    const ft511938 = isFtProfile(config.endpointProfile);
     const realIntegratedEndpoint = physical || cylindrical4 || cylindrical4Integrated || ft511938;
-    setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: true, error: undefined, diagnostics: physical ? 'Reading S7-1200 RobotHolding HR0..20...' : cylindrical4 ? `Reading Cylindrical4 FB adapter HR${config.address}..HR${config.address + CYLINDRICAL4_FB_HR_COUNT - 1}...` : cylindrical4Integrated ? `Reading Cylindrical4 Integrated IoT process image HR${config.address}..HR${config.address + CYLINDRICAL4_INTEGRATED_HR_COUNT - 1}...` : ft511938 ? `Reading proposed FT511938 adapter image HR${config.address}..HR${config.address + FT511938_HR_COUNT - 1}...` : 'Scanning ports, Unit IDs and %QW registers...' } }));
+    setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: true, error: undefined, diagnostics: physical ? 'Reading S7-1200 RobotHolding HR0..20...' : cylindrical4 ? `Reading Cylindrical4 FB adapter HR${config.address}..HR${config.address + CYLINDRICAL4_FB_HR_COUNT - 1}...` : cylindrical4Integrated ? `Reading Cylindrical4 Integrated IoT process image HR${config.address}..HR${config.address + CYLINDRICAL4_INTEGRATED_HR_COUNT - 1}...` : ft511938 ? `Reading FT511938 process image HR${config.address}..HR${config.address + FT511938_HR_COUNT - 1}...` : 'Scanning ports, Unit IDs and %QW registers...' } }));
     const query = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), profile: config.endpointProfile });
     try {
       const response = await fetch(`/__openplc/probe?${query.toString()}`, { cache: 'no-store' });
@@ -4462,7 +4557,7 @@ export const App = () => {
       if (!response.ok || !payload.ok) throw new Error(`${payload.error ?? 'OpenPLC probe failed'} (${payload.attempts?.map((item) => `${item.port}/U${item.unitId}: ${item.result}`).join(' | ') ?? 'no response'})`);
       const detectedReal = realIntegratedEndpoint && window.confirm(
         ft511938
-          ? `FT511938 adapter image is readable at ${config.host}:${payload.port ?? config.port}, Unit ${payload.unitId ?? config.unitId}. It is a proposed map; connect only after the PLC adapter is verified. Continue?`
+          ? `FT511938 HR0..60 is readable at ${config.host}:${payload.port ?? config.port}, Unit ${payload.unitId ?? config.unitId}. Connect only after the DB offsets and physical safety inputs are verified. Continue?`
           : cylindrical4
           ? `Cylindrical4 FB process image is readable at ${config.host}:${payload.port ?? config.port}, Unit ${payload.unitId ?? config.unitId}. Connect now?`
           : cylindrical4Integrated
@@ -4474,7 +4569,7 @@ export const App = () => {
         externalBridgeEnabled: detectedReal ? false : current.externalBridgeEnabled,
         localManualActive: detectedReal ? false : current.localManualActive,
         platformManualActive: detectedReal ? false : current.platformManualActive,
-        openPlc: { ...current.openPlc, probing: false, enabled: detectedReal || current.openPlc.enabled, online: false, autoReconnect: detectedReal || current.openPlc.autoReconnect, connectionAuthorized: detectedReal || current.openPlc.connectionAuthorized, controlledNodeId: detectedReal ? selectedKinematicNode?.id : current.openPlc.controlledNodeId, port: payload.port ?? current.openPlc.port, unitId: payload.unitId ?? current.openPlc.unitId, address: payload.address ?? (physical ? 7 : 0), quantity: payload.quantity ?? (ft511938 ? FT511938_HR_COUNT : cylindrical4Integrated ? CYLINDRICAL4_INTEGRATED_HR_COUNT : cylindrical4 ? CYLINDRICAL4_FB_HR_COUNT : 6), dataFormat: payload.dataFormat ?? (ft511938 ? 'ft511938-unified' : cylindrical4Integrated ? 'cylindrical4-integrated' : cylindrical4 ? 'cylindrical4-rpp' : 'int16-rad-x10000'), command: payload.registers?.[0] !== undefined ? payload.registers[0] : 0, rawRegisters: payload.registers, diagnostics: physical ? (detectedReal ? 'S7-1200 detected. Continuous FC03 polling and automatic reconnect are active.' : 'Detected S7-1200 RobotHolding HR0..20. Connection was not authorized.') : cylindrical4 ? (detectedReal ? 'Cylindrical4 FB adapter detected. FC03 HR0..22 polling is armed.' : 'Cylindrical4 FB candidate detected, but continuous connection was not authorized.') : cylindrical4Integrated ? (detectedReal ? 'Cylindrical4 Integrated IoT detected. FC03 HR0..60 polling is armed.' : 'Cylindrical4 Integrated IoT candidate detected, but continuous connection was not authorized.') : ft511938 ? (detectedReal ? 'FT511938 proposed adapter image is readable. Electrical permissions remain PLC-owned.' : 'FT511938 candidate detected, but connection was not authorized.') : `Detected %QW90..105. J1-J6 start at wire ${payload.address ?? 100}.` },
+        openPlc: { ...current.openPlc, probing: false, enabled: detectedReal || current.openPlc.enabled, online: false, autoReconnect: detectedReal || current.openPlc.autoReconnect, connectionAuthorized: detectedReal || current.openPlc.connectionAuthorized, controlledNodeId: detectedReal ? selectedKinematicNode?.id : current.openPlc.controlledNodeId, port: payload.port ?? current.openPlc.port, unitId: payload.unitId ?? current.openPlc.unitId, address: payload.address ?? (physical ? 7 : 0), quantity: payload.quantity ?? (ft511938 ? FT511938_HR_COUNT : cylindrical4Integrated ? CYLINDRICAL4_INTEGRATED_HR_COUNT : cylindrical4 ? CYLINDRICAL4_FB_HR_COUNT : 6), dataFormat: payload.dataFormat ?? (ft511938 ? 'ft511938-unified' : cylindrical4Integrated ? 'cylindrical4-integrated' : cylindrical4 ? 'cylindrical4-rpp' : 'int16-rad-x10000'), command: payload.registers?.[0] !== undefined ? payload.registers[0] : 0, rawRegisters: payload.registers, diagnostics: physical ? (detectedReal ? 'S7-1200 detected. Continuous FC03 polling and automatic reconnect are active.' : 'Detected S7-1200 RobotHolding HR0..20. Connection was not authorized.') : cylindrical4 ? (detectedReal ? 'Cylindrical4 FB adapter detected. FC03 HR0..22 polling is armed.' : 'Cylindrical4 FB candidate detected, but continuous connection was not authorized.') : cylindrical4Integrated ? (detectedReal ? 'Cylindrical4 Integrated IoT detected. FC03 HR0..60 polling is armed.' : 'Cylindrical4 Integrated IoT candidate detected, but continuous connection was not authorized.') : ft511938 ? (detectedReal ? 'FT511938 HR0..60 process image is readable. Electrical permissions remain PLC-owned.' : 'FT511938 candidate detected, but connection was not authorized.') : `Detected %QW90..105. J1-J6 start at wire ${payload.address ?? 100}.` },
         message: physical ? (detectedReal ? 'Physical S7-1200 connected. HR7..12 now drive both robot views.' : 'Physical PLC detected, but continuous connection was not authorized.') : cylindrical4 ? (detectedReal ? 'Cylindrical4 FB PLC connected. Measured positions HR15..18 drive the digital twin.' : 'Cylindrical4 FB candidate detected, but connection was not authorized.') : cylindrical4Integrated ? (detectedReal ? 'Cylindrical4 Integrated IoT PLC connected. Measured HR32..39 drive the digital twin.' : 'Cylindrical4 Integrated IoT candidate detected, but connection was not authorized.') : 'OpenPLC cobot register map detected. Press Connect OpenPLC.',
       }));
     } catch (error) {
@@ -4610,7 +4705,7 @@ export const App = () => {
       setPlcDashboard((current) => ({ ...current, message: 'Select the native four-axis cylindrical robot before testing the FT511938 adapter.' }));
       return;
     }
-    setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: true, online: false, error: undefined, diagnostics: `Testing FT511938 proposed adapter FC03 HR${config.address}..HR${config.address + FT511938_HR_COUNT - 1}...` } }));
+    setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: true, online: false, error: undefined, diagnostics: `Testing FT511938 FC03 HR${config.address}..HR${config.address + FT511938_HR_COUNT - 1}...` } }));
     try {
       const query = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), address: String(config.address), quantity: String(FT511938_HR_COUNT), profile: FT511938_ENDPOINT_PROFILE });
       const response = await fetch(`/__openplc/read?${query.toString()}`, { cache: 'no-store' });
@@ -4658,7 +4753,7 @@ export const App = () => {
         },
         message: 'FT511938 adapter image detected. Read-only test completed; no command or output permit was written.',
       }));
-      recordCommunicationEvent({ stage: 'plc-rx', status: 'ok', source: `FT511938 ${config.host}:${config.port}`, destination: 'TwinAxis FT511938 decoder', operation: 'Read-only FT511938 adapter test', endpoint: `${config.host}:${config.port}`, protocol: 'Modbus TCP', registerRange: `HR${config.address}..HR${config.address + FT511938_HR_COUNT - 1}`, registers: payload.registers, decoded: { ...snapshot, manualTargets: snapshot.manualTargets.join(','), positions: snapshot.positions.join(','), targets: snapshot.targets.join(','), validation: snapshot.validation.join(' | ') }, metadata: { readOnly: true, proposedMap: true, functionCode: payload.functionCode ?? 3 } });
+      recordCommunicationEvent({ stage: 'plc-rx', status: 'ok', source: `FT511938 ${config.host}:${config.port}`, destination: 'TwinAxis FT511938 decoder', operation: 'Read-only FT511938 process-image test', endpoint: `${config.host}:${config.port}`, protocol: 'Modbus TCP', registerRange: `HR${config.address}..HR${config.address + FT511938_HR_COUNT - 1}`, registers: payload.registers, decoded: { ...snapshot, manualTargets: snapshot.manualTargets.join(','), positions: snapshot.positions.join(','), targets: snapshot.targets.join(','), validation: snapshot.validation.join(' | ') }, metadata: { readOnly: true, contract: 'ft511938-hr0-60-v1', functionCode: payload.functionCode ?? 3 } });
     } catch (error) {
       const detail = error instanceof Error ? error.message : 'FT511938 adapter test failed';
       setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, probing: false, online: false, error: detail, diagnostics: `FT511938 TEST FAIL - ${detail}` }, message: detail }));
@@ -4743,7 +4838,7 @@ export const App = () => {
     }
 
     const config = plcDashboardRef.current.openPlc;
-    if (config.endpointProfile === FT511938_ENDPOINT_PROFILE) {
+    if (isFtProfile(config.endpointProfile)) {
       const writeCommand = async (command: 0 | 1) => {
         const heartbeat = nextCylindrical4IntegratedHeartbeat();
         await writeFt511938Block(1, [encodeFt511938Word(command === 1 ? 1 : 0)], command === 1 ? 'FT511938 Enable for explicit demo' : 'FT511938 Enable release');
@@ -4774,7 +4869,7 @@ export const App = () => {
         setPlcDashboard((current) => ({ ...current, message: 'FT511938 demo blocked: the PLC has not reported all commissioning, safety, communication, sensor and homing permits.' }));
         return;
       }
-      if (!window.confirm(`RUN FT511938 DEMO ON ${config.host}:${config.port}\n\nThis writes Cmd=1 through the proposed HR0..60 adapter. The FB controls Q1..Q8 only when its PLC permits are valid. Confirm the cell is safe and the adapter map is verified.`)) return;
+      if (!window.confirm(`RUN FT511938 DEMO ON ${config.host}:${config.port}\n\nThis writes Cmd=1 through the HR0..60 process image. The FB controls Q1..Q8 only when its PLC permits are valid. Confirm the cell is safe and the DB map is verified.`)) return;
       try {
         await writeCommand(1);
         cylindrical4DemoActiveRef.current = true;
@@ -4961,6 +5056,74 @@ export const App = () => {
 
   const writeOpenPlcCommand = async (command: 0 | 1 | 2) => {
     const config = plcDashboardRef.current.openPlc;
+    if (isFtProfile(config.endpointProfile)) {
+      if (!config.enabled || !config.online) {
+        const detail = `FT511938 command blocked: endpoint ${config.enabled ? 'enabled' : 'disabled'}, FC03 ${config.online ? 'online' : 'offline'}.`;
+        setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, diagnostics: detail }, message: detail }));
+        return;
+      }
+      // Command=0 only establishes Manual/HOLD authority. AUTO and HOME
+      // additionally require a valid measured feedback contract.
+      const reasons = command === 0
+        ? ft511938ManualAuthorityPermissionReasons(config)
+        : ft511938MotionPermissionReasons(config);
+      if (reasons.length) {
+        const detail = `FT511938 ${command === 1 ? 'AUTO' : command === 2 ? 'HOME' : 'MANUAL'} blocked: ${reasons.join('; ')}.`;
+        setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, diagnostics: detail }, message: detail }));
+        return;
+      }
+      const heartbeat = nextCylindrical4IntegratedHeartbeat();
+      const labels = ['MANUAL / HOLD', 'AUTO', 'HOME'] as const;
+      const values = [
+        encodeFt511938Word(command),
+        encodeFt511938Word(1),
+        0,
+        0,
+        0,
+        encodeFt511938Word(heartbeat),
+      ];
+      const startedAt = performance.now();
+      try {
+        if (config.endpointProfile === 'openplc-ft511938' && command === 1) {
+          // The OpenPLC POU starts AUTO on a rising command transition.
+          // Drop queued manual targets before transferring motion authority.
+          if (ft511938ManualTargetTimerRef.current !== undefined) {
+            window.clearTimeout(ft511938ManualTargetTimerRef.current);
+            ft511938ManualTargetTimerRef.current = undefined;
+          }
+          ft511938ManualTargetPendingRef.current = undefined;
+          ft511938ManualTargetAwaitingAckRef.current = undefined;
+          await writeFt511938Block(0, [0, 1, 0, 0, 0, encodeFt511938Word(heartbeat)], 'OpenPLC FT AUTO prepare HOLD');
+        }
+        await writeFt511938Block(0, values, `FT511938 ${labels[command]} command`);
+        setPlcDashboard((current) => ({
+          ...current,
+          localManualActive: false,
+          platformManualActive: false,
+          openPlc: { ...current.openPlc, command, heartbeatSequence: heartbeat, diagnostics: `FT511938 HR0=${command} (${labels[command]}) · IoT gating remains PLC-owned for AUTO · heartbeat ${heartbeat}.` },
+          message: `FT511938 ${labels[command]} sent. ${command === 1 ? 'The PLC applies the selected IoT policy.' : 'Manual control is independent of IoT.'}`,
+        }));
+        setStatus(`FT511938 ${labels[command]}`);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : 'FT511938 command write failed';
+        recordCommunicationEvent({
+          stage: 'modbus-tx',
+          status: 'error',
+          source: 'TwinAxis FT511938 command',
+          destination: `${config.endpointProfile} ${config.host}:${config.port}`,
+          operation: 'FT511938 command write failed',
+          latencyMs: performance.now() - startedAt,
+          endpoint: `${config.host}:${config.port}`,
+          protocol: 'Modbus TCP',
+          registerRange: 'HR0..HR5',
+          registers: values,
+          error: detail,
+          metadata: { authority: 'platform', endpointProfile: FT511938_ENDPOINT_PROFILE, command },
+        });
+        setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, error: detail, diagnostics: detail }, message: detail }));
+      }
+      return;
+    }
     const commandWire = configuredPlcWire(config, 'system-command', 90);
     if (!config.enabled) {
       setPlcDashboard((current) => ({ ...current, message: 'Connect the selected PLC before selecting a robot operating mode.' }));
@@ -5049,6 +5212,7 @@ export const App = () => {
 
   const writeFt511938Block = async (address: number, values: number[], semantic: string) => {
     const config = plcDashboardRef.current.openPlc;
+    if (!ftWriteAllowed(address, values.length)) throw new Error('FT511938: escritura fuera de HR0..20; los permisos y posiciones pertenecen al PLC.');
     const startedAt = performance.now();
     const response = await fetch('/__openplc/write', {
       method: 'POST',
@@ -5057,6 +5221,13 @@ export const App = () => {
     });
     const payload = await response.json() as { ok?: boolean; functionCode?: number; error?: string };
     if (!response.ok || !payload.ok) throw new Error(payload.error ?? `FT511938 write failed at HR${config.address + address}`);
+    const query = new URLSearchParams({ host: config.host, port: String(config.port), unitId: String(config.unitId), profile: FT511938_ENDPOINT_PROFILE, address: String(config.address + address), quantity: String(values.length) });
+    const readResponse = await fetch(`/__openplc/read?${query}`, { cache: 'no-store' });
+    const readback = await readResponse.json() as { ok?: boolean; registers?: number[]; error?: string };
+    if (!readResponse.ok || !readback.ok) throw new Error(readback.error ?? 'FT511938: no se pudo verificar la escritura.');
+    const differences = compareFtWrite(address, values, readback.registers ?? []);
+    recordCommunicationEvent({ stage: 'plc-rx', status: differences.length ? 'error' : 'ok', source: `${config.host}:${config.port}`, destination: 'TwinAxis write verifier', operation: 'FT511938 command readback', registerRange: `HR${config.address + address}..HR${config.address + address + values.length - 1}`, registers: readback.registers, error: differences.length ? differences.map((issue) => issue.detail).join(' ') : undefined });
+    if (differences.length) throw new Error(differences.map((issue) => issue.detail).join(' '));
     recordCommunicationEvent({
       stage: 'modbus-tx',
       status: 'ok',
@@ -5068,13 +5239,12 @@ export const App = () => {
       protocol: 'Modbus TCP',
       registerRange: `HR${config.address + address}..HR${config.address + address + values.length - 1}`,
       registers: values,
-      metadata: { authority: 'platform', endpointProfile: FT511938_ENDPOINT_PROFILE, proposedMap: true },
+      metadata: { authority: 'platform', endpointProfile: FT511938_ENDPOINT_PROFILE, contract: 'ft511938-hr0-60-v1' },
     });
   };
 
   const nextCylindrical4IntegratedHeartbeat = () => {
-    const current = plcDashboardRef.current.openPlc.heartbeatSequence ?? cylindrical4IntegratedHeartbeatRef.current;
-    cylindrical4IntegratedHeartbeatRef.current = (current + 1) & 0xffff;
+    cylindrical4IntegratedHeartbeatRef.current = (cylindrical4IntegratedHeartbeatRef.current + 1) & 0xffff;
     return cylindrical4IntegratedHeartbeatRef.current;
   };
 
@@ -5133,76 +5303,19 @@ export const App = () => {
     }
   };
 
-  const sendFt511938Jog = async (axis: 1 | 2 | 3 | 4, direction: -1 | 1, enabled: boolean) => {
-    const config = plcDashboardRef.current.openPlc;
-    if (config.endpointProfile !== FT511938_ENDPOINT_PROFILE || !config.enabled || !config.online) {
-      setPlcDashboard((current) => ({ ...current, message: 'Connect and test the FT511938 adapter before using JOG.' }));
-      return;
-    }
-    if (!isFt511938MotionPermitted(config)) {
-      setPlcDashboard((current) => ({ ...current, message: 'FT511938 JOG blocked: wiring, physical output, safety, drives, communication, sensor and all homing permits must be valid in the PLC.' }));
-      return;
-    }
-    if (cylindrical4IntegratedJogTimerRef.current !== undefined) {
-      window.clearInterval(cylindrical4IntegratedJogTimerRef.current);
-      cylindrical4IntegratedJogTimerRef.current = undefined;
-    }
-    const sendLease = async (jogEnabled: boolean) => {
-      const heartbeat = nextCylindrical4IntegratedHeartbeat();
-      const values = [
-        encodeFt511938Word(jogEnabled ? 3 : 0),
-        encodeFt511938Word(1),
-        encodeFt511938Word(axis),
-        encodeFt511938Word(direction),
-        encodeFt511938Word(jogEnabled ? 1 : 0),
-        encodeFt511938Word(heartbeat),
-      ];
-      await writeFt511938Block(0, values, jogEnabled ? `FT511938 JOG axis ${axis} direction ${direction} lease` : 'FT511938 JOG release / STOP');
-      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, command: jogEnabled ? 3 : 0, activeMode: jogEnabled ? 3 : 0, heartbeatSequence: heartbeat, diagnostics: `FT511938 JOG - axis ${axis} - direction ${direction} - lease ${jogEnabled ? 'active' : 'released'} - heartbeat ${heartbeat}` } }));
-    };
-    try {
-      await sendLease(enabled);
-      if (enabled) {
-        const period = Math.max(100, Math.min(250, config.pollMs));
-        cylindrical4IntegratedJogTimerRef.current = window.setInterval(() => { void sendLease(true).catch(() => undefined); }, period);
-      }
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : 'FT511938 JOG write failed';
-      setPlcDashboard((current) => ({ ...current, message: detail, openPlc: { ...current.openPlc, error: detail } }));
-    }
-  };
-
-  const sendFt511938Goto = async (targets: [number, number, number, number]) => {
-    const config = plcDashboardRef.current.openPlc;
-    if (config.endpointProfile !== FT511938_ENDPOINT_PROFILE || !config.enabled || !config.online) {
-      setPlcDashboard((current) => ({ ...current, message: 'Connect and test the FT511938 adapter before using GOTO.' }));
-      return;
-    }
-    if (!isFt511938MotionPermitted(config)) {
-      setPlcDashboard((current) => ({ ...current, message: 'FT511938 GOTO blocked: the PLC has not reported all required commissioning and safety permits.' }));
-      return;
-    }
-    if (!window.confirm(`SEND GOTO TO FT511938 PLC ${config.host}:${config.port}?\n\nTargets: [${targets.map((value) => value.toFixed(2)).join(', ')}]\nThe proposed adapter map will be used. Confirm the real cell is safe.`)) return;
-    try {
-      const words = targets.flatMap((value) => encodeFt511938Float32(value));
-      await writeFt511938Block(0, [encodeFt511938Word(0)], 'FT511938 GOTO preparation / STOP');
-      await writeFt511938Block(6, words, 'FT511938 ManualTarget[1..4] write');
-      const heartbeat = nextCylindrical4IntegratedHeartbeat();
-      await writeFt511938Block(0, [encodeFt511938Word(4), encodeFt511938Word(1), 0, 0, 0, encodeFt511938Word(heartbeat)], 'FT511938 GOTO edge and heartbeat');
-      setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, command: 4, activeMode: 4, heartbeatSequence: heartbeat, integratedTargets: targets, diagnostics: `FT511938 GOTO - targets [${targets.map((value) => value.toFixed(2)).join(', ')}] - heartbeat ${heartbeat}` }, message: 'FT511938 GOTO sent. TwinAxis will mirror measured Pos[1..4] from the PLC.' }));
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : 'FT511938 GOTO write failed';
-      setPlcDashboard((current) => ({ ...current, message: detail, openPlc: { ...current.openPlc, error: detail } }));
-    }
-  };
-
   const scheduleFt511938ManualTarget = (targets: [number, number, number, number]) => {
     const config = plcDashboardRef.current.openPlc;
-    if (config.endpointProfile !== FT511938_ENDPOINT_PROFILE || !plcDashboardRef.current.platformManualActive) return;
+    if (!isFtProfile(config.endpointProfile) || !plcDashboardRef.current.platformManualActive) return;
     if (!isFt511938MotionPermitted(config)) {
       setPlcDashboard((state) => ({ ...state, message: 'FT511938 manual target blocked: PLC permissions are not valid for this endpoint.' }));
       return;
     }
+    setPlcDashboard((state) => ({
+      ...state,
+      openPlc: { ...state.openPlc, integratedTargets: targets },
+      message: 'FT511938 manual target queued. Waiting for measured PLC feedback.',
+    }));
+    ft511938ManualTargetAwaitingAckRef.current = { targets, expiresAt: Date.now() + 10000 };
     ft511938ManualTargetPendingRef.current = targets;
     if (ft511938ManualTargetTimerRef.current !== undefined || ft511938ManualTargetWriteInFlightRef.current) return;
     ft511938ManualTargetTimerRef.current = window.setTimeout(() => {
@@ -5236,6 +5349,181 @@ export const App = () => {
     }, 80);
   };
 
+  /**
+   * Sends a complete pose snapshot for the non-FT profiles. A kinematic
+   * editor emits one callback per slider tick; the short coalescing window
+   * prevents those ticks from becoming a burst of competing Modbus writes.
+   * The PLC remains the source of truth: the local twin is only updated by
+   * the existing feedback poll once the process image confirms the change.
+   */
+  const scheduleBidirectionalManualPose = (
+    nodeId: string,
+    graph: KinematicGraph,
+    values: Record<string, number>,
+  ) => {
+    const current = plcDashboardRef.current;
+    const config = current.openPlc;
+    if (!current.platformManualActive || isFtProfile(config.endpointProfile)) return;
+    if (config.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE) {
+      setPlcDashboard((state) => ({ ...state, message: 'Cylindrical4 FB legacy is feedback-only. Use Integrated IoT or FT511938 for bidirectional manual targets.' }));
+      return;
+    }
+    const permissionReasons = bidirectionalPermissionReasons({
+      enabled: config.enabled,
+      online: config.online,
+      platformManualActive: current.platformManualActive,
+      runtimeRunning: config.runtimeRunning,
+      startupReady: config.startupReady,
+      host: config.host,
+      homedMask: config.homedMask,
+      simulationMode: config.simulationMode,
+      safetyOk: config.safetyOk,
+      drivesReady: config.drivesReady,
+      wiringVerified: config.wiringVerified,
+      physicalOutputEnable: config.physicalOutputEnable,
+    });
+    if (permissionReasons.length) {
+      const detail = `Twin -> PLC write blocked: ${permissionReasons.join('; ')}.`;
+      setPlcDashboard((state) => ({ ...state, openPlc: { ...state.openPlc, diagnostics: detail }, message: detail }));
+      return;
+    }
+    bidirectionalManualPendingRef.current = { nodeId, graph, values: clonePoseValues(values) };
+    if (bidirectionalManualTimerRef.current !== undefined || bidirectionalManualWriteInFlightRef.current) return;
+    bidirectionalManualTimerRef.current = window.setTimeout(() => {
+      bidirectionalManualTimerRef.current = undefined;
+      const pending = bidirectionalManualPendingRef.current;
+      bidirectionalManualPendingRef.current = undefined;
+      if (!pending || bidirectionalManualWriteInFlightRef.current) return;
+      bidirectionalManualWriteInFlightRef.current = true;
+      void (async () => {
+        const live = plcDashboardRef.current;
+        const liveConfig = live.openPlc;
+        const node = assetDocumentRef.current.nodes.find((candidate) => candidate.id === pending.nodeId);
+        const liveGraph = node ? graphFromGeometry(node.geometry) ?? pending.graph : pending.graph;
+        const baseValues = node && kinematicGeometryWithGraph(node.geometry)
+          ? node.geometry.kinematicState?.jointValues ?? {}
+          : {};
+        const mergedValues = mergeGraphJointValues(liveGraph, baseValues, pending.values);
+        const fourAxisBase = liveConfig.integratedTargets ?? liveConfig.integratedPositions ?? undefined;
+        const plan = buildManualPoseWritePlan(
+          liveConfig.endpointProfile as 'openplc' | 's7-1200-robot-holding' | 'cylindrical4-integrated-iot' | 'ft511938-unified' | 'openplc-ft511938',
+          liveGraph,
+          mergedValues,
+          mergedValues,
+          { heartbeat: ((liveConfig.heartbeatSequence ?? cylindrical4IntegratedHeartbeatRef.current) + 1) & 0xffff, fourAxisBase },
+        );
+        if (plan.errors.length) {
+          const detail = diagnosticForPlan(plan);
+          setPlcDashboard((state) => ({ ...state, openPlc: { ...state.openPlc, diagnostics: detail }, message: detail }));
+          return;
+        }
+        try {
+          let lastReadback: number[] | undefined;
+          const addressBase = liveConfig.endpointProfile === 'openplc' ? 0 : liveConfig.address;
+          for (const operation of plan.writes) {
+            const startedAt = performance.now();
+            const wireAddress = addressBase + operation.address;
+            const response = await enqueuePhysicalPlcIo(() => fetch('/__openplc/write', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                host: liveConfig.host,
+                port: liveConfig.port,
+                unitId: liveConfig.unitId,
+                address: wireAddress,
+                values: operation.values,
+                priority: 'control',
+              }),
+            }));
+            const payload = await response.json() as { ok?: boolean; functionCode?: number; error?: string };
+            if (!response.ok || !payload.ok) throw new Error(payload.error ?? `PLC write failed at HR${wireAddress}`);
+            recordCommunicationEvent({
+              stage: 'modbus-tx',
+              status: 'ok',
+              source: 'TwinAxis digital twin manual control',
+              destination: `${liveConfig.endpointProfile} ${liveConfig.host}:${liveConfig.port}`,
+              operation: operation.semantic,
+              latencyMs: performance.now() - startedAt,
+              endpoint: `${liveConfig.host}:${liveConfig.port}`,
+              protocol: 'Modbus TCP',
+              registerRange: `HR${wireAddress}..HR${wireAddress + operation.values.length - 1}`,
+              registers: operation.values,
+              joints: plan.engineeringTargets,
+              decoded: { profile: liveConfig.endpointProfile, encoding: operation.encoding, engineeringTargets: plan.engineeringTargets.join(',') },
+              metadata: { authority: 'platform-manual', direction: 'twin-to-plc', nodeId: pending.nodeId },
+            });
+            if (operation.verifyAddress !== undefined && operation.verifyQuantity) {
+              const readAddress = addressBase + operation.verifyAddress;
+              const verifyResponse = await enqueuePhysicalPlcIo(() => fetch(`/__openplc/read?${new URLSearchParams({
+                host: liveConfig.host,
+                port: String(liveConfig.port),
+                unitId: String(liveConfig.unitId),
+                address: String(readAddress),
+                quantity: String(operation.verifyQuantity),
+                profile: liveConfig.endpointProfile,
+              }).toString()}`, { cache: 'no-store' }));
+              const verifyPayload = await verifyResponse.json() as { ok?: boolean; registers?: number[]; error?: string };
+              if (!verifyResponse.ok || !verifyPayload.ok || !verifyPayload.registers) throw new Error(verifyPayload.error ?? `PLC readback failed at HR${readAddress}`);
+              lastReadback = verifyPayload.registers;
+            }
+          }
+          let readbackNote = '';
+          if (lastReadback) {
+            const verification = liveConfig.endpointProfile === 'openplc' || liveConfig.endpointProfile === 's7-1200-robot-holding'
+              ? verifyLegacyTargetReadback(plan.engineeringTargets, lastReadback)
+              : verifyFourAxisTargetReadback(plan.engineeringTargets, lastReadback);
+            readbackNote = `; ${summarizeVerification(verification)}`;
+            recordCommunicationEvent({
+              stage: 'plc-rx',
+              status: verification.ok ? 'ok' : 'error',
+              source: `${liveConfig.endpointProfile} ${liveConfig.host}:${liveConfig.port}`,
+              destination: 'TwinAxis manual write verifier',
+              operation: 'manual target readback verification',
+              endpoint: `${liveConfig.host}:${liveConfig.port}`,
+              protocol: 'Modbus TCP',
+              registers: lastReadback,
+              joints: verification.actual,
+              error: verification.ok ? undefined : verification.detail,
+              decoded: { direction: 'plc-to-twin', verified: verification.ok, expected: verification.expected.join(','), actual: verification.actual.join(',') },
+              metadata: { authority: 'platform-manual', nodeId: pending.nodeId },
+            });
+            if (!verification.ok) throw new Error(`PLC readback rejected: ${verification.detail}`);
+          }
+          const detail = `Twin -> PLC MANUAL accepted: ${diagnosticForPlan(plan)}${readbackNote}. Waiting for PLC feedback.`;
+          setPlcDashboard((state) => ({
+            ...state,
+            openPlc: { ...state.openPlc, diagnostics: detail, error: undefined },
+            message: detail,
+          }));
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : 'Bidirectional PLC pose write failed';
+          recordCommunicationEvent({
+            stage: 'modbus-tx',
+            status: 'error',
+            source: 'TwinAxis digital twin manual control',
+            destination: `${liveConfig.endpointProfile} ${liveConfig.host}:${liveConfig.port}`,
+            operation: 'Twin -> PLC pose transaction failed',
+            endpoint: `${liveConfig.host}:${liveConfig.port}`,
+            protocol: 'Modbus TCP',
+            error: detail,
+            metadata: { authority: 'platform-manual', direction: 'twin-to-plc', nodeId: pending.nodeId },
+          });
+          setPlcDashboard((state) => ({ ...state, openPlc: { ...state.openPlc, error: detail, diagnostics: `Twin -> PLC FAILED: ${detail}` }, message: detail }));
+        } finally {
+          bidirectionalManualWriteInFlightRef.current = false;
+          if (bidirectionalManualPendingRef.current && bidirectionalManualTimerRef.current === undefined) {
+            bidirectionalManualTimerRef.current = window.setTimeout(() => {
+              bidirectionalManualTimerRef.current = undefined;
+              const next = bidirectionalManualPendingRef.current;
+              bidirectionalManualPendingRef.current = undefined;
+              if (next) scheduleBidirectionalManualPose(next.nodeId, next.graph, next.values);
+            }, 80);
+          }
+        }
+      })();
+    }, 80);
+  };
+
   const togglePlatformManualControl = async (snapshot?: PlcDashboardState) => {
     const current = snapshot ?? plcDashboardRef.current;
     const config = current.openPlc;
@@ -5248,7 +5536,16 @@ export const App = () => {
       setPlcDashboard((state) => ({ ...state, message: 'The legacy Cylindrical4 FB is feedback-only. Select the Integrated IoT profile for validated JOG and GOTO controls.' }));
       return;
     }
-    if (config.endpointProfile === FT511938_ENDPOINT_PROFILE) {
+    if (config.runtimeRunning === false
+      && config.endpointProfile !== 's7-1200-robot-holding'
+      && !isFtProfile(config.endpointProfile)) {
+      const detail = config.startupReady === false
+        ? 'Manual PLC blocked: Modbus answers, but the selected OpenPLC POU has not executed a scan (HR59 StartupReady=0). Compile/download the POU and set OpenPLC to RUN.'
+        : 'Manual PLC blocked: the selected PLC runtime is not executing its scan.';
+      setPlcDashboard((state) => ({ ...state, openPlc: { ...state.openPlc, diagnostics: detail }, message: detail }));
+      return;
+    }
+    if (isFtProfile(config.endpointProfile)) {
       if (current.platformManualActive) {
         if (!window.confirm('Disable FT511938 platform manual control and keep the PLC in STOP / HOLD?')) return;
         try {
@@ -5260,21 +5557,22 @@ export const App = () => {
         }
         return;
       }
-      if (!isFt511938MotionPermitted(config)) {
-        const reasons = ft511938MotionPermissionReasons(config);
-        const detail = `FT511938 manual control blocked: ${reasons.join('; ')}.`;
+      if (!isFt511938ManualAuthorityPermitted(config)) {
+        const reasons = ft511938ManualAuthorityPermissionReasons(config);
+        const detail = `FT511938 manual authority blocked: ${reasons.join('; ')}.`;
         setPlcDashboard((state) => ({ ...state, openPlc: { ...state.openPlc, diagnostics: detail }, message: detail }));
         return;
       }
       const confirmed = window.confirm(
         `Enable FT511938 platform manual control for ${config.host}:${config.port}?\n\n` +
-        'TwinAxis will write Cmd=0, Enable=1 and use only the proposed FT511938 adapter fields. Confirm the map is verified and this platform is the sole Modbus writer.',
+        'TwinAxis will write Cmd=0, Enable=1 and use only the FT511938 HR0..60 command fields. Confirm the DB map is verified and this platform is the sole Modbus writer.',
       );
       if (!confirmed) return;
       try {
         const heartbeat = nextCylindrical4IntegratedHeartbeat();
         await writeFt511938Block(0, [0, 1, 0, 0, 0, encodeFt511938Word(heartbeat)], 'FT511938 manual authority enable');
-        setPlcDashboard((state) => ({ ...state, running: false, localManualActive: false, platformManualActive: true, openPlc: { ...state.openPlc, command: 0, activeMode: 0, heartbeatSequence: heartbeat, error: undefined, diagnostics: `FT511938 manual authority active. Cmd=0, Enable=1, heartbeat=${heartbeat}.` }, message: 'FT511938 manual PLC active. Use JOG buttons or send a validated GOTO target.' }));
+        const feedbackNote = config.runtimeIssue ? ` Feedback motion remains blocked until the PLC reports a valid pose: ${config.runtimeIssue}` : '';
+        setPlcDashboard((state) => ({ ...state, running: false, localManualActive: false, platformManualActive: true, openPlc: { ...state.openPlc, command: 0, activeMode: 0, heartbeatSequence: heartbeat, error: undefined, diagnostics: `FT511938 manual authority active. Cmd=0, Enable=1, heartbeat=${heartbeat}. IoT is not used by Manual.${feedbackNote}` }, message: `FT511938 manual PLC active. IoT is ignored by Manual.${feedbackNote}` }));
         setStatus('FT511938 platform manual PLC active');
       } catch (error) {
         const detail = error instanceof Error ? error.message : 'FT511938 manual authority enable failed';
@@ -5367,6 +5665,7 @@ export const App = () => {
     }
 
     plcBridgeDisconnectLockRef.current = true;
+    clearExternalPlcPose();
     const sequence = plcDashboardRef.current.sequence + 1;
     const project = createConfiguredPlcProject(selectedKinematicNode);
     const frame = runPlcModbusSimulationFrame(selectedKinematicNode, {
@@ -5440,7 +5739,7 @@ export const App = () => {
       }
       return;
     }
-    if (config.endpointProfile === FT511938_ENDPOINT_PROFILE) {
+    if (isFtProfile(config.endpointProfile)) {
       if (!config.enabled) {
         setPlcDashboard((current) => ({ ...current, message: 'Connect the FT511938 PLC before changing the sensor policy.' }));
         return;
@@ -5450,6 +5749,9 @@ export const App = () => {
         const heartbeat = nextCylindrical4IntegratedHeartbeat();
         await writeFt511938Block(ft511938Wire['cylindrical-heartbeat'], [encodeFt511938Word(heartbeat)], 'FT511938 heartbeat renewal');
         setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, sensorPolicy, heartbeatSequence: heartbeat }, message: sensorPolicy === 1 ? 'FT511938 AUTO policy written: run while IoT motion is present. Manual control ignores IoT.' : 'FT511938 AUTO policy written: run after two seconds without IoT motion. Manual control ignores IoT.' }));
+        if (config.endpointProfile === 'openplc-ft511938') {
+          await writeOpenPlcCommand(1);
+        }
       } catch (error) {
         const detail = error instanceof Error ? error.message : 'FT511938 IoT policy write failed';
         setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, error: detail }, message: detail }));
@@ -5509,7 +5811,7 @@ export const App = () => {
     const physicalEndpoint = config.endpointProfile === 's7-1200-robot-holding';
     const cylindrical4LegacyEndpoint = config.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE;
     const cylindrical4IntegratedEndpoint = config.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE;
-    const ft511938Endpoint = config.endpointProfile === FT511938_ENDPOINT_PROFILE;
+    const ft511938Endpoint = isFtProfile(config.endpointProfile);
     const cylindrical4Endpoint = cylindrical4LegacyEndpoint || cylindrical4IntegratedEndpoint || ft511938Endpoint;
     const configuredJointCapacity = cylindrical4Endpoint ? 4 : config.dataFormat === 'float32-be' ? Math.max(1, Math.floor(config.quantity / 2)) : Math.max(1, config.quantity);
     const selectedJointIds = new Set(graphFromGeometry(plcNode.geometry)?.joints.map((joint) => joint.id) ?? []);
@@ -5645,8 +5947,30 @@ export const App = () => {
       const integratedSnapshot = cylindrical4IntegratedEndpoint ? decodeCylindrical4IntegratedRegisters(rawRegisters) : undefined;
       const ft511938Snapshot = ft511938Endpoint ? decodeFt511938Registers(rawRegisters) : undefined;
       const cylindricalPose = cylindricalSnapshot && runtimeGraph ? cylindrical4PoseForGraph(runtimeGraph, cylindricalSnapshot) : integratedSnapshot && runtimeGraph ? cylindrical4IntegratedPoseForGraph(runtimeGraph, integratedSnapshot) : ft511938Snapshot && runtimeGraph ? ft511938PoseForGraph(runtimeGraph, ft511938Snapshot) : undefined;
+      // A readable Modbus frame is not automatically a usable motion frame.
+      // HR30..45 are zero while the FT POU is stopped or before its first
+      // scan. Never turn that invalid image into a real zero pose.
+      const ftFeedbackIsUninitialized = Boolean(
+        ft511938Snapshot
+        && ft511938Snapshot.startupReady
+        && ft511938Snapshot.positions[1] === 0
+        && ft511938Snapshot.positions[2] === 0
+        && ft511938Snapshot.positions[3] === 0
+        && ft511938Snapshot.targets[1] === 0
+        && ft511938Snapshot.targets[2] === 0
+        && ft511938Snapshot.targets[3] === 0,
+      );
+      const ftFeedbackUsable = Boolean(ft511938Snapshot && ft511938Snapshot.valid && !ftFeedbackIsUninitialized);
+      const poseForFrame = ft511938Snapshot && !ftFeedbackUsable ? undefined : cylindricalPose;
       const overrides = Object.fromEntries(template.physicalRegisters.map((register) => {
-        if (cylindricalPose && Object.prototype.hasOwnProperty.call(cylindricalPose, register.jointId)) return [register.signalId, cylindricalPose[register.jointId]];
+        if (poseForFrame && Object.prototype.hasOwnProperty.call(poseForFrame, register.jointId)) return [register.signalId, poseForFrame[register.jointId]];
+        if (ft511938Snapshot && !ftFeedbackUsable) {
+          const lastConfirmedValue = current.registerOverrides[register.signalId];
+          if (Number.isFinite(lastConfirmedValue)) return [register.signalId, lastConfirmedValue];
+          // On the first invalid sample retain the graph's current value. The
+          // dashboard will report the invalid feedback separately below.
+          return [register.signalId, register.value];
+        }
         const definition = jointDefinitions.find((entry) => entry.jointId === register.jointId);
         const wire = definition?.wire ?? register.address;
         const encoding = definition?.encoding ?? config.dataFormat;
@@ -5678,7 +6002,7 @@ export const App = () => {
       const legacyProfileMismatch = config.endpointProfile === 'openplc' && programSignature !== 2101;
       const legacyFtAutoDetectKey = `${config.host}:${config.port}:${config.unitId}`;
       const legacyFtAutoDetectLastAttempt = legacyFtAutoDetectAttemptRef.current;
-      const legacyFtAutoDetectDue = legacyProfileMismatch
+      const legacyFtAutoDetectDue = Boolean(0) && legacyProfileMismatch
         && (!legacyFtAutoDetectLastAttempt
           || legacyFtAutoDetectLastAttempt.key !== legacyFtAutoDetectKey
           || Date.now() - legacyFtAutoDetectLastAttempt.at >= 5000);
@@ -5778,19 +6102,46 @@ export const App = () => {
       const runtimeGraceMs = Math.max(2000, config.pollMs * 6);
       // RobotHolding has no dedicated scan heartbeat. A static ElapsedMs or pose
       // is a valid process state and cannot be used to declare a physical CPU stopped.
-      const runtimeRunning = physicalEndpoint || ft511938Snapshot?.valid === true || integratedSnapshot?.valid === true || cylindricalSnapshot?.valid === true || scanProgressed || nowMs - probe.lastProgressAt < runtimeGraceMs;
-      const runtimeIssue = ft511938Snapshot && !ft511938Snapshot.valid
-        ? `FT511938 adapter mismatch: ${ft511938Snapshot.validation.join(' ')}`
+      const ftScanRunning = ft511938Snapshot
+        ? ft511938Snapshot.startupReady === true
+        : undefined;
+      const runtimeRunning = ft511938Snapshot
+        ? ftScanRunning === true
+        : config.endpointProfile === 'openplc' && legacyProfileMismatch
+        ? false
+        : physicalEndpoint
+        || integratedSnapshot?.valid === true
+        || cylindricalSnapshot?.valid === true
+        || scanProgressed
+        || nowMs - probe.lastProgressAt < runtimeGraceMs;
+      const runtimeIssue = ft511938Snapshot && !ft511938Snapshot.startupReady
+        ? 'FT511938: HR59=0. Verificar la llamada ciclica del FB y el DB expuesto por MB_SERVER.'
+        : ftFeedbackIsUninitialized
+        ? 'FT511938: HR30..45 sin posiciones validas. Verificar PosMeasured y los offsets del DB expuesto; no hay feedback para mover las vistas.'
+        : ft511938Snapshot && !ft511938Snapshot.valid
+        ? `FT511938: ${diagnoseFtImage(rawRegisters).map((issue) => issue.detail).join(' ')}`
         : integratedSnapshot && !integratedSnapshot.valid
         ? `Cylindrical4 Integrated IoT mismatch: ${integratedSnapshot.validation.join(' ')}`
         : cylindricalSnapshot && !cylindricalSnapshot.valid
         ? `Cylindrical4 FB adapter mismatch: ${cylindricalSnapshot.validation.join(' ')}`
         : !physicalEndpoint && !cylindrical4Endpoint && !cylindrical4IntegratedEndpoint && !ft511938Endpoint && programSignature !== 2101
-        ? `OpenPLC legacy profile mismatch: %QW97=${programSignature ?? '--'}, expected 2101. If the loaded program is FB_FT511938_openplc.st, select "Physical FT511938 Unified · proposed HR0..60"; the FT adapter does not use %QW97.`
+        ? `OpenPLC legacy profile mismatch: %QW97=${programSignature ?? '--'}, expected 2101. If the loaded program uses the FT511938 HR0..60 contract, select "Physical FT511938 Unified · HR0..60"; that contract does not use %QW97.`
         : runtimeRunning
           ? undefined
           : `Modbus responds, but the OpenPLC scan is not advancing. Command=${commandValue}, Status=${statusCode ?? '--'}, ElapsedMs=${elapsedMs ?? '--'}. Upload the POU and press Start PLC.`;
       const frame = runPlcDashboardFrame(plcNode, 0, current.sequence + 1, project, overrides, false);
+      let ft511938TargetsForState = ft511938Snapshot?.targets;
+      const awaitingManualTarget = ft511938ManualTargetAwaitingAckRef.current;
+      if (ft511938Snapshot && awaitingManualTarget) {
+        const targetConfirmed = ft511938Snapshot.targets.every(
+          (value, index) => Math.abs(value - awaitingManualTarget.targets[index]) <= 0.05,
+        );
+        if (targetConfirmed || Date.now() >= awaitingManualTarget.expiresAt) {
+          ft511938ManualTargetAwaitingAckRef.current = undefined;
+        } else {
+          ft511938TargetsForState = awaitingManualTarget.targets;
+        }
+      }
       const completedAt = performance.now();
       const jointVector = Object.values(frame.jointValues);
       const previousJoints = plcTimingRef.current.lastJoints;
@@ -5828,7 +6179,12 @@ export const App = () => {
         minIntervalMs: 0,
       });
       openPlcFailureCountRef.current = 0;
-      publishExternalPlcPose({ nodeId: plcNode.id, jointValues: { ...frame.jointValues } });
+      // Only confirmed FT feedback is allowed to replace the visible PLC pose.
+      // Invalid/stopped samples keep the last confirmed pose and remain
+      // visible as a diagnostic instead of resetting both 3D views to zero.
+      if (!ft511938Snapshot || ftFeedbackUsable) {
+        publishExternalPlcPose({ nodeId: plcNode.id, jointValues: { ...frame.jointValues } });
+      }
       setPlcDashboard((state) => ({
         ...state,
         running: commandValue === 1 && (conditionCode ?? 0) < 2 && runtimeRunning,
@@ -5848,8 +6204,12 @@ export const App = () => {
           status: statusCode, activeMode: ft511938Snapshot?.activeMode ?? integratedSnapshot?.activeMode, activeStep: ft511938Snapshot?.activeStep ?? integratedSnapshot?.activeStep ?? statusValue('system-step'), elapsedMs,
           alarmCode: ft511938Snapshot?.alarmCode ?? integratedSnapshot?.alarmCode ?? statusValue('system-alarm'), ioTAlarmCode: ft511938Snapshot?.ioTAlarmCode ?? integratedSnapshot?.ioTAlarmCode, conditionState: conditionCode, speedPermille: ft511938Snapshot?.speedPermille ?? integratedSnapshot?.speedPermille ?? statusValue('system-speed'),
           heartbeatSequence: ft511938Snapshot?.heartbeatSequence ?? integratedSnapshot?.heartbeatSequence,
-          integratedPositions: ft511938Snapshot?.positions ?? integratedSnapshot?.positions,
-          integratedTargets: ft511938Snapshot?.targets ?? integratedSnapshot?.targets,
+          integratedPositions: ft511938Snapshot
+            ? (ftFeedbackUsable ? ft511938Snapshot.positions : state.openPlc.integratedPositions)
+            : integratedSnapshot?.positions,
+          integratedTargets: ft511938Snapshot
+            ? (ftFeedbackUsable ? ft511938TargetsForState : state.openPlc.integratedTargets)
+            : integratedSnapshot?.targets,
           homedMask: ft511938Snapshot?.homedMask ?? integratedSnapshot?.homedMask,
           runMask: ft511938Snapshot?.runMask ?? integratedSnapshot?.runMask,
           directionMask: ft511938Snapshot?.directionMask ?? integratedSnapshot?.directionMask,
@@ -5863,6 +6223,7 @@ export const App = () => {
           wiringVerified: ft511938Snapshot?.wiringVerified,
           physicalOutputEnable: ft511938Snapshot?.physicalOutputEnable,
           simulationMode: ft511938Snapshot?.simulationMode,
+          startupReady: ft511938Snapshot?.startupReady,
           cmdQMask: ft511938Snapshot?.cmdQMask,
           sensorPolicy: policyPayload.registers?.[0] === 1 ? 1 : 0,
           diagnostics: runtimeIssue ?? (ft511938Endpoint
@@ -6330,23 +6691,33 @@ export const App = () => {
           ['iot-sequence', Number(telemetry.sequence ?? 0) & 0xffff], ['iot-quality', qualityBits],
         ]);
         const integratedEndpoint = current.openPlc.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE;
-        const ft511938Endpoint = current.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE;
-        if (integratedEndpoint || ft511938Endpoint) {
-          const nextHeartbeat = ((current.openPlc.heartbeatSequence ?? cylindrical4IntegratedHeartbeatRef.current) + 1) & 0xffff;
-          cylindrical4IntegratedHeartbeatRef.current = nextHeartbeat;
+        const ft511938Endpoint = isFtProfile(current.openPlc.endpointProfile);
+        // The legacy OpenPLC simulation consumes bridge-owned health words.
+        // On the physical S7 these words are PLC-owned and must never be written.
+        const openPlcSimulationHealth = current.openPlc.endpointProfile === 'openplc-ft511938'
+          && current.openPlc.simulationMode === 1
+          && /^(localhost|127\.0\.0\.1|::1)$/i.test(current.openPlc.host);
+        if (openPlcSimulationHealth) {
+          iotValues.set('simulation-comm-fresh', current.openPlc.online ? 1 : 0);
+          iotValues.set('simulation-sensor-ok', telemetry.valid && telemetry.hasGyroscope && telemetry.ageMs <= 2500 ? 1 : 0);
+        }
+        if (integratedEndpoint) {
+          const nextHeartbeat = nextCylindrical4IntegratedHeartbeat();
           iotValues.set('iot-policy', current.openPlc.sensorPolicy ?? 0);
           iotValues.set('iot-heartbeat', nextHeartbeat);
         }
         const iotEntries = ft511938Endpoint
           ? [
-            { id: 'iot-policy', wire: ft511938Wire['iot-policy'] },
             { id: 'iot-valid', wire: ft511938Wire['iot-valid'] },
             { id: 'iot-quality', wire: ft511938Wire['iot-quality'] },
             { id: 'iot-age', wire: ft511938Wire['iot-age'] },
             { id: 'iot-temperature', wire: ft511938Wire['iot-temperature'] },
             { id: 'iot-humidity', wire: ft511938Wire['iot-humidity'] },
             { id: 'iot-gyro', wire: ft511938Wire['iot-gyro'] },
-            { id: 'iot-heartbeat', wire: ft511938Wire['cylindrical-heartbeat'] },
+            ...(openPlcSimulationHealth ? [
+              { id: 'simulation-comm-fresh', wire: 23 },
+              { id: 'simulation-sensor-ok', wire: 24 },
+            ] : []),
           ]
           : integratedEndpoint
           ? [
@@ -6387,7 +6758,7 @@ export const App = () => {
                   recordCommunicationEvent({ stage: 'modbus-tx', status: 'ok', source: 'TwinAxis IoT bridge', destination: `${current.openPlc.host}:${current.openPlc.port}`, operation: 'FC16 telemetry write', latencyMs: performance.now() - writeStartedAt, endpoint: `${current.openPlc.host}:${current.openPlc.port}`, protocol: 'Modbus TCP', registerRange: `HR${block.address}..HR${block.address + block.values.length - 1}`, registers: block.values, correlationId: telemetry.sampleId, dedupeKey: `tx-${telemetry.sequence}-${block.address}`, minIntervalMs: 50 });
               }
             };
-            if (current.openPlc.endpointProfile === 's7-1200-robot-holding' || current.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE) await enqueuePhysicalPlcIo(forwardTelemetry);
+            if (current.openPlc.endpointProfile === 's7-1200-robot-holding' || isFtProfile(current.openPlc.endpointProfile)) await enqueuePhysicalPlcIo(forwardTelemetry);
             else await forwardTelemetry();
           } catch (error) {
             const detail = error instanceof Error ? error.message : 'IoT Modbus write failed';
@@ -6526,6 +6897,64 @@ export const App = () => {
     return () => window.clearInterval(timer);
   }, [plcDashboard.open, traceAuditDrawerOpen, plcDashboard.externalBridgeEnabled, plcDashboard.openPlc.enabled, pollTerminalModbusBridge]);
 
+  useEffect(() => {
+    const config = plcDashboard.openPlc;
+    if (!isFtProfile(config.endpointProfile) || !config.enabled || !config.online) return undefined;
+    let disposed = false;
+    let inFlight = false;
+    const renewHeartbeat = async () => {
+      if (disposed || inFlight) return;
+      inFlight = true;
+      const heartbeat = nextCylindrical4IntegratedHeartbeat();
+      try {
+        const response = await fetch('/__openplc/write', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            host: config.host,
+            port: config.port,
+            unitId: config.unitId,
+            address: config.address + ft511938Wire['cylindrical-heartbeat'],
+            values: [encodeFt511938Word(heartbeat)],
+            priority: 'telemetry',
+          }),
+        });
+        const payload = await response.json() as { ok?: boolean; error?: string };
+        if (!response.ok || !payload.ok) throw new Error(payload.error ?? 'FT511938 heartbeat write failed');
+        if (!disposed) {
+          setPlcDashboard((current) => ({
+            ...current,
+            openPlc: { ...current.openPlc, heartbeatSequence: heartbeat },
+          }));
+        }
+      } catch (error) {
+        if (!disposed) {
+          const detail = error instanceof Error ? error.message : 'FT511938 heartbeat write failed';
+          setPlcDashboard((current) => ({
+            ...current,
+            openPlc: { ...current.openPlc, runtimeIssue: detail },
+          }));
+        }
+      } finally {
+        inFlight = false;
+      }
+    };
+    void renewHeartbeat();
+    const timer = window.setInterval(() => void renewHeartbeat(), 900);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    plcDashboard.openPlc.endpointProfile,
+    plcDashboard.openPlc.enabled,
+    plcDashboard.openPlc.online,
+    plcDashboard.openPlc.host,
+    plcDashboard.openPlc.port,
+    plcDashboard.openPlc.unitId,
+    plcDashboard.openPlc.address,
+  ]);
+
   const writePlcRegisterValue = (signalId: string, value: number) => {
     const current = plcDashboardRef.current;
     if (current.openPlc.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE) {
@@ -6539,13 +6968,25 @@ export const App = () => {
     const register = current.frame?.physicalRegisters.find((item) => item.signalId === signalId);
     const overrides = { ...current.registerOverrides, [signalId]: value };
     let ftManualTargetMapped = false;
-    if (current.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE && current.platformManualActive && register) {
+    if (isFtProfile(current.openPlc.endpointProfile) && current.platformManualActive) {
+      if (!register) return;
+      if (!isFt511938MotionPermitted(current.openPlc)) {
+        const reasons = ft511938MotionPermissionReasons(current.openPlc);
+        const detail = `FT511938 manual motion blocked: ${reasons.join('; ')}. Cmd=0 Manual/HOLD remains available and IoT is not part of this gate.`;
+        setPlcDashboard((state) => ({ ...state, message: detail, openPlc: { ...state.openPlc, diagnostics: detail } }));
+        return;
+      }
       const graph = graphFromGeometry(activeNode.geometry);
       const target = graph ? ft511938TargetsFromGraphValues(graph, current.openPlc.integratedTargets ?? current.openPlc.integratedPositions ?? [0, 300, 60, 50], { [register.jointId]: value }) : undefined;
       if (target) {
         ftManualTargetMapped = true;
         scheduleFt511938ManualTarget(target);
       }
+      if (!ftManualTargetMapped) return;
+    }
+    if (ftManualTargetMapped) {
+      setStatus('FT511938 target queued; waiting for measured PLC feedback');
+      return;
     }
     if (current.openPlc.enabled && register && !ftManualTargetMapped) {
       const definition = registerConfiguration.find((entry) => entry.enabled && entry.robotNodeId === activeNode.id && entry.jointId === register.jointId);
@@ -8186,8 +8627,6 @@ export const App = () => {
             onTestFt511938={testFt511938}
             onCylindrical4IntegratedJog={sendCylindrical4IntegratedJog}
             onCylindrical4IntegratedGoto={sendCylindrical4IntegratedGoto}
-            onFt511938Jog={sendFt511938Jog}
-            onFt511938Goto={sendFt511938Goto}
             physicalPlcDemoActive={physicalPlcDemoActive}
             onTogglePhysicalPlcDemo={togglePhysicalPlcStartDemo}
             onOpenPlcCommand={writeOpenPlcCommand}
@@ -9791,8 +10230,6 @@ type PlcModbusDashboardProps = {
   onTestFt511938: () => Promise<void>;
   onCylindrical4IntegratedJog: (axis: 1 | 2 | 3 | 4, direction: -1 | 1, enabled: boolean) => Promise<void>;
   onCylindrical4IntegratedGoto: (targets: [number, number, number, number]) => Promise<void>;
-  onFt511938Jog: (axis: 1 | 2 | 3 | 4, direction: -1 | 1, enabled: boolean) => Promise<void>;
-  onFt511938Goto: (targets: [number, number, number, number]) => Promise<void>;
   physicalPlcDemoActive: boolean;
   onTogglePhysicalPlcDemo: () => Promise<void>;
   onOpenPlcCommand: (command: 0 | 1 | 2) => void;
@@ -9832,6 +10269,22 @@ const registerValueLimits = (register: PlcRegister) => {
   if (lowerName.includes('linear') || lowerName.includes('rail') || lowerName.includes('conveyor')) return { min: -1, max: 1 };
   return { min: -3.14, max: 3.14 };
 };
+
+type PlcJointControlLimits = { min: number; max: number; step: number };
+
+const graphControlLimits = (graph: KinematicGraph, registers: PlcRegister[]) => new Map(
+  registers.flatMap((register) => {
+    const joint = graph.joints.find((candidate) => candidate.id === register.jointId);
+    const lower = joint?.limits?.lower;
+    const upper = joint?.limits?.upper;
+    if (!joint || !Number.isFinite(lower) || !Number.isFinite(upper)) return [];
+    return [[register.signalId, {
+      min: lower as number,
+      max: upper as number,
+      step: joint.type === 'prismatic' ? 0.001 : 0.005,
+    } satisfies PlcJointControlLimits] as const];
+  }),
+);
 
 const formatHexPair = (values: number[]) => values.map((value) => `0x${value.toString(16).padStart(4, '0').toUpperCase()}`).join(' ');
 
@@ -9877,6 +10330,9 @@ const PlcRobotMirror = ({
   title,
   subtitle,
   rows,
+  controlRows,
+  controlLimits,
+  editableSignalIds,
   editable,
   running,
   onWriteRegister,
@@ -9885,11 +10341,15 @@ const PlcRobotMirror = ({
   title: string;
   subtitle: string;
   rows: PlcRegister[];
+  controlRows?: PlcRegister[];
+  controlLimits?: Map<string, PlcJointControlLimits>;
+  editableSignalIds?: Set<string>;
   editable?: boolean;
   running?: boolean;
   onWriteRegister?: (signalId: string, value: number) => void;
 }) => {
   const mirrorDocument = useMemo(() => buildPlcMirrorDocument(node, rows, title), [node, rows, title]);
+  const controls = controlRows ?? rows;
   const noop = useCallback(() => undefined, []);
   const noopTransform = useCallback(() => undefined, []);
   const noopPartTransforms = useCallback(() => undefined, []);
@@ -9932,9 +10392,10 @@ const PlcRobotMirror = ({
           <div className="empty-state compact">Select a robot with KinematicGraph to render the real 3D mirror.</div>
         )}
         <div className="plc-mini-registers">
-          {rows.slice(0, 6).map((register) => {
-            const limits = registerValueLimits(register);
+          {controls.slice(0, 6).map((register) => {
+            const limits = controlLimits?.get(register.signalId) ?? { ...registerValueLimits(register), step: 0.01 };
             const value = clampPlcValue(register.value, limits.min, limits.max);
+            const registerEditable = editable && (!editableSignalIds || editableSignalIds.has(register.signalId));
             return (
               <label key={`${title}-${register.signalId}`} className="plc-register-control">
                 <span title={register.jointName}>{register.jointName}</span>
@@ -9942,16 +10403,17 @@ const PlcRobotMirror = ({
                   type="range"
                   min={limits.min}
                   max={limits.max}
-                  step="0.01"
+                  step={limits.step}
                   value={value}
-                  disabled={!editable}
+                  disabled={!registerEditable}
+                  title={registerEditable ? `Command ${register.jointName}` : `${register.jointName} is not mapped by the active PLC adapter`}
                   onChange={(event) => onWriteRegister?.(register.signalId, Number(event.target.value))}
                 />
                 <strong>{value.toFixed(2)}</strong>
               </label>
             );
           })}
-          {!rows.length && <div className="empty-state compact">Run or Step to create live Modbus registers.</div>}
+          {!controls.length && <div className="empty-state compact">Run or Step to create live Modbus registers.</div>}
         </div>
       </div>
     </section>
@@ -10449,21 +10911,29 @@ const PlcLiveExchangeDashboard = ({ node, state, definitions, onTogglePlatformMa
   );
 };
 
-const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdvanced, onToggleTerminalBridge, onDisconnectTerminalBridge, onEndpointChange, onWriteRegister, onPlcInputChange, onPlcFaultReset, onPlcScanTargetChange, onToggleOpenPlc, onProbeOpenPlc, onTestPhysicalPlcConnection, onTestPhysicalPlcReaction, onTestPhysicalPlcJog, onTestCylindrical4Fb, onTestCylindrical4Integrated, onTestFt511938, onCylindrical4IntegratedJog, onCylindrical4IntegratedGoto, onFt511938Jog, onFt511938Goto, physicalPlcDemoActive, onTogglePhysicalPlcDemo, onOpenPlcCommand, onActivateManualControl, onOpenPlcSensorPolicy, onOpenPlcConfigChange, historianRecording, historianRecordCount, onToggleHistorianRecording, onClose }: PlcModbusDashboardProps) => {
+const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdvanced, onToggleTerminalBridge, onDisconnectTerminalBridge, onEndpointChange, onWriteRegister, onPlcInputChange, onPlcFaultReset, onPlcScanTargetChange, onToggleOpenPlc, onProbeOpenPlc, onTestPhysicalPlcConnection, onTestPhysicalPlcReaction, onTestPhysicalPlcJog, onTestCylindrical4Fb, onTestCylindrical4Integrated, onTestFt511938, onCylindrical4IntegratedJog, onCylindrical4IntegratedGoto, physicalPlcDemoActive, onTogglePhysicalPlcDemo, onOpenPlcCommand, onActivateManualControl, onOpenPlcSensorPolicy, onOpenPlcConfigChange, historianRecording, historianRecordCount, onToggleHistorianRecording, onClose }: PlcModbusDashboardProps) => {
   const [mirrorHeight, setMirrorHeight] = useState(330);
   const [integratedTargets, setIntegratedTargets] = useState<[number, number, number, number]>([0, 300, 60, 50]);
   const integratedTargetsEditingRef = useRef(false);
   const mirrorResizeRef = useRef<{ pointerId: number; startY: number; startHeight: number }>();
   const cylindrical4IntegratedActive = state.openPlc.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE;
-  const ft511938Active = state.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE;
+  const ft511938Active = isFtProfile(state.openPlc.endpointProfile);
   const physicalPlcActive = (state.openPlc.endpointProfile === 's7-1200-robot-holding' || state.openPlc.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE || cylindrical4IntegratedActive || ft511938Active) && state.openPlc.enabled;
   const cylindrical4LegacyActive = state.openPlc.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE;
   const cylindrical4Active = cylindrical4LegacyActive || cylindrical4IntegratedActive || ft511938Active;
   const cylindrical4Robot = isCylindrical4RobotNode(node);
   const ft511938MotionPermitted = ft511938Active && isFt511938MotionPermitted(state.openPlc);
   useEffect(() => {
-    if (state.openPlc.integratedTargets && !integratedTargetsEditingRef.current) setIntegratedTargets(state.openPlc.integratedTargets);
-  }, [state.openPlc.integratedTargets]);
+    if (!state.openPlc.integratedTargets || integratedTargetsEditingRef.current) return;
+    if (ft511938Active && !ft511938TargetVectorIsValid(state.openPlc.integratedTargets)) {
+      // Do not copy an uninitialized HR38..45 image into the editable form.
+      // This keeps GOTO usable while the PLC is being recompiled or while its
+      // REAL32 feedback contract is still invalid.
+      setIntegratedTargets(ft511938SafeEditorTargets);
+      return;
+    }
+    setIntegratedTargets(state.openPlc.integratedTargets);
+  }, [ft511938Active, state.openPlc.integratedTargets]);
   const registers = (state.frame?.physicalRegisters ?? []).map((register, index) => {
     if (state.openPlc.endpointProfile === 's7-1200-robot-holding') return { ...register, address: 7 + index, displayAddress: String(7 + index) };
     if (cylindrical4IntegratedActive) {
@@ -10508,6 +10978,40 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
     ? Boolean(state.openPlc.online && state.openPlc.runtimeRunning !== false && state.openPlc.command === 1 && (state.openPlc.conditionState ?? 0) < 2)
     : state.running;
   const synchronizedTwinRows = externalPlcActive ? registers : (twinRows.length ? twinRows : registers);
+  const ft511938Graph = node ? graphFromGeometry(node.geometry) : undefined;
+  const ft511938CommandValues = useMemo(
+    () => ft511938Active && ft511938Graph && state.openPlc.integratedTargets
+      ? ft511938GraphValuesFromTargets(ft511938Graph, state.openPlc.integratedTargets)
+      : undefined,
+    [ft511938Active, ft511938Graph, state.openPlc.integratedTargets],
+  );
+  const manualControlRows = ft511938Active && state.platformManualActive && ft511938CommandValues
+    ? registers.map((register) => Number.isFinite(ft511938CommandValues[register.jointId])
+      ? { ...register, value: ft511938CommandValues[register.jointId] }
+      : register)
+    : registers;
+  const ft511938EditableSignalIds = useMemo(() => {
+    if (!ft511938Active || !ft511938Graph) return undefined;
+    const mappedJointIds = new Set(ft511938Graph.joints
+      .filter((joint) => joint.type !== 'fixed' && ft511938TargetIndexForJoint(joint) !== undefined)
+      .map((joint) => joint.id));
+    return new Set(registers.filter((register) => mappedJointIds.has(register.jointId)).map((register) => register.signalId));
+  }, [ft511938Active, ft511938Graph, registers]);
+  const ft511938ControlLimits = useMemo(
+    () => ft511938Active && ft511938Graph ? graphControlLimits(ft511938Graph, registers) : undefined,
+    [ft511938Active, ft511938Graph, registers],
+  );
+  const manualMirrorEditable = state.localManualActive
+    || (state.platformManualActive && (!ft511938Active || ft511938MotionPermitted));
+  const physicalFeedbackRange = ft511938Active
+    ? `HR${state.openPlc.address + 30}..HR${state.openPlc.address + 37}`
+    : cylindrical4IntegratedActive
+    ? `HR${state.openPlc.address + 32}..HR${state.openPlc.address + 39}`
+    : cylindrical4LegacyActive
+    ? `HR${state.openPlc.address + 15}..HR${state.openPlc.address + 18}`
+    : state.openPlc.endpointProfile === 's7-1200-robot-holding'
+    ? 'HR7..HR12'
+    : '%QW100..%QW105';
 
   return (
     <div className={`plc-dashboard ${state.advanced ? 'advanced' : ''}`} style={dashboardStyle} onClick={(event) => event.stopPropagation()}>
@@ -10621,13 +11125,13 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
         )}
         {externalPlcActive && <div className="virtual-plc-authority">{physicalPlcActive ? ft511938Active ? `Physical FT511938 PLC ${state.openPlc.host}:${state.openPlc.port} owns motion. Both 3D views use measured REAL32 HR30..37 feedback.` : cylindrical4IntegratedActive ? `Physical Cylindrical4 Integrated IoT PLC ${state.openPlc.host}:${state.openPlc.port} owns motion. Both 3D views use measured REAL32 HR32..39 feedback.` : cylindrical4LegacyActive ? `Physical Cylindrical4 FB PLC ${state.openPlc.host}:${state.openPlc.port} owns motion. Both 3D views use measured HR15..18 feedback.` : `Physical PLC ${state.openPlc.host}:${state.openPlc.port} owns motion. Both 3D views use the same HR7..12 process image.` : 'External controller has write authority. Disconnect Client before running the internal PLC CPU.'}</div>}
         <div className={`openplc-connector ${state.openPlc.online && state.openPlc.runtimeRunning === false ? 'stalled' : state.openPlc.online ? 'online' : state.openPlc.enabled ? 'waiting' : ''}`}>
-          <div className="openplc-title"><strong>{ft511938Active ? 'Physical PLC · FT511938 Unified' : cylindrical4IntegratedActive ? 'Physical PLC · Cylindrical4 Integrated IoT' : cylindrical4LegacyActive ? 'Physical PLC · Cylindrical4 FB' : state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'Physical PLC · S7-1200' : 'OpenPLC Runtime'}</strong><span>{state.openPlc.online && state.openPlc.runtimeRunning === false ? 'MODBUS ONLINE · SCAN STOPPED' : state.openPlc.online ? 'ONLINE · SCAN ACTIVE' : state.openPlc.enabled ? 'CONNECTING' : 'OFFLINE'}</span></div>
-          <label><span>PLC profile</span><select value={state.openPlc.endpointProfile} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('endpointProfile', event.target.value)}><option value="openplc">OpenPLC %QW</option><option value="s7-1200-robot-holding">Physical S7-1200 · HR0..20</option><option value={CYLINDRICAL4_ENDPOINT_PROFILE}>Physical Cylindrical4 FB · HR0..22</option><option value={CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE}>Physical Cylindrical4 Integrated IoT · HR0..60</option><option value={FT511938_ENDPOINT_PROFILE}>Physical FT511938 Unified · proposed HR0..60</option></select></label>
+<div className="openplc-title"><strong>{ft511938Active ? (state.openPlc.endpointProfile === 'openplc-ft511938' ? 'OpenPLC · FT511938 Simulation' : 'Physical PLC · FT511938 Unified') : cylindrical4IntegratedActive ? 'Physical PLC · Cylindrical4 Integrated IoT' : cylindrical4LegacyActive ? 'Physical PLC · Cylindrical4 FB' : state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'Physical PLC · S7-1200' : 'OpenPLC Runtime'}</strong><span>{state.openPlc.online && ft511938Active && state.openPlc.runtimeIssue ? 'MODBUS ONLINE · IMAGE INVALID' : state.openPlc.online && state.openPlc.runtimeRunning === false ? 'MODBUS ONLINE · SCAN STOPPED' : state.openPlc.online ? 'ONLINE · SCAN ACTIVE' : state.openPlc.enabled ? 'CONNECTING' : 'OFFLINE'}</span></div>
+          <label><span>PLC profile</span><select value={state.openPlc.endpointProfile} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('endpointProfile', event.target.value)}><option value="openplc">OpenPLC %QW</option><option value="s7-1200-robot-holding">Physical S7-1200 · HR0..20</option><option value={CYLINDRICAL4_ENDPOINT_PROFILE}>Physical Cylindrical4 FB · HR0..22</option><option value={CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE}>Physical Cylindrical4 Integrated IoT · HR0..60</option><option value="openplc-ft511938">OpenPLC FT511938 simulation · HR0..60</option><option value={FT511938_ENDPOINT_PROFILE}>Physical S7 FT511938 · HR0..60</option></select></label>
           <label><span>IP / host</span><input value={state.openPlc.host} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('host', event.target.value)} /></label>
           <label><span>Port</span><input type="number" min="1" max="65535" value={state.openPlc.port} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('port', event.target.value)} /></label>
           <label><span>Unit ID</span><input type="number" min="0" max="255" value={state.openPlc.unitId} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('unitId', event.target.value)} /></label>
           <label><span>HR start</span><input type="number" min="0" max="65535" value={state.openPlc.address} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('address', event.target.value)} /></label>
-          <label><span>Data</span><select value={state.openPlc.dataFormat} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('dataFormat', event.target.value)}><option value="float32-be">FLOAT32 BE</option><option value="int16-rad-x10000">INT16 rad x10000</option><option value="cylindrical4-rpp">R-P-P + gripper scales</option><option value="cylindrical4-integrated">Integrated HR0..60 REAL32</option><option value="ft511938-unified">FT511938 proposed HR0..60 REAL32</option></select></label>
+          <label><span>Data</span><select value={state.openPlc.dataFormat} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('dataFormat', event.target.value)}><option value="float32-be">FLOAT32 BE</option><option value="int16-rad-x10000">INT16 rad x10000</option><option value="cylindrical4-rpp">R-P-P + gripper scales</option><option value="cylindrical4-integrated">Integrated HR0..60 REAL32</option><option value="ft511938-unified">FT511938 HR0..60 REAL32</option></select></label>
           <label><span>Poll</span><input type="number" min="100" max="5000" step="50" value={state.openPlc.pollMs} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('pollMs', event.target.value)} /><small>ms</small></label>
           <label title="Remember this endpoint and resume polling automatically when the PLC network becomes available."><span>Reconnect</span><input type="checkbox" checked={state.openPlc.autoReconnect} disabled={state.openPlc.enabled} onChange={(event) => onOpenPlcConfigChange('autoReconnect', event.target.checked)} /><small>{state.openPlc.autoReconnect ? 'armed' : 'off'}</small></label>
           <button type="button" className={state.openPlc.enabled ? 'active openplc-button' : 'openplc-button'} title="Connect the selected PLC profile over Modbus TCP" disabled={!node} onClick={onToggleOpenPlc}><Link2 size={13} />{state.openPlc.enabled ? `Disconnect ${ft511938Active ? 'FT511938 PLC' : cylindrical4IntegratedActive ? 'Integrated Cylindrical4 PLC' : cylindrical4LegacyActive ? 'Cylindrical4 PLC' : state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'Physical PLC' : 'OpenPLC'}` : `Connect ${ft511938Active ? 'FT511938 PLC' : cylindrical4IntegratedActive ? 'Integrated Cylindrical4 PLC' : cylindrical4LegacyActive ? 'Cylindrical4 PLC' : state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'Physical PLC' : 'OpenPLC'}`}</button>
@@ -10670,17 +11174,8 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
               </div>
               <div className="cylindrical4-integrated-diagnostics">
                 <code>mode {state.openPlc.activeMode ?? '--'} · status {state.openPlc.status ?? '--'} · step {state.openPlc.activeStep ?? '--'} · axis alarm {state.openPlc.alarmCode ?? '--'} · IoT alarm {state.openPlc.ioTAlarmCode ?? '--'}</code>
-                <code>Pos[1..4] [{state.openPlc.integratedPositions?.map((value) => value.toFixed(2)).join(', ') ?? '--'}] · HR32..39</code>
-                <code>Target[1..4] [{state.openPlc.integratedTargets?.map((value) => value.toFixed(2)).join(', ') ?? '--'}] · HR40..47</code>
-              </div>
-              <div className="cylindrical4-integrated-jog" aria-label="Cylindrical4 integrated JOG controls">
-                <strong>JOG mantenido</strong>
-                {[1, 2, 3, 4].map((axis) => <div key={axis} className="cylindrical4-jog-row"><span>J{axis}</span><button type="button" disabled={!state.openPlc.online} title={`Hold to move J${axis} negative`} onPointerDown={() => void onCylindrical4IntegratedJog(axis as 1 | 2 | 3 | 4, -1, true)} onPointerUp={() => void onCylindrical4IntegratedJog(axis as 1 | 2 | 3 | 4, -1, false)} onPointerLeave={() => void onCylindrical4IntegratedJog(axis as 1 | 2 | 3 | 4, -1, false)}>-</button><button type="button" disabled={!state.openPlc.online} title={`Hold to move J${axis} positive`} onPointerDown={() => void onCylindrical4IntegratedJog(axis as 1 | 2 | 3 | 4, 1, true)} onPointerUp={() => void onCylindrical4IntegratedJog(axis as 1 | 2 | 3 | 4, 1, false)} onPointerLeave={() => void onCylindrical4IntegratedJog(axis as 1 | 2 | 3 | 4, 1, false)}>+</button></div>)}
-              </div>
-              <div className="cylindrical4-integrated-goto">
-                <strong>GOTO manual [grados, mm, mm, mm]</strong>
-                <div>{integratedTargets.map((value, index) => <label key={index}><span>J{index + 1}</span><input type="number" step={index === 0 ? '0.1' : '1'} value={value} disabled={!state.openPlc.online} onChange={(event) => setIntegratedTargets((current) => current.map((item, itemIndex) => itemIndex === index ? Number(event.target.value) : item) as [number, number, number, number])} /></label>)}</div>
-                <button type="button" disabled={!state.openPlc.online || !cylindrical4Robot} onClick={() => void onCylindrical4IntegratedGoto(integratedTargets)}><Send size={13} />Send GOTO</button>
+                <code>Pos[1..4] [{state.openPlc.integratedPositions?.map((value) => value.toFixed(2)).join(', ') ?? '--'}] · HR30..37</code>
+                <code>Target[1..4] [{state.openPlc.integratedTargets?.map((value) => value.toFixed(2)).join(', ') ?? '--'}] · HR38..45</code>
               </div>
             </div>
           )}
@@ -10689,7 +11184,7 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
               <div className={`physical-plc-link-state ${state.openPlc.online ? 'connected' : 'disconnected'}`}>
                 <i aria-hidden="true" />
                 <strong>{state.openPlc.online ? 'FT511938 CONNECTED' : 'FT511938 DISCONNECTED'}</strong>
-                <span>{cylindrical4Robot ? 'Native four-axis cylindrical graph detected' : 'Select the native four-axis cylindrical robot'} · proposed HR0..HR60 adapter image</span>
+                <span>{cylindrical4Robot ? 'Native four-axis cylindrical graph detected' : 'Select the native four-axis cylindrical robot'} · HR0..HR60 process image</span>
               </div>
               <div className="physical-plc-test-actions">
                 <button type="button" disabled={state.openPlc.probing || !cylindrical4Robot} onClick={() => void onTestFt511938()}><Activity size={13} />{state.openPlc.probing ? 'Testing...' : 'Test FT511938'}</button>
@@ -10711,6 +11206,7 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
                 <button type="button" className={state.openPlc.sensorPolicy === 1 ? 'active' : ''} disabled={!state.openPlc.enabled} title="AUTO runs while IoT gyro motion is present. Manual PLC ignores IoT." onClick={() => onOpenPlcSensorPolicy(1)}>Auto · IoT en movimiento</button>
               </div>
               <div className="ft511938-permissions" aria-label="FT511938 PLC permissions">
+                {!ft511938MotionPermitted && <span role="status">Movimiento bloqueado: {ft511938MotionPermissionReasons(state.openPlc).join('; ')}</span>}
                 <code className={state.openPlc.safetyOk ? 'permission-ok' : ''}>SafetyOK {state.openPlc.safetyOk ? '1' : '0'}</code>
                 <code className={state.openPlc.drivesReady ? 'permission-ok' : ''}>DrivesReady {state.openPlc.drivesReady ? '1' : '0'}</code>
                 <code className={state.openPlc.commFresh ? 'permission-ok' : ''}>CommFresh {state.openPlc.commFresh ? '1' : '0'}</code>
@@ -10718,21 +11214,13 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
                 <code className={state.openPlc.wiringVerified ? 'permission-ok' : ''}>WiringVerified {state.openPlc.wiringVerified ? '1' : '0'}</code>
                 <code className={state.openPlc.physicalOutputEnable ? 'permission-ok' : ''}>PhysicalOutputEnable {state.openPlc.physicalOutputEnable ? '1' : '0'}</code>
                 <code className={(state.openPlc.homedMask ?? 0) === 15 ? 'permission-ok' : ''}>Homed mask {state.openPlc.homedMask ?? '--'}</code>
+                <code className={state.openPlc.startupReady ? 'permission-ok' : 'permission-blocked'}>StartupReady HR59 {state.openPlc.startupReady ? '1 · SCAN' : '0 · STOPPED'}</code>
               </div>
-              <div className="cylindrical4-integrated-jog" aria-label="FT511938 maintained JOG controls">
-                <strong>JOG mantenido · PLC-owned permits required</strong>
-                {[1, 2, 3, 4].map((axis) => <div key={axis} className="cylindrical4-jog-row"><span>J{axis}</span><button type="button" disabled={!ft511938MotionPermitted} title={`Hold to move J${axis} negative`} onPointerDown={() => void onFt511938Jog(axis as 1 | 2 | 3 | 4, -1, true)} onPointerUp={() => void onFt511938Jog(axis as 1 | 2 | 3 | 4, -1, false)} onPointerLeave={() => void onFt511938Jog(axis as 1 | 2 | 3 | 4, -1, false)}>-</button><button type="button" disabled={!ft511938MotionPermitted} title={`Hold to move J${axis} positive`} onPointerDown={() => void onFt511938Jog(axis as 1 | 2 | 3 | 4, 1, true)} onPointerUp={() => void onFt511938Jog(axis as 1 | 2 | 3 | 4, 1, false)} onPointerLeave={() => void onFt511938Jog(axis as 1 | 2 | 3 | 4, 1, false)}>+</button></div>)}
-              </div>
-              <div className="cylindrical4-integrated-goto">
-                <strong>GOTO manual [J1 grados, J2/J3/J4 mm]</strong>
-                <div>{integratedTargets.map((value, index) => <label key={index}><span>J{index + 1}</span><input type="number" step={index === 0 ? '0.1' : '1'} value={value} disabled={!ft511938MotionPermitted} onChange={(event) => { integratedTargetsEditingRef.current = true; setIntegratedTargets((current) => current.map((item, itemIndex) => itemIndex === index ? Number(event.target.value) : item) as [number, number, number, number]); }} /></label>)}</div>
-                <button type="button" disabled={!ft511938MotionPermitted || !cylindrical4Robot} onClick={() => { integratedTargetsEditingRef.current = false; void onFt511938Goto(integratedTargets); }}><Send size={13} />Send GOTO</button>
-              </div>
-              <small className="ft511938-contract-note">HR0..60 is the proposed TwinAxis adapter for FB_FT511938_Unificado. Verify DB offsets, REAL32 word order and electrical permissions in the commissioned PLC before enabling physical outputs.</small>
+              <small className="ft511938-contract-note">HR0..60 is the shared process image for FB_FT511938_Real and the commissioning adapter. Verify DB offsets, REAL32 word order and electrical permissions before enabling physical outputs.</small>
             </div>
           )}
-          <code>FC03 · {ft511938Active ? '61 HR FT511938 proposed adapter image' : cylindrical4IntegratedActive ? '61 HR integrated process image' : cylindrical4LegacyActive ? '23 HR adapter image' : state.openPlc.endpointProfile === 's7-1200-robot-holding' ? '21 HR process image' : `${state.openPlc.quantity} HR`} · Unit {state.openPlc.unitId} · RX {state.openPlc.received}</code>
-          {state.openPlc.diagnostics && <code>{state.openPlc.diagnostics}</code>}
+          <code>FC03 · {ft511938Active ? '61 HR FT511938 process image' : cylindrical4IntegratedActive ? '61 HR integrated process image' : cylindrical4LegacyActive ? '23 HR adapter image' : state.openPlc.endpointProfile === 's7-1200-robot-holding' ? '21 HR process image' : `${state.openPlc.quantity} HR`} · Unit {state.openPlc.unitId} · RX {state.openPlc.received}</code>
+          {state.openPlc.diagnostics && state.openPlc.diagnostics !== state.openPlc.runtimeIssue && <code>{state.openPlc.diagnostics}</code>}
           {state.openPlc.runtimeIssue && <span className="openplc-runtime-error" role="alert">{state.openPlc.runtimeIssue}</span>}
           {state.openPlc.rawRegisters && <code>{state.openPlc.online ? 'RAW' : 'STALE RAW'} [{state.openPlc.rawRegisters.join(', ')}]</code>}
           {state.openPlc.error && <span className="openplc-error">{state.openPlc.error}</span>}
@@ -10750,8 +11238,8 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
               {(state.localManualActive || state.platformManualActive) ? <Pause size={13} /> : <Unlock size={13} />}
               {state.openPlc.enabled ? 'Manual PLC' : 'Local Manual'}
             </button>
-            <button type="button" className={state.openPlc.command === 1 ? 'active auto' : ''} disabled={!state.openPlc.enabled || ft511938Active} title="Command 1: execute the automatic robot sequence continuously" onClick={() => onOpenPlcCommand(1)}><Play size={13} />Auto</button>
-            <button type="button" className={state.openPlc.command === 2 ? 'active home' : ''} disabled={!state.openPlc.enabled || ft511938Active} title="Command 2: move and hold the robot at its configured Home pose" onClick={() => onOpenPlcCommand(2)}><RotateCw size={13} />Home</button>
+            <button type="button" className={state.openPlc.command === 1 ? 'active auto' : ''} disabled={!state.openPlc.enabled} title={ft511938Active ? 'Command 1: the FT511938 PLC runs AUTO only when its selected IoT policy allows it.' : 'Command 1: execute the automatic robot sequence continuously'} onClick={() => onOpenPlcCommand(1)}><Play size={13} />Auto</button>
+            <button type="button" className={state.openPlc.command === 2 ? 'active home' : ''} disabled={!state.openPlc.enabled} title={ft511938Active ? 'Command 2: move and hold the FT511938 robot at its PLC Home pose. IoT does not gate Home.' : 'Command 2: move and hold the robot at its configured Home pose'} onClick={() => onOpenPlcCommand(2)}><RotateCw size={13} />Home</button>
             <code>{state.openPlc.command} · {state.openPlc.command === 0 ? 'manual hold' : state.openPlc.command === 1 ? 'automatic cycle' : 'home pose'}</code>
           </div>
           {!cylindrical4Active && <div className={`openplc-iot-reaction condition-${state.openPlc.conditionState ?? 3}`}>
@@ -10834,9 +11322,12 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
         <PlcRobotMirror
           node={node}
           title={physicalPlcActive ? 'Entidad Física · PLC Real' : 'Entidad Fisica Simulada'}
-          subtitle={physicalPlcActive ? `Imagen de proceso recibida por FC03 desde ${state.openPlc.host}:${state.openPlc.port}, HR7..12.` : 'Proceso fisico controlado por scan, interlocks y salidas del PLC virtual.'}
+          subtitle={physicalPlcActive ? `Imagen de proceso recibida por FC03 desde ${state.openPlc.host}:${state.openPlc.port}, ${physicalFeedbackRange}.` : 'Proceso fisico controlado por scan, interlocks y salidas del PLC virtual.'}
           rows={registers}
-          editable={state.localManualActive || state.platformManualActive}
+          controlRows={manualControlRows}
+          controlLimits={ft511938ControlLimits}
+          editableSignalIds={ft511938EditableSignalIds}
+          editable={manualMirrorEditable}
           running={mirrorRunning}
           onWriteRegister={onWriteRegister}
         />
@@ -10845,7 +11336,12 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
           title="Gemelo Digital 3D"
           subtitle="Recibe datos decodificados y actualiza kinematicState."
           rows={synchronizedTwinRows}
+          controlRows={manualControlRows}
+          controlLimits={ft511938ControlLimits}
+          editableSignalIds={ft511938EditableSignalIds}
+          editable={manualMirrorEditable}
           running={mirrorRunning}
+          onWriteRegister={onWriteRegister}
         />
       </div>
 

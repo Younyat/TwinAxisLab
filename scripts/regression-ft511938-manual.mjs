@@ -9,7 +9,17 @@ const root = resolve('.');
 const vitePort = Number(process.env.FT511938_TEST_VITE_PORT ?? 5227);
 const modbusPort = Number(process.env.FT511938_TEST_MODBUS_PORT ?? 15027);
 const fixtureDirectory = resolve(tmpdir(), 'twinaxis-ft511938-regression');
-const sourceAsset = resolve('3d imported models', 'celda_robotica', 'cobot-6dof.glb');
+const desktopScreenshot = resolve(tmpdir(), 'twinaxis-ft511938-manual-desktop.png');
+const mobileScreenshot = resolve(tmpdir(), 'twinaxis-ft511938-manual-mobile.png');
+const sourceAsset = resolve(
+  '..',
+  '3D Asset Platform',
+  '3d imported models',
+  'celda_robotica',
+  'brazo-cilindrico-new',
+  'modelo',
+  'brazo_cilindrico_4_nodos.glb',
+);
 const fixtureAsset = resolve(fixtureDirectory, 'brazo_cilindrico_4_nodos.glb');
 const words = new Array(61).fill(0);
 const writes = [];
@@ -105,7 +115,9 @@ const initializeProcessImage = () => {
   writeWord(56, 0);
   writeWord(57, 0);
   writeWord(58, 1);
-  writeWord(59, 0);
+  // HR59 is written by the running POU. The fake endpoint represents a
+  // running OpenPLC task, so it must expose StartupReady=1 explicitly.
+  writeWord(59, 1);
   writeWord(60, 0);
 };
 
@@ -267,8 +279,12 @@ try {
   await dashboard.waitFor();
 
   const connector = dashboard.locator('.openplc-connector');
-  await connector.locator('label').filter({ hasText: 'PLC profile' }).locator('select').selectOption('ft511938-unified');
-  await connector.getByText(/FT511938 unified adapter selected/).waitFor({ timeout: 10000 });
+  await connector.locator('label').filter({ hasText: 'IP / host' }).locator('input').fill('127.0.0.1');
+  await connector.locator('label').filter({ hasText: 'PLC profile' }).locator('select').selectOption('openplc-ft511938');
+  if (await connector.locator('label').filter({ hasText: 'IP / host' }).locator('input').inputValue() !== '127.0.0.1') {
+    throw new Error('Selecting FT511938 redirected the local OpenPLC endpoint to a physical PLC.');
+  }
+  await connector.getByText(/FT511938 unified controller selected/).waitFor({ timeout: 10000 });
   await connector.locator('label').filter({ hasText: 'IP / host' }).locator('input').fill('127.0.0.1');
   await connector.locator('label').filter({ hasText: 'Port' }).locator('input').fill(String(modbusPort));
   await connector.locator('label').filter({ hasText: 'Unit ID' }).locator('input').fill('1');
@@ -282,12 +298,33 @@ try {
   }
   await connector.getByText('FT511938 CONNECTED', { exact: true }).waitFor({ timeout: 30000 });
   await connector.getByText(/61 HR FT511938/).waitFor({ timeout: 30000 });
+  const readDeadline = Date.now() + 5000;
+  while (reads < 2 && Date.now() < readDeadline) await page.waitForTimeout(100);
   if (reads < 2) throw new Error(`FT process image was not polled in real time: ${reads} reads.`);
   await page.waitForTimeout(1000);
 
   const idlePolicyButton = dashboard.getByRole('button', { name: 'Auto · IoT sin movimiento', exact: true });
   const motionPolicyButton = dashboard.getByRole('button', { name: 'Auto · IoT en movimiento', exact: true });
   if (!(await idlePolicyButton.isVisible()) || !(await motionPolicyButton.isVisible())) throw new Error(`The two AUTO IoT policies are not visible in the dashboard. Dashboard: ${await dashboard.innerText()}`);
+  const autoWriteStart = writes.length;
+  await idlePolicyButton.click();
+  await page.waitForFunction(() => document.querySelector('.openplc-robot-command button.active.auto') !== null, undefined, { timeout: 10000 }).catch(async () => {
+    const deadline = Date.now() + 10000;
+    while (Date.now() < deadline && !writes.slice(autoWriteStart).some(w => w.address === 0 && w.values[0] === 1)) await page.waitForTimeout(100);
+  });
+  const autoWrites = writes.slice(autoWriteStart);
+  if (!autoWrites.some(w => w.address === 14 && w.values[0] === 0)) throw new Error('AUTO policy was not written.');
+  const holdIndex = autoWrites.findIndex(w => w.address === 0 && w.values[0] === 0);
+  const autoIndex = autoWrites.findIndex(w => w.address === 0 && w.values[0] === 1);
+  if (holdIndex < 0 || autoIndex <= holdIndex) throw new Error('OpenPLC AUTO must send HOLD followed by Cmd=1.');
+  // The uploaded OpenPLC POU consumes these bridge-owned gates, unlike S7.
+  const appSource = await import('node:fs/promises').then(fs => fs.readFile('src/presentation/App.tsx', 'utf8'));
+  if (!appSource.includes("current.openPlc.endpointProfile === 'openplc-ft511938'")
+      || !appSource.includes("current.openPlc.simulationMode === 1")
+      || !appSource.includes("{ id: 'simulation-comm-fresh', wire: 23 }")
+      || !appSource.includes("{ id: 'simulation-sensor-ok', wire: 24 }")) {
+    throw new Error('OpenPLC simulation health-word contract missing.');
+  }
 
   // Deliberately make the IoT sample invalid. Manual PLC must remain
   // available because this gate belongs to AUTO only.
@@ -312,40 +349,100 @@ try {
   }
   if (!writes.some((write) => write.address === 0 && write.values[0] === 0)) throw new Error('Manual authority did not write Cmd=0 HOLD.');
 
-  const ftPanel = dashboard.locator('.ft511938-test-panel');
-  const gotoInputs = ftPanel.locator('.cylindrical4-integrated-goto input');
-  const target = [35, 325, 110, 40];
-  for (let index = 0; index < target.length; index += 1) await gotoInputs.nth(index).fill(String(target[index]));
-  await ftPanel.getByRole('button', { name: 'Send GOTO' }).click();
-  try {
-    await page.waitForFunction((expected) => {
-      const text = document.querySelector('.ft511938-test-panel')?.textContent ?? '';
-      return expected.every((value) => text.includes(value.toFixed(2)));
-    }, target, { timeout: 30000 });
-  } catch {
-    throw new Error(`FT GOTO feedback did not show target. Console: ${JSON.stringify(consoleMessages.slice(-8))}. Control writes: ${JSON.stringify(writes.filter((write) => write.address < 14).slice(-20))}. Panel: ${await ftPanel.innerText()}`);
+  const twinMirror = dashboard.locator('.plc-robot-screen').nth(1);
+  const twinControls = twinMirror.locator('.plc-register-control input');
+  if (await twinControls.count() < 4) throw new Error(`Expected four FT manual controls, found ${await twinControls.count()}.`);
+  const axisCases = [
+    { control: 0, axis: 0, graphValue: -0.35, engineeringRange: [-21, -19], label: 'J1 base' },
+    { control: 1, axis: 1, graphValue: -0.04, engineeringRange: [259, 261], label: 'J2 vertical' },
+    { control: 2, axis: 2, graphValue: 0.04, engineeringRange: [99, 101], label: 'J3 extension' },
+    { control: 3, axis: 3, graphValue: 0.10, engineeringRange: [59, 61], label: 'J4 gripper' },
+  ];
+  const target = [0, 300, 60, 50];
+  for (const axisCase of axisCases) {
+    await twinControls.nth(axisCase.control).evaluate((element, requestedValue) => {
+      const input = element;
+      const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      nativeSetter?.call(input, String(requestedValue));
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }, axisCase.graphValue);
+    await page.waitForTimeout(250);
+    const retainedCommandValue = Number(await twinControls.nth(axisCase.control).inputValue());
+    if (Math.abs(retainedCommandValue - axisCase.graphValue) > 0.006) {
+      throw new Error(`${axisCase.label} rebounded in the lower manual control: expected ${axisCase.graphValue.toFixed(3)}, received ${retainedCommandValue}.`);
+    }
+    const targetDeadline = Date.now() + 5000;
+    while (Date.now() < targetDeadline) {
+      const engineeringValue = readFloat(6 + axisCase.axis * 2);
+      if (engineeringValue >= axisCase.engineeringRange[0] && engineeringValue <= axisCase.engineeringRange[1]) break;
+      await page.waitForTimeout(100);
+    }
+    const engineeringValue = readFloat(6 + axisCase.axis * 2);
+    if (engineeringValue < axisCase.engineeringRange[0] || engineeringValue > axisCase.engineeringRange[1]) {
+      throw new Error(`${axisCase.label} was not encoded in engineering units: ${engineeringValue}.`);
+    }
+    target[axisCase.axis] = engineeringValue;
+    const feedbackDeadline = Date.now() + 8000;
+    while (Date.now() < feedbackDeadline && Math.abs(readFloat(30 + axisCase.axis * 2) - engineeringValue) > 0.25) {
+      await page.waitForTimeout(100);
+    }
+    if (Math.abs(readFloat(30 + axisCase.axis * 2) - engineeringValue) > 0.25) {
+      throw new Error(`${axisCase.label} PLC feedback did not reach its target: ${readFloat(30 + axisCase.axis * 2)} -> ${engineeringValue}.`);
+    }
   }
-  await page.waitForFunction(() => document.querySelector('.ft511938-test-panel')?.textContent?.includes('mode 4') ?? false, undefined, { timeout: 30000 });
-  await page.waitForFunction(() => document.querySelector('.ft511938-test-panel')?.textContent?.includes('status 2') ?? false, undefined, { timeout: 30000 });
+  await page.waitForTimeout(500);
   const after = await canvasSample(page);
   const changedPixels = sampleDiff(before, after);
   if (changedPixels < 3) throw new Error(`The digital twin did not visibly change after PLC feedback. Changed samples: ${changedPixels}.`);
 
-  const gotoWrite = writes.find((write) => write.address === 6 && write.values.length === 8);
+  const gotoWrite = writes.filter((write) => write.address === 6 && write.values.length === 8).at(-1);
   if (!gotoWrite) throw new Error('TwinAxis did not write the FT511938 ManualTarget REAL32 block HR6..13.');
   if (!writes.some((write) => write.address === 0 && write.values[0] === 4)) throw new Error('TwinAxis did not write Cmd=4 GOTO after updating targets.');
   const decodedTarget = [readFloat(6), readFloat(8), readFloat(10), readFloat(12)];
-  if (decodedTarget.some((value, index) => Math.abs(value - target[index]) > 0.01)) throw new Error(`FT target image mismatch: ${decodedTarget.join(', ')}.`);
+  if (decodedTarget.some((value, index) => Math.abs(value - target[index]) > 0.01)) throw new Error(`FT target image mismatch from existing manual menu: ${decodedTarget.join(', ')}.`);
+  if (Math.abs(readFloat(30) - target[0]) > 0.5 || Math.abs(readFloat(32) - target[1]) > 0.5 || Math.abs(readFloat(34) - target[2]) > 0.5 || Math.abs(readFloat(36) - target[3]) > 0.5) {
+    throw new Error(`FT feedback image mismatch after existing manual menu update: [${readFloat(30)}, ${readFloat(32)}, ${readFloat(34)}, ${readFloat(36)}].`);
+  }
 
-  const positionBeforeRelease = [...position];
   await manualButton.click();
-  await page.waitForTimeout(1200);
+  await page.waitForTimeout(400);
+  const positionBeforeRelease = [...position];
+  await page.waitForTimeout(800);
   const positionAfterRelease = [...position];
   const lastCommandWrite = writes.filter((write) => write.address === 0).at(-1);
   if (lastCommandWrite?.values[0] !== 0) throw new Error(`Releasing manual authority did not return the PLC to Cmd=0 HOLD: ${JSON.stringify(lastCommandWrite)}.`);
   if (positionAfterRelease.some((value, index) => Math.abs(value - positionBeforeRelease[index]) > 0.001)) throw new Error(`PLC did not hold the released pose: ${positionBeforeRelease} -> ${positionAfterRelease}.`);
   if (!await connector.getByText(/ONLINE.*SCAN ACTIVE/).isVisible()) throw new Error('FT511938 polling disconnected after manual release.');
   if (pageErrors.length) throw new Error(`Browser errors during FT manual exchange: ${pageErrors.join(' | ')}`);
+  const mirrorSection = dashboard.locator('.plc-twin-split');
+  await mirrorSection.evaluate((element) => element.scrollIntoView({ block: 'start' }));
+  await page.waitForTimeout(200);
+  await page.screenshot({ path: desktopScreenshot, fullPage: false });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(300);
+  const mobilePixels = await canvasSample(page);
+  if (!mobilePixels.some((value) => value > 0)) throw new Error('The FT511938 canvas is blank at the mobile viewport.');
+  const mobileLayout = await dashboard.locator('.plc-robot-screen').evaluateAll((screens) => screens.map((screen) => {
+    const bounds = screen.getBoundingClientRect();
+    const controls = [...screen.querySelectorAll('.plc-register-control')].map((control) => {
+      const rect = control.getBoundingClientRect();
+      return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+    });
+    return { left: bounds.left, right: bounds.right, top: bounds.top, bottom: bounds.bottom, controls };
+  }));
+  if (mobileLayout.length >= 2 && mobileLayout[0].bottom > mobileLayout[1].top + 1) {
+    throw new Error(`The physical and digital robot panels overlap on mobile: ${JSON.stringify(mobileLayout)}.`);
+  }
+  if (mobileLayout.some((screen) => screen.controls.some((control) => control.left < screen.left - 1
+    || control.right > screen.right + 1
+    || control.top < screen.top - 1
+    || control.bottom > screen.bottom + 1))) {
+    throw new Error(`A manual joint control overflows its mobile robot panel: ${JSON.stringify(mobileLayout)}.`);
+  }
+  await mirrorSection.evaluate((element) => element.scrollIntoView({ block: 'start' }));
+  await page.waitForTimeout(200);
+  await page.screenshot({ path: mobileScreenshot, fullPage: false });
 
   console.log(JSON.stringify({
     result: 'PASS',
@@ -356,9 +453,12 @@ try {
     heldPosition: positionAfterRelease,
     changedPixels,
     manualHold: true,
+    allManualTargetsRetained: true,
     manualIgnoresInvalidIoT: true,
     feedbackMode: 4,
     processImage: 'HR0..HR60',
+    mobileLayout,
+    screenshots: [desktopScreenshot, mobileScreenshot],
   }, null, 2));
 } finally {
   await browser?.close();

@@ -1,26 +1,3 @@
-// FT511938 OpenPLC simulator adapter for TwinAxis.
-//
-// This POU uses the TwinAxis FT511938 adapter image HR0..HR60.
-// It is intended for OpenPLC simulation and commissioning only. The real
-// S7-1200 program must use measured encoder/limit/safety inputs before any
-// physical output is enabled.
-//
-// Control image:
-// HR0 Cmd: 0 manual hold, 1 demo, 2 home, 3 maintained jog, 4 goto
-// HR1 Enable, HR2 JogAxis, HR3 JogDirection, HR4 JogEnable, HR5 heartbeat
-// HR6..13 ManualTarget[1..4] REAL32, big endian high word first
-// HR14..20 AUTO IoT policy (0=stillness, 1=motion), validity, quality, age,
-// temperature, humidity, gyro. Manual Cmd=3/4 ignores this gate.
-// HR21..29 PLC permits and diagnostic masks
-// HR30..37 measured position REAL32, HR38..45 active target REAL32
-// HR46..60 status, mode, step, alarms, masks and counters
-// HR58 SimulationMode: 1 is the OpenPLC-only internal pose simulator.
-//
-// IMPORTANT: HR30..37 are simulated measured feedback in this POU. The POU
-// integrates them toward a target so the platform can test a bidirectional
-// PLC loop. Do not use this internal position integrator as feedback for a
-// real motor without replacing it with measured inputs.
-
 VAR
   Cmd AT %QW0 : UINT := 0;
   Enable AT %QW1 : UINT := 1;
@@ -29,10 +6,14 @@ VAR
   JogEnable AT %QW4 : UINT := 0;
   HeartbeatSequence AT %QW5 : UINT := 0;
 
-  ManualTarget1 AT %QD3 : REAL := 0.0;
-  ManualTarget2 AT %QD4 : REAL := 300.0;
-  ManualTarget3 AT %QD5 : REAL := 60.0;
-  ManualTarget4 AT %QD6 : REAL := 50.0;
+  ManualTarget1High AT %QW6 : UINT := 0;
+  ManualTarget1Low AT %QW7 : UINT := 0;
+  ManualTarget2High AT %QW8 : UINT := 17302;
+  ManualTarget2Low AT %QW9 : UINT := 0;
+  ManualTarget3High AT %QW10 : UINT := 17008;
+  ManualTarget3Low AT %QW11 : UINT := 0;
+  ManualTarget4High AT %QW12 : UINT := 16968;
+  ManualTarget4Low AT %QW13 : UINT := 0;
 
   SensorPolicy AT %QW14 : UINT := 0;
   SensorValid AT %QW15 : UINT := 1;
@@ -52,14 +33,22 @@ VAR
   WiringVerified AT %QW28 : UINT := 0;
   PhysicalOutputEnable AT %QW29 : UINT := 0;
 
-  Pos1 AT %QD15 : REAL := 0.0;
-  Pos2 AT %QD16 : REAL := 300.0;
-  Pos3 AT %QD17 : REAL := 60.0;
-  Pos4 AT %QD18 : REAL := 50.0;
-  Target1 AT %QD19 : REAL := 0.0;
-  Target2 AT %QD20 : REAL := 300.0;
-  Target3 AT %QD21 : REAL := 60.0;
-  Target4 AT %QD22 : REAL := 50.0;
+  Pos1High AT %QW30 : UINT := 0;
+  Pos1Low AT %QW31 : UINT := 0;
+  Pos2High AT %QW32 : UINT := 0;
+  Pos2Low AT %QW33 : UINT := 0;
+  Pos3High AT %QW34 : UINT := 0;
+  Pos3Low AT %QW35 : UINT := 0;
+  Pos4High AT %QW36 : UINT := 0;
+  Pos4Low AT %QW37 : UINT := 0;
+  Target1High AT %QW38 : UINT := 0;
+  Target1Low AT %QW39 : UINT := 0;
+  Target2High AT %QW40 : UINT := 0;
+  Target2Low AT %QW41 : UINT := 0;
+  Target3High AT %QW42 : UINT := 0;
+  Target3Low AT %QW43 : UINT := 0;
+  Target4High AT %QW44 : UINT := 0;
+  Target4Low AT %QW45 : UINT := 0;
 
   Status AT %QW46 : UINT := 0;
   ActiveMode AT %QW47 : UINT := 0;
@@ -74,9 +63,12 @@ VAR
   DirectionMask AT %QW56 : UINT := 0;
   HeartbeatEcho AT %QW57 : UINT := 0;
   SimulationMode AT %QW58 : UINT := 1;
+  StartupReady AT %QW59 : UINT := 0;
   DoneCounter AT %QW60 : UINT := 0;
 
   SegmentTimer : TON;
+  AutoSegmentTimerA : TON;
+  AutoSegmentTimerB : TON;
   JogPulseTimer : TON;
   SettleTimer : TON;
   MotionIdleTimer : TON;
@@ -90,6 +82,9 @@ VAR
   SegmentDurationMs : DINT := 1800;
   P : REAL := 0.0;
   SegmentRunning : BOOL := FALSE;
+  AutoSegmentReady : BOOL := FALSE;
+  AutoSegmentRunning : BOOL := FALSE;
+  AutoSegmentDone : BOOL := FALSE;
   AtTarget : BOOL := FALSE;
   AnyMoving : BOOL := FALSE;
   DonePulse : BOOL := FALSE;
@@ -118,6 +113,10 @@ VAR
   SegmentStart2 : REAL := 300.0;
   SegmentStart3 : REAL := 60.0;
   SegmentStart4 : REAL := 50.0;
+  AutoSegmentStart1 : REAL := 0.0;
+  AutoSegmentStart2 : REAL := 300.0;
+  AutoSegmentStart3 : REAL := 60.0;
+  AutoSegmentStart4 : REAL := 50.0;
   TargetValue : REAL := 0.0;
   ManualValid : BOOL := FALSE;
   DemoTarget1 : REAL := 0.0;
@@ -139,22 +138,28 @@ VAR
   ManualHeightReady : BOOL := FALSE;
   ManualGripperReady : BOOL := FALSE;
   StartupDefaultsApplied : BOOL := FALSE;
+  RealBits : POINTER TO DWORD;
+  RawReal : DWORD := 0;
+  RawRealPointer : POINTER TO REAL;
+  ManualTarget1 : REAL := 0.0;
+  ManualTarget2 : REAL := 300.0;
+  ManualTarget3 : REAL := 60.0;
+  ManualTarget4 : REAL := 50.0;
+  Pos1 : REAL := 0.0;
+  Pos2 : REAL := 300.0;
+  Pos3 : REAL := 60.0;
+  Pos4 : REAL := 50.0;
+  Target1 : REAL := 0.0;
+  Target2 : REAL := 300.0;
+  Target3 : REAL := 60.0;
+  Target4 : REAL := 50.0;
 END_VAR
 
 
-// 1. Simulated process image and IoT condition monitor.
-// Cmd=0 is deliberately a hold state. It never writes Home values.
-// OpenPLC can start a newly compiled POU with zeroed mapped output words
-// instead of applying the declarations' initial values. The FT511938 file is
-// explicitly the local OpenPLC simulator adapter, so recover its safe
-// commissioning defaults once at the first scan. This block is deliberately
-// absent from the S7-1200 program: a physical PLC must receive measured
-// safety, homing and encoder values from its real I/O and must never bootstrap
-// those permits in application logic.
 IF NOT StartupDefaultsApplied THEN
-  IF (Enable = 0) AND (HomedMask = 0) AND (SimulationMode = 0)
-     AND (SafetyOK = 0) AND (DrivesReady = 0)
-     AND (WiringVerified = 0) AND (PhysicalOutputEnable = 0) THEN
+  IF ((Pos4High = 0) AND (Pos4Low = 0))
+     OR (Pos2 < 128.0) OR (Pos2 > 362.0)
+     OR (Pos4 < 10.0) OR (Pos4 > 72.0) THEN
     Enable := 1;
     HomedMask := 15;
     SimulationMode := 1;
@@ -175,6 +180,21 @@ IF NOT StartupDefaultsApplied THEN
   END_IF;
   StartupDefaultsApplied := TRUE;
 END_IF;
+
+RawReal := SHL(TO_DWORD(ManualTarget1High), 16) OR TO_DWORD(ManualTarget1Low);
+RawRealPointer := ADR(RawReal);
+ManualTarget1 := RawRealPointer^;
+RawReal := SHL(TO_DWORD(ManualTarget2High), 16) OR TO_DWORD(ManualTarget2Low);
+RawRealPointer := ADR(RawReal);
+ManualTarget2 := RawRealPointer^;
+RawReal := SHL(TO_DWORD(ManualTarget3High), 16) OR TO_DWORD(ManualTarget3Low);
+RawRealPointer := ADR(RawReal);
+ManualTarget3 := RawRealPointer^;
+RawReal := SHL(TO_DWORD(ManualTarget4High), 16) OR TO_DWORD(ManualTarget4Low);
+RawRealPointer := ADR(RawReal);
+ManualTarget4 := RawRealPointer^;
+
+StartupReady := 1;
 
 HeartbeatEcho := HeartbeatSequence;
 TemperatureC := INT_TO_REAL(TemperatureCx100) / 100.0;
@@ -236,12 +256,8 @@ PhysicalPermitted := (Enable <> 0) AND (HomedMask = 15)
                           OR ((SafetyOK <> 0) AND (DrivesReady <> 0)
                               AND (WiringVerified <> 0) AND (PhysicalOutputEnable <> 0)));
 
-// Manual control is owned by the operator/platform. IoT validity, freshness,
-// temperature, humidity and gyro motion never revoke a manual JOG or GOTO.
 ManualPermitted := PhysicalPermitted;
 
-// AUTO has two explicit IoT gates. Policy 0 runs only after the sensor has
-// been still for two seconds; policy 1 runs only while sensor motion exists.
 AutoMotionAllowed := FALSE;
 IF SensorPolicy = 0 THEN
   AutoMotionAllowed := (NOT MotionPresent) AND MotionIdleTimer.Q;
@@ -260,16 +276,12 @@ AutoPermitted := PhysicalPermitted
                  AND (NOT IoTDegraded)
                  AND AutoMotionAllowed;
 
-// The active mode selects the permission used by the motion engine. AUTO can
-// remain latched in a safe hold while its IoT gate is false; manual remains
-// independent of the IoT gate.
 IF ModeState = 1 THEN
   Permitted := AutoPermitted;
 ELSE
   Permitted := ManualPermitted;
 END_IF;
 
-// 2. Copy current simulated position into the public feedback image.
 Pos1 := Current1;
 Pos2 := Current2;
 Pos3 := Current3;
@@ -282,7 +294,6 @@ AtTarget := FALSE;
 ActiveAxis := 0;
 Fault := 0;
 
-// 3. Command edges. Manual hold preserves the current pose.
 IF Cmd = 2 THEN
   IF LastCmd <> 2 THEN
     ModeState := 2;
@@ -299,9 +310,9 @@ IF Cmd = 2 THEN
     ManualComplete := FALSE;
     ManualTargetError := FALSE;
     LastActiveAxis := 0;
+    AutoSegmentReady := FALSE;
   END_IF;
 ELSIF Cmd = 0 THEN
-  // Cmd=0 is a hold command. It stops an active plan without changing pose.
   ModeState := 0;
   Step := 0;
   ManualSafeHeight := FALSE;
@@ -312,28 +323,24 @@ ELSIF Cmd = 0 THEN
   ManualComplete := FALSE;
   ManualTargetError := FALSE;
   LastActiveAxis := 0;
+  AutoSegmentReady := FALSE;
 ELSIF (Cmd = 1) AND (LastCmd <> 1) THEN
-  // Starting AUTO only requires physical authority. Its IoT policy may be
-  // waiting; the cycle remains held and resumes when the gate is satisfied.
   IF ManualPermitted THEN
     ModeState := 1;
     Step := 1;
     LastActiveAxis := 0;
+    AutoSegmentReady := FALSE;
   ELSE
     Fault := 1;
   END_IF;
 ELSIF Cmd = 4 THEN
-  // Cmd=4 is level-sensitive on purpose. The platform may keep Cmd=4 high
-  // while it edits a target, so every changed target must be accepted.
   ManualValid := (ManualTarget1 >= -171.0) AND (ManualTarget1 <= 171.0)
                  AND (ManualTarget2 >= 130.0) AND (ManualTarget2 <= 360.0)
                  AND (ManualTarget3 >= 0.0) AND (ManualTarget3 <= 180.0)
                  AND (ManualTarget4 >= 12.0) AND (ManualTarget4 <= 70.0);
   ManualTargetError := NOT ManualValid;
   IF ManualPermitted AND ManualValid THEN
-    // A new plan is started on the first Cmd=4 scan, after Cmd=0, or when
-    // any target changes. The current feedback is never replaced by Home.
-    IF (LastCmd <> 4) OR (ModeState <> 4)
+    IF (LastCmd <> 4)
        OR (ABS(ManualTarget1 - Captured1) > 0.01)
        OR (ABS(ManualTarget2 - Captured2) > 0.01)
        OR (ABS(ManualTarget3 - Captured3) > 0.01)
@@ -376,8 +383,6 @@ ELSE
   Permitted := ManualPermitted;
 END_IF;
 
-// Only physical authority faults cancel a mode. A temporary IoT gate loss
-// leaves AUTO latched in HOLD so it can resume without a new command edge.
 IF ((ModeState <> 0) AND (ModeState <> 1) AND NOT ManualPermitted)
    OR ((ModeState = 1) AND NOT ManualPermitted) THEN
   Fault := 1;
@@ -387,28 +392,42 @@ IF ((ModeState <> 0) AND (ModeState <> 1) AND NOT ManualPermitted)
   ManualPlanActive := FALSE;
   ManualComplete := FALSE;
   LastActiveAxis := 0;
+  AutoSegmentReady := FALSE;
 END_IF;
 
-// 4. Nine point demo, Home and GOTO targets.
 IF ModeState = 1 THEN
   IF Step = 1 THEN
-    DemoTarget1 := -68.8; DemoTarget2 := 300.0; DemoTarget3 := 140.0; DemoTarget4 := 50.0;
+    DemoTarget1 := -68.754936; DemoTarget2 := 300.0; DemoTarget3 := 180.0; DemoTarget4 := 60.0;
   ELSIF Step = 2 THEN
-    DemoTarget1 := -68.8; DemoTarget2 := 300.0; DemoTarget3 := 140.0; DemoTarget4 := 60.0;
+    DemoTarget1 := -68.754936; DemoTarget2 := 150.0; DemoTarget3 := 180.0; DemoTarget4 := 60.0;
   ELSIF Step = 3 THEN
-    DemoTarget1 := -68.8; DemoTarget2 := 150.0; DemoTarget3 := 140.0; DemoTarget4 := 60.0;
+    DemoTarget1 := -68.754936; DemoTarget2 := 150.0; DemoTarget3 := 180.0; DemoTarget4 := 25.0;
   ELSIF Step = 4 THEN
-    DemoTarget1 := -68.8; DemoTarget2 := 150.0; DemoTarget3 := 140.0; DemoTarget4 := 25.0;
+    DemoTarget1 := -68.754936; DemoTarget2 := 320.0; DemoTarget3 := 180.0; DemoTarget4 := 25.0;
   ELSIF Step = 5 THEN
-    DemoTarget1 := -68.8; DemoTarget2 := 320.0; DemoTarget3 := 140.0; DemoTarget4 := 25.0;
+    DemoTarget1 := 80.214088; DemoTarget2 := 320.0; DemoTarget3 := 0.0; DemoTarget4 := 25.0;
   ELSIF Step = 6 THEN
-    DemoTarget1 := 80.2; DemoTarget2 := 320.0; DemoTarget3 := 40.0; DemoTarget4 := 25.0;
+    DemoTarget1 := 80.214088; DemoTarget2 := 180.0; DemoTarget3 := 0.0; DemoTarget4 := 25.0;
   ELSIF Step = 7 THEN
-    DemoTarget1 := 80.2; DemoTarget2 := 180.0; DemoTarget3 := 40.0; DemoTarget4 := 25.0;
+    DemoTarget1 := 80.214088; DemoTarget2 := 180.0; DemoTarget3 := 0.0; DemoTarget4 := 60.0;
   ELSIF Step = 8 THEN
-    DemoTarget1 := 80.2; DemoTarget2 := 180.0; DemoTarget3 := 40.0; DemoTarget4 := 60.0;
+    DemoTarget1 := 80.214088; DemoTarget2 := 300.0; DemoTarget3 := 0.0; DemoTarget4 := 60.0;
+  ELSIF Step = 9 THEN
+    DemoTarget1 := 80.214088; DemoTarget2 := 180.0; DemoTarget3 := 0.0; DemoTarget4 := 60.0;
+  ELSIF Step = 10 THEN
+    DemoTarget1 := 80.214088; DemoTarget2 := 180.0; DemoTarget3 := 0.0; DemoTarget4 := 25.0;
+  ELSIF Step = 11 THEN
+    DemoTarget1 := 80.214088; DemoTarget2 := 320.0; DemoTarget3 := 0.0; DemoTarget4 := 25.0;
+  ELSIF Step = 12 THEN
+    DemoTarget1 := -68.754936; DemoTarget2 := 320.0; DemoTarget3 := 180.0; DemoTarget4 := 25.0;
+  ELSIF Step = 13 THEN
+    DemoTarget1 := -68.754936; DemoTarget2 := 150.0; DemoTarget3 := 180.0; DemoTarget4 := 25.0;
+  ELSIF Step = 14 THEN
+    DemoTarget1 := -68.754936; DemoTarget2 := 150.0; DemoTarget3 := 180.0; DemoTarget4 := 60.0;
+  ELSIF Step = 15 THEN
+    DemoTarget1 := -68.754936; DemoTarget2 := 300.0; DemoTarget3 := 180.0; DemoTarget4 := 60.0;
   ELSE
-    DemoTarget1 := 80.2; DemoTarget2 := 300.0; DemoTarget3 := 40.0; DemoTarget4 := 60.0;
+    DemoTarget1 := 0.0; DemoTarget2 := 300.0; DemoTarget3 := 60.0; DemoTarget4 := 50.0;
   END_IF;
 ELSIF ModeState = 2 THEN
   DemoTarget1 := 0.0; DemoTarget2 := 300.0; DemoTarget3 := 60.0; DemoTarget4 := 50.0;
@@ -423,14 +442,6 @@ Target2 := DemoTarget2;
 Target3 := DemoTarget3;
 Target4 := DemoTarget4;
 
-// 5. Select one axis at a time. Manual GOTO uses an explicit plan so the
-// platform can command a new pose without causing an implicit Home action.
-// Phase 1: establish a safe height or the requested height.
-// Phase 2: rotate the base while the arm is clear of the work envelope.
-// Phase 3: move the extension while the arm is clear of the work envelope.
-// Phase 4: descend to the requested height when a safe staging height was used.
-// Phase 5: move the gripper after the structural axes have settled.
-// Phase 6: wait for the final pose to remain stable before reporting Done.
 AxisTarget2 := DemoTarget2;
 ManualBaseReady := FALSE;
 ManualExtensionReady := FALSE;
@@ -439,21 +450,16 @@ ManualHeightReady := FALSE;
 ManualGripperReady := FALSE;
 
 IF ModeState = 4 THEN
-  // Re-evaluate readiness from feedback on every PLC scan. This prevents a
-  // stale command or a delayed Modbus frame from being interpreted as motion.
   ManualBaseReady := ABS(Current1 - Captured1) <= 1.0;
   ManualExtensionReady := ABS(Current3 - Captured3) <= 2.0;
   ManualHeightReady := ABS(Current2 - Captured2) <= 2.0;
   ManualGripperReady := ABS(Current4 - Captured4) <= 2.0;
 
   IF ManualTargetChanged THEN
-    // The command edge has already latched the targets. Clearing this flag
-    // here documents that the plan now runs from the latched snapshot.
     ManualTargetChanged := FALSE;
   END_IF;
 
   IF NOT ManualPlanActive THEN
-    // Recovery path for a retained Cmd=4 after a PLC scan restart.
     ManualPlanActive := TRUE;
     ManualComplete := FALSE;
     ManualPhase := 1;
@@ -464,16 +470,12 @@ IF ModeState = 4 THEN
   END_IF;
 
   IF ManualPhase = 0 THEN
-    // Phase zero is never a moving phase. It is converted into phase one so
-    // a partially retained state cannot select an axis without a plan.
     ManualPhase := 1;
     ManualComplete := FALSE;
     LastActiveAxis := 0;
   END_IF;
 
   IF ManualPhase = 1 THEN
-    // A low final height is reached only after the base and extension are
-    // finished, when either of them actually changes in this plan.
     IF ManualRequiresSafeHeight THEN
       ManualAxisTarget2 := 300.0;
     ELSE
@@ -489,7 +491,6 @@ IF ModeState = 4 THEN
   END_IF;
 
   IF ManualPhase = 2 THEN
-    // Base rotation is allowed only after the safe height is reached.
     IF ManualBaseReady THEN
       ManualPhase := 3;
       LastActiveAxis := 0;
@@ -497,8 +498,6 @@ IF ModeState = 4 THEN
   END_IF;
 
   IF ManualPhase = 3 THEN
-    // Extension is treated independently from base rotation. A target that
-    // changes only the extension therefore does not move the base.
     IF ManualExtensionReady THEN
       IF ManualRequiresSafeHeight THEN
         ManualPhase := 4;
@@ -510,7 +509,6 @@ IF ModeState = 4 THEN
   END_IF;
 
   IF ManualPhase = 4 THEN
-    // Descend only after both structural axes report their final values.
     ManualAxisTarget2 := Captured2;
     AxisTarget2 := ManualAxisTarget2;
     IF ManualHeightReady THEN
@@ -520,8 +518,6 @@ IF ModeState = 4 THEN
   END_IF;
 
   IF ManualPhase = 5 THEN
-    // The gripper is deliberately last so it cannot enter the arm envelope
-    // while the base, extension, or height is still being positioned.
     IF ManualGripperReady THEN
       ManualPhase := 6;
       ManualComplete := TRUE;
@@ -530,7 +526,6 @@ IF ModeState = 4 THEN
   END_IF;
 
   IF ManualPhase = 6 THEN
-    // Keep the final target visible while the settle timer verifies feedback.
     AxisTarget2 := Captured2;
     ManualComplete := ManualBaseReady AND ManualExtensionReady
                       AND ManualHeightReady AND ManualGripperReady;
@@ -552,14 +547,11 @@ IF ModeState = 4 THEN
     ActiveAxis := 0;
   END_IF;
 
-  // A manual plan is complete only in phase six and only when all four
-  // feedback values are inside their mechanical tolerances.
   AtTarget := (ManualPhase = 6) AND ManualComplete
               AND ManualBaseReady AND ManualExtensionReady
               AND ManualHeightReady AND ManualGripperReady;
   ActiveStep := ManualPhase;
-ELSIF (ModeState = 1) OR (ModeState = 2) THEN
-  // Demo and Home retain their original sequence and collision guards.
+ELSIF ModeState = 2 THEN
   IF ABS(Current2 - AxisTarget2) > 2.0 THEN
     ActiveAxis := 2;
   ELSIF ABS(Current1 - DemoTarget1) > 1.0 THEN
@@ -574,6 +566,56 @@ ELSIF (ModeState = 1) OR (ModeState = 2) THEN
               AND (ABS(Current2 - DemoTarget2) <= 2.0)
               AND (ABS(Current3 - DemoTarget3) <= 2.0)
               AND (ABS(Current4 - DemoTarget4) <= 2.0);
+END_IF;
+
+IF ModeState <> 1 THEN
+  AutoSegmentReady := FALSE;
+ELSIF NOT Permitted THEN
+  AutoSegmentReady := FALSE;
+ELSIF NOT AutoSegmentReady THEN
+  AutoSegmentStart1 := Current1;
+  AutoSegmentStart2 := Current2;
+  AutoSegmentStart3 := Current3;
+  AutoSegmentStart4 := Current4;
+  AutoSegmentReady := TRUE;
+END_IF;
+
+AutoSegmentRunning := (ModeState = 1) AND Permitted AND AutoSegmentReady AND (Fault = 0);
+AutoSegmentTimerA(IN := AutoSegmentRunning AND ((Step AND 1) <> 0), PT := T#1100ms);
+AutoSegmentTimerB(IN := AutoSegmentRunning AND ((Step AND 1) = 0), PT := T#1100ms);
+AutoSegmentDone := FALSE;
+
+IF AutoSegmentRunning THEN
+  IF (Step AND 1) <> 0 THEN
+    P := TIME_TO_DINT(AutoSegmentTimerA.ET) / DINT_TO_REAL(1100);
+    AutoSegmentDone := AutoSegmentTimerA.Q;
+  ELSE
+    P := TIME_TO_DINT(AutoSegmentTimerB.ET) / DINT_TO_REAL(1100);
+    AutoSegmentDone := AutoSegmentTimerB.Q;
+  END_IF;
+  IF P < 0.0 THEN P := 0.0; END_IF;
+  IF P > 1.0 THEN P := 1.0; END_IF;
+  P := P * P * (3.0 - (2.0 * P));
+  Current1 := AutoSegmentStart1 + ((DemoTarget1 - AutoSegmentStart1) * P);
+  Current2 := AutoSegmentStart2 + ((DemoTarget2 - AutoSegmentStart2) * P);
+  Current3 := AutoSegmentStart3 + ((DemoTarget3 - AutoSegmentStart3) * P);
+  Current4 := AutoSegmentStart4 + ((DemoTarget4 - AutoSegmentStart4) * P);
+  AnyMoving := TRUE;
+  IF AutoSegmentDone THEN
+    Current1 := DemoTarget1;
+    Current2 := DemoTarget2;
+    Current3 := DemoTarget3;
+    Current4 := DemoTarget4;
+    DonePulse := TRUE;
+    Done := 1;
+    DoneCounter := DoneCounter + 1;
+    IF Step < 16 THEN
+      Step := Step + 1;
+    ELSE
+      Step := 1;
+    END_IF;
+    AutoSegmentReady := FALSE;
+  END_IF;
 END_IF;
 
 IF ActiveAxis = 1 THEN
@@ -618,7 +660,6 @@ ELSIF ActiveAxis <> 0 AND SegmentRunning THEN
   AnyMoving := TRUE;
 END_IF;
 
-// 6. Maintained JOG. Release holds the current pose and never returns Home.
 JogPulseTimer(IN := (ModeState = 3) AND (Cmd = 3) AND (JogEnable <> 0)
                     AND Permitted AND NOT JogPulseTimer.Q, PT := T#50ms);
 IF (ModeState = 3) AND (Cmd = 3) AND (JogEnable <> 0) AND Permitted AND JogPulseTimer.Q THEN
@@ -647,33 +688,22 @@ IF (ModeState = 3) AND (Cmd = 3) AND (JogEnable <> 0) AND Permitted AND JogPulse
   AnyMoving := TRUE;
 END_IF;
 
-// 7. Completion and status. The settle time prevents final-state jumps.
-SettleTimer(IN := ((ModeState = 1) OR (ModeState = 2) OR (ModeState = 4))
+SettleTimer(IN := ((ModeState = 2) OR (ModeState = 4))
                    AND AtTarget AND Permitted AND (Fault = 0), PT := T#200ms);
 IF SettleTimer.Q AND (Fault = 0) THEN
   DonePulse := TRUE;
   Done := 1;
   DoneCounter := DoneCounter + 1;
-  IF ModeState = 1 THEN
-    IF Step < 9 THEN
-      Step := Step + 1;
-      LastActiveAxis := 0;
-    ELSE
-      ModeState := 0;
-      Step := 0;
-      LastActiveAxis := 0;
-    END_IF;
-  ELSE
-    ModeState := 0;
-    Step := 0;
-    LastActiveAxis := 0;
-  END_IF;
+  ModeState := 0;
+  Step := 0;
+  LastActiveAxis := 0;
 END_IF;
 
 IF Fault <> 0 THEN
   ModeState := 0;
   Step := 0;
   LastActiveAxis := 0;
+  AutoSegmentReady := FALSE;
 END_IF;
 
 IF Fault <> 0 THEN
@@ -681,7 +711,7 @@ IF Fault <> 0 THEN
 ELSIF DonePulse THEN
   Status := 2;
 ELSIF (ModeState = 1) AND NOT Permitted THEN
-  Status := 3;
+  Status := 0;
 ELSIF (ModeState <> 0) AND Permitted AND (AnyMoving OR (ActiveAxis <> 0)) THEN
   Status := 1;
 ELSE
@@ -698,7 +728,6 @@ ELSE
   ActiveMode := 0;
 END_IF;
 IF ModeState = 4 THEN
-  // Expose the manual planner phase instead of the demo step counter.
   ActiveStep := ManualPhase;
 ELSE
   ActiveStep := Step;
@@ -708,7 +737,16 @@ AlarmCode := Fault;
 RunMask := 0;
 DirectionMask := 0;
 CmdQ1toQ8Mask := 0;
-IF (ModeState <> 0) AND Permitted AND (Fault = 0) AND (ActiveAxis <> 0) THEN
+IF (ModeState = 1) AND Permitted AND (Fault = 0) THEN
+  IF ABS(DemoTarget1 - Current1) > 0.01 THEN RunMask := RunMask OR 1; END_IF;
+  IF ABS(DemoTarget2 - Current2) > 0.01 THEN RunMask := RunMask OR 2; END_IF;
+  IF ABS(DemoTarget3 - Current3) > 0.01 THEN RunMask := RunMask OR 4; END_IF;
+  IF ABS(DemoTarget4 - Current4) > 0.01 THEN RunMask := RunMask OR 8; END_IF;
+  IF ((RunMask AND 1) <> 0) AND (DemoTarget1 >= Current1) THEN DirectionMask := DirectionMask OR 1; END_IF;
+  IF ((RunMask AND 2) <> 0) AND (DemoTarget2 >= Current2) THEN DirectionMask := DirectionMask OR 2; END_IF;
+  IF ((RunMask AND 4) <> 0) AND (DemoTarget3 >= Current3) THEN DirectionMask := DirectionMask OR 4; END_IF;
+  IF ((RunMask AND 8) <> 0) AND (DemoTarget4 >= Current4) THEN DirectionMask := DirectionMask OR 8; END_IF;
+ELSIF (ModeState <> 0) AND Permitted AND (Fault = 0) AND (ActiveAxis <> 0) THEN
   IF ActiveAxis = 1 THEN RunMask := 1;
   ELSIF ActiveAxis = 2 THEN RunMask := 2;
   ELSIF ActiveAxis = 3 THEN RunMask := 4;
@@ -725,14 +763,11 @@ IF (ModeState <> 0) AND Permitted AND (Fault = 0) AND (ActiveAxis <> 0) THEN
   END_IF;
 END_IF;
 
-// Eight logical direction commands: Q1/Q2 gripper, Q3/Q4 extension,
-// Q5/Q6 height and Q7/Q8 base. These remain diagnostic in this simulator.
 IF (RunMask AND 1) <> 0 THEN CmdQ1toQ8Mask := CmdQ1toQ8Mask OR 3; END_IF;
 IF (RunMask AND 2) <> 0 THEN CmdQ1toQ8Mask := CmdQ1toQ8Mask OR 12; END_IF;
 IF (RunMask AND 4) <> 0 THEN CmdQ1toQ8Mask := CmdQ1toQ8Mask OR 48; END_IF;
 IF (RunMask AND 8) <> 0 THEN CmdQ1toQ8Mask := CmdQ1toQ8Mask OR 192; END_IF;
 
-// Export current feedback after the motion calculation.
 Pos1 := Current1;
 Pos2 := Current2;
 Pos3 := Current3;
@@ -744,3 +779,28 @@ IF ModeState = 0 THEN
   Target3 := Current3;
   Target4 := Current4;
 END_IF;
+
+RealBits := ADR(Pos1);
+Pos1High := TO_UINT(SHR(RealBits^, 16));
+Pos1Low := TO_UINT(RealBits^ AND 16#0000FFFF);
+RealBits := ADR(Pos2);
+Pos2High := TO_UINT(SHR(RealBits^, 16));
+Pos2Low := TO_UINT(RealBits^ AND 16#0000FFFF);
+RealBits := ADR(Pos3);
+Pos3High := TO_UINT(SHR(RealBits^, 16));
+Pos3Low := TO_UINT(RealBits^ AND 16#0000FFFF);
+RealBits := ADR(Pos4);
+Pos4High := TO_UINT(SHR(RealBits^, 16));
+Pos4Low := TO_UINT(RealBits^ AND 16#0000FFFF);
+RealBits := ADR(Target1);
+Target1High := TO_UINT(SHR(RealBits^, 16));
+Target1Low := TO_UINT(RealBits^ AND 16#0000FFFF);
+RealBits := ADR(Target2);
+Target2High := TO_UINT(SHR(RealBits^, 16));
+Target2Low := TO_UINT(RealBits^ AND 16#0000FFFF);
+RealBits := ADR(Target3);
+Target3High := TO_UINT(SHR(RealBits^, 16));
+Target3Low := TO_UINT(RealBits^ AND 16#0000FFFF);
+RealBits := ADR(Target4);
+Target4High := TO_UINT(SHR(RealBits^, 16));
+Target4Low := TO_UINT(RealBits^ AND 16#0000FFFF);

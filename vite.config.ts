@@ -234,7 +234,7 @@ const openPlcPlugin = () => ({
         const physical = profile === 's7-1200-robot-holding';
         const cylindrical4 = profile === 'cylindrical4-fb';
         const cylindrical4Integrated = profile === 'cylindrical4-integrated-iot';
-        const ft511938 = profile === 'ft511938-unified';
+        const ft511938 = (profile === 'ft511938-unified' || profile === 'openplc-ft511938');
         if (!validOpenPlcHost(host) || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(unitId) || unitId < 0 || unitId > 255 || !Number.isInteger(address) || address < 0 || address > 65535 || !Number.isInteger(quantity) || quantity < 1 || quantity > 125) throw new Error('Invalid OpenPLC endpoint or register range');
         const frame = await openPlcRequest({ host, port, unitId, functionCode: 3, address, quantity, timeoutMs: physical || cylindrical4 || cylindrical4Integrated || ft511938 ? 2500 : 1200, deviceLabel: ft511938 ? `FT511938 PLC ${host}:${port}` : cylindrical4Integrated ? `Cylindrical4 Integrated IoT PLC ${host}:${port}` : cylindrical4 ? `Cylindrical4 FB PLC ${host}:${port}` : physical ? `Physical S7-1200 ${host}:${port}` : `OpenPLC ${host}:${port}` });
         const byteCount = frame[8];
@@ -287,7 +287,7 @@ const openPlcPlugin = () => ({
               }
               continue;
             }
-            if (profile === 'ft511938-unified') {
+            if ((profile === 'ft511938-unified' || profile === 'openplc-ft511938')) {
               const frame = await openPlcRequest({ host, port, unitId, functionCode: 3, address: 0, quantity: 61, timeoutMs: 2500, deviceLabel: `FT511938 PLC ${host}:${port}` });
               const byteCount = frame[8];
               const registers = Array.from({ length: Math.floor(byteCount / 2) }, (_, index) => frame.readUInt16BE(9 + index * 2));
@@ -305,9 +305,9 @@ const openPlcPlugin = () => ({
                 && [0, 550, 1000].includes(speed)
                 && (registers[28] ?? 2) <= 1
                 && (registers[29] ?? 2) <= 1;
-              attempts.push({ port, unitId, result: signature ? 'ft511938-unified-proposed-image' : 'holding-registers-readable' });
+              attempts.push({ port, unitId, result: signature ? 'ft511938-unified-hr0-60' : 'holding-registers-readable' });
               if (signature) {
-                response.end(JSON.stringify({ ok: true, detected: true, profile, host, port, unitId, address: 0, quantity: 61, dataFormat: 'ft511938-unified', commandAddress: 0, rawAddress: 0, registers, attempts, receivedAt: new Date().toISOString(), detection: 'proposed-adapter-image; Modbus map and electrical permissions require PLC commissioning' }));
+                response.end(JSON.stringify({ ok: true, detected: true, profile, host, port, unitId, address: 0, quantity: 61, dataFormat: 'ft511938-unified', commandAddress: 0, rawAddress: 0, registers, attempts, receivedAt: new Date().toISOString(), detection: 'FT511938 HR0..60 process image; electrical permissions remain PLC-owned' }));
                 return;
               }
               continue;
@@ -371,7 +371,7 @@ const openPlcPlugin = () => ({
         }
       }
       response.statusCode = 502;
-      response.end(JSON.stringify({ ok: false, detected: false, error: profile === 's7-1200-robot-holding' ? 'S7-1200 RobotHolding signature not found at HR0..HR20' : profile === 'cylindrical4-fb' ? 'Cylindrical4 FB adapter contract not found at HR0..HR22' : profile === 'cylindrical4-integrated-iot' ? 'Cylindrical4 Integrated IoT process image not found at HR0..HR60' : profile === 'ft511938-unified' ? 'FT511938 proposed adapter image not found at HR0..HR60' : 'Cobot OpenPLC register signature not found at %QW90..%QW105', attempts }));
+      response.end(JSON.stringify({ ok: false, detected: false, error: profile === 's7-1200-robot-holding' ? 'S7-1200 RobotHolding signature not found at HR0..HR20' : profile === 'cylindrical4-fb' ? 'Cylindrical4 FB adapter contract not found at HR0..HR22' : profile === 'cylindrical4-integrated-iot' ? 'Cylindrical4 Integrated IoT process image not found at HR0..HR60' : (profile === 'ft511938-unified' || profile === 'openplc-ft511938') ? 'FT511938 HR0..HR60 process image not found' : 'Cobot OpenPLC register signature not found at %QW90..%QW105', attempts }));
     });
 
     server.middlewares.use('/__openplc/write', async (request, response) => {
@@ -388,7 +388,7 @@ const openPlcPlugin = () => ({
           const address = Number(parsed.address ?? 100);
           const values = Array.isArray(parsed.values) ? parsed.values.map(Number) : [];
           const priority = parsed.priority === 'control' ? 'control' : 'telemetry';
-          if (!validOpenPlcHost(host) || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(address) || address < 0 || address > 65535 || !values.length || values.length > 123 || values.some((word) => !Number.isInteger(word) || word < 0 || word > 65535)) throw new Error('Invalid OpenPLC write request');
+          if (!validOpenPlcHost(host) || !Number.isInteger(port) || port < 1 || port > 65535 || !Number.isInteger(unitId) || unitId < 0 || unitId > 255 || !Number.isInteger(address) || address < 0 || address > 65535 || !values.length || values.length > 123 || values.some((word) => !Number.isInteger(word) || word < 0 || word > 65535)) throw new Error('Invalid Modbus write request');
           const functionCode = values.length === 1 ? 6 : 16;
           const frame = await openPlcRequest({ host, port, unitId, functionCode, address, values, priority });
           response.end(JSON.stringify({ ok: true, functionCode, transactionId: frame.readUInt16BE(0), receivedAt: new Date().toISOString() }));
