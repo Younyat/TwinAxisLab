@@ -50,9 +50,17 @@ controlador esten configurados; mover una pieza en el editor o reproducir una
 animacion local no envia por si solo una orden al hardware.
 
 ```text
-Plataforma -> comando / objetivo -> Modbus TCP -> PLC
-PLC -> posicion / estado / alarma -> Modbus TCP -> gemelo 3D
-IoT real -> telemetria / calidad / edad -> plataforma -> registros IoT del PLC
+CONTROL: DEL GEMELO DIGITAL AL EQUIPO FISICO
+Controles del gemelo 3D -> comando / objetivo -> plataforma -> Modbus TCP
+  -> PLC (permisos e interbloqueos) -> accionamientos -> robot / equipo fisico
+
+FEEDBACK: DEL EQUIPO FISICO AL GEMELO DIGITAL
+Robot / equipo fisico -> sensores de posicion y estado -> PLC -> Modbus TCP
+  -> plataforma (decodificacion) -> posicion y estado visibles del gemelo 3D
+
+TELEMETRIA IoT: ENTRADA ADICIONAL AL CONTROLADOR
+Sensores IoT reales -> telemetria / calidad / edad -> plataforma
+  -> registros IoT del PLC -> evaluacion de condicion y permisos AUTO
 ```
 
 - **Plataforma hacia PLC:** envio de comandos y consignas mediante el mapa
