@@ -37,6 +37,18 @@ este contrato PLC de cuatro ejes.
 
 ### Bidireccionalidad Del Gemelo
 
+**El gemelo digital tambien puede mandar mover el robot u otro equipo fisico.**
+Al operar los controles del gemelo, la plataforma convierte la accion en un
+comando o una consigna y la escribe en el PLC. El PLC evalua sus permisos e
+interbloqueos y, si procede, acciona el equipo. En sentido inverso, las posiciones
+y estados reportados por el PLC actualizan la representacion digital.
+
+Por tanto, la bidireccionalidad no significa solo visualizar datos: permite
+**controlar el equipo fisico desde el gemelo y observar su respuesta real en el
+gemelo**. Esto se aplica a las articulaciones y componentes cuyo mapping y
+controlador esten configurados; mover una pieza en el editor o reproducir una
+animacion local no envia por si solo una orden al hardware.
+
 ```text
 Plataforma -> comando / objetivo -> Modbus TCP -> PLC
 PLC -> posicion / estado / alarma -> Modbus TCP -> gemelo 3D
