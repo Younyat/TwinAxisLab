@@ -35,6 +35,47 @@ de cada modo depende del perfil, del programa cargado y de sus condiciones.
 La configuracion de articulaciones de otros modelos no amplia automaticamente
 este contrato PLC de cuatro ejes.
 
+### Dashboard Siemens S7 Real
+
+![Dashboard Siemens S7: control manual, estado PLC y gemelo digital](docs/readme-assets/dashboard-s7-real.png)
+
+*Conexion Modbus TCP con un S7 real: prueba manual del programa alternativo,
+con posiciones simuladas dentro del PLC y salidas fisicas inhibidas. La captura
+no acredita movimiento mecanico ni recepcion IoT en esa sesion.*
+
+El dashboard integra consignas manuales, AUTO, HOME y STOP/HOLD con la lectura
+de posiciones, heartbeat, permisos y alarmas del controlador. La vista del
+gemelo se actualiza con el feedback recibido, distinguiendo el objetivo enviado
+de la posicion reportada. El banco permite comprobar este intercambio antes
+de integrar accionamientos y sensores de posicion fisicos.
+
+La telemetria IoT es una entrada adicional al PLC, no un sustituto del feedback
+de los ejes. En el programa alternativo actualizado, la plataforma escribe su
+validez, calidad, edad y magnitudes en HR15..20; el PLC evalua la politica HR14:
+reposo durante dos segundos o movimiento detectado por el giroscopio. AUTO
+queda condicionado por estos datos y los umbrales del programa. El mando manual
+no depende de la politica IoT, pero conserva sus requisitos de comunicacion.
+
+### Dashboard OpenPLC
+
+![Dashboard del perfil OpenPLC: telemetria, imagen de proceso y gemelo digital](docs/readme-assets/dashboard-openplc-test.png)
+
+*Captura de regresion del perfil OpenPLC con servidor Modbus de ensayo. Muestra
+la interfaz y su intercambio de registros; no certifica una sesion conectada
+al runtime OpenPLC ni mediciones fisicas del robot.*
+
+El perfil OpenPLC proporciona un entorno separado para desarrollar y comprobar
+comandos, consignas de cuatro ejes, secuencias automaticas y decodificacion del
+mapa HR0..60. El dashboard permite comparar la imagen del proceso simulado con
+el gemelo 3D y consultar el estado de comunicacion y los bloqueos del control.
+
+El panel IoT presenta las magnitudes disponibles, su antiguedad y calidad.
+Las politicas AUTO permiten ensayar las dos condiciones de operacion: avanzar
+en reposo o avanzar mientras exista movimiento IoT. Los datos invalidos o
+caducados deben bloquear AUTO, sin convertirse en un permiso artificial.
+La simulacion facilita validar el flujo plataforma-controlador-gemelo sin
+atribuir a sus resultados una validacion electrica o mecanica de la instalacion.
+
 ### Bidireccionalidad Del Gemelo
 
 **El gemelo digital tambien puede mandar mover el robot u otro equipo fisico.**
