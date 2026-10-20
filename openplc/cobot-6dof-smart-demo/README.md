@@ -1,5 +1,13 @@
 # OpenPLC - Cobot 6DOF Smart Demo
 
+## Source Ownership
+
+This directory contains OpenPLC `.st` programs only. For the cylindrical FT
+simulation use `FB_FT511938_openplc.st` with the explicit OpenPLC FT HR0..60
+profile. Siemens physical `.scl` sources and TIA guides have moved to
+`../../plc/siemens-s7-1200/cobot-6dof-smart-demo/`.
+Do not select a physical S7 profile for this OpenPLC simulation.
+
 Este programa reproduce en OpenPLC el clip `Ciclo_Asistencia` usado por `Start Smart Demo` para `cobot-6dof.glb`. El ciclo dura 10 segundos, se repite y usa la misma interpolacion suave entre poses. El archivo usa el formato POU de OpenPLC Editor: primer bloque de declaraciones `VAR...END_VAR` y segundo bloque con el cuerpo ST. No incluye wrappers `PROGRAM`, `FUNCTION` ni `CONFIGURATION`.
 
 ## Carga

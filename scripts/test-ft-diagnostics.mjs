@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { transform } from 'esbuild';
+
+const source = await readFile('src/application/twin/ft511938Diagnostics.ts', 'utf8');
+const compiled = await transform(source, { loader: 'ts', format: 'esm' });
+const { diagnoseFtImage, compareFtWrite, ftWriteAllowed } = await import(`data:text/javascript;base64,${Buffer.from(compiled.code).toString('base64')}`);
+const raw = [0,0,0,0,0,139,17996,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,3,8727,0,0,0,0,0,65535,0,0,0,0,0,0,0,0,0,0,0,0,0,0,4,3,0,0,0,0,3,0,1,0];
+const issues = diagnoseFtImage(raw);
+assert(issues.some((issue) => issue.code === 'layout' && issue.registers.includes(29)));
+assert(issues.some((issue) => issue.code === 'inconsistent'));
+assert(issues.some((issue) => issue.code === 'feedback' && issue.registers.includes(36)));
+assert(issues.some((issue) => issue.code === 'watchdog'));
+assert(issues.some((issue) => issue.code === 'homing'));
+assert.equal(compareFtWrite(15, [1,93,10,0,0,119], [0,0,0,0,0,0]).length, 4);
+assert.equal(compareFtWrite(14, [1], [1]).length, 0);
+assert(ftWriteAllowed(15, 6));
+assert(ftWriteAllowed(6, 8));
+assert(!ftWriteAllowed(23, 2));
+assert(!ftWriteAllowed(30, 8));
+assert(!ftWriteAllowed(20, 2));
+assert.equal(diagnoseFtImage([])[0].code, 'length');
+console.log('PASS: actual captured DB inconsistency, lost IoT writes, watchdog, homing, and PLC-owned register protection.');

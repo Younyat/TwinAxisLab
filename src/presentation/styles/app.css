@@ -4726,3 +4726,23 @@ html,
     max-height: calc(100dvh - 44px);
   }
 }
+.ft-bench-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid #667078;
+  padding-top: 10px;
+  margin-top: 10px;
+  min-width: 0;
+}
+.ft-bench-panel h4, .ft-bench-panel output, .ft-bench-panel code {
+  flex-basis: 100%;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.ft-bench-panel label { display: inline-flex; gap: 5px; align-items: center; }
+.ft-bench-panel input[type='checkbox'] { width: 14px; height: 14px; }
+.ft-bench-panel fieldset { flex-basis: 100%; min-width: 0; }
+.ft-bench-panel fieldset div { display: flex; gap: 10px; flex-wrap: wrap; }

@@ -9,7 +9,7 @@ export const FT511938_ENDPOINT_PROFILE = 'ft511938-unified' as const;
 export const FT511938_HR_COUNT = 61;
 
 export const FT511938_REGISTER_MAP = [
-  { offset: 0, name: 'Cmd', semantic: '0 stop, 1 demo edge, 2 reset, 3 jog, 4 goto edge', access: 'platform-to-plc' },
+  { offset: 0, name: 'Cmd', semantic: '0 stop, 1 demo edge, 2 home, 3 jog, 4 goto, 5 S7 isolated bench', access: 'platform-to-plc' },
   { offset: 1, name: 'Enable', semantic: 'FB enable permit', access: 'platform-to-plc' },
   { offset: 2, name: 'JogAxis', semantic: 'JOG axis 1..4', access: 'platform-to-plc' },
   { offset: 3, name: 'JogDirection', semantic: 'JOG direction -1/+1', access: 'platform-to-plc' },
@@ -55,7 +55,7 @@ export const FT511938_REGISTER_MAP = [
   { offset: 55, name: 'RunMask', semantic: 'Run bits M1..M4', access: 'plc-to-platform' },
   { offset: 56, name: 'DirectionMask', semantic: 'Positive direction bits M1..M4', access: 'plc-to-platform' },
   { offset: 57, name: 'HeartbeatEcho', semantic: 'PLC watchdog echo', access: 'plc-to-platform' },
-  { offset: 58, name: 'SimulationMode', semantic: 'OpenPLC-only internal pose simulation permit', access: 'plc-to-platform' },
+  { offset: 58, name: 'SimulationMode', semantic: '1 OpenPLC simulation or isolated S7 Cmd5 bench; never a physical output permit', access: 'plc-to-platform' },
   { offset: 59, name: 'StartupReady', semantic: 'PLC control block has executed at least one scan', access: 'plc-to-platform' },
   { offset: 60, name: 'DoneCounter', semantic: 'Optional completed-cycle counter', access: 'plc-to-platform' },
 ] as const;
@@ -131,9 +131,9 @@ export const decodeFt511938Registers = (words: number[]): Ft511938Snapshot => {
   const conditionState = word(words, 52);
   const speedPermille = word(words, 53);
   const startupReady = flag(words, 59);
-  if (![0, 1, 2, 3, 4].includes(command)) validation.push(`Cmd=${command} is outside 0..4.`);
+  if (![0, 1, 2, 3, 4, 5].includes(command)) validation.push(`Cmd=${command} is outside 0..5.`);
   if (![0, 1, 2, 3].includes(status)) validation.push(`Status=${status} is outside 0..3.`);
-  if (![0, 1, 3, 4].includes(activeMode)) validation.push(`ActiveMode=${activeMode} is outside 0,1,3,4.`);
+  if (![0, 1, 3, 4, 5].includes(activeMode)) validation.push(`ActiveMode=${activeMode} is outside 0,1,3,4,5.`);
   if (activeStep < 0 || activeStep > 16) validation.push(`ActiveStep=${activeStep} is outside 0..16.`);
   if (alarmCode < 0 || alarmCode > 10) validation.push(`AlarmCode=${alarmCode} is outside 0..10.`);
   if (conditionState > 3) validation.push(`ConditionState=${conditionState} is outside 0..3.`);

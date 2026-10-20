@@ -1,5 +1,7 @@
 import { ChangeEvent, type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import * as THREE from 'three';
+import { FtBenchPanel } from './components/FtBenchPanel';
+import { FtRegisterMonitor } from './components/FtRegisterMonitor';
 import { diagnoseFtImage, compareFtWrite, ftWriteAllowed } from '../application/twin/ft511938Diagnostics';
 import {
   ArrowDown,
@@ -928,6 +930,7 @@ type PlcDashboardState = {
     forwardedAt?: string;
   };
   openPlc: {
+    s7VirtualBench?: boolean;
     endpointProfile: 'openplc' | 's7-1200-robot-holding' | typeof CYLINDRICAL4_ENDPOINT_PROFILE | typeof CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE | typeof FT511938_ENDPOINT_PROFILE | 'openplc-ft511938';
     autoReconnect: boolean;
     connectionAuthorized: boolean;
@@ -988,7 +991,11 @@ const ft511938MotionPermissionReasons = (config: PlcDashboardState['openPlc']) =
   if (config.endpointProfile === 'openplc-ft511938' && config.simulationMode !== 1) {
     reasons.push('OpenPLC simulation profile requires HR58=1; select the physical profile for a real PLC.');
   }
-  if (config.endpointProfile === FT511938_ENDPOINT_PROFILE && config.simulationMode !== 0) {
+  const s7Bench = config.endpointProfile === FT511938_ENDPOINT_PROFILE && config.s7VirtualBench === true;
+  if (s7Bench && (config.simulationMode !== 1 || config.physicalOutputEnable !== false || config.sensorOk !== true || config.startupReady !== true || config.activeMode === 5)) {
+    reasons.push('Banco S7 requiere HR58=1, HR29=0, SensorOK=1, StartupReady=1 y modo distinto de Cmd5.');
+  }
+  if (config.endpointProfile === FT511938_ENDPOINT_PROFILE && !s7Bench && config.simulationMode !== 0) {
     reasons.push('Physical S7 profile requires HR58=0; simulation cannot grant physical authority.');
   }
   if (!config.enabled) reasons.push('endpoint disabled');
@@ -1007,7 +1014,7 @@ const ft511938MotionPermissionReasons = (config: PlcDashboardState['openPlc']) =
     && config.physicalOutputEnable === true
     && config.safetyOk === true
     && config.drivesReady === true;
-  if (!localSimulation && !physicalPermit) {
+  if (!localSimulation && !s7Bench && !physicalPermit) {
     reasons.push(`output permit missing (SimulationMode=${config.simulationMode ?? '--'} host=${config.host}, SafetyOK=${config.safetyOk ? 1 : 0}, DrivesReady=${config.drivesReady ? 1 : 0}, WiringVerified=${config.wiringVerified ? 1 : 0}, PhysicalOutputEnable=${config.physicalOutputEnable ? 1 : 0})`);
   }
   return reasons;
@@ -1308,6 +1315,7 @@ export const App = () => {
   const [desktopRuntime] = useState(isDesktopRuntime);
   const [nativeProjectPath, setNativeProjectPath] = useState<string | undefined>();
   const [demoMotionNodeId, setDemoMotionNodeId] = useState<string | undefined>();
+  const [offlineAutoNodeId, setOfflineAutoNodeId] = useState<string>();
   const assetDocumentRef = useRef<AssetDocument>(document);
   const staleCylindricalRigIds = useRef(new Set<string>());
   const [externalPlcRuntimePose, setExternalPlcRuntimePose] = useState<{
@@ -4458,7 +4466,7 @@ export const App = () => {
       : documentedOpenPlcWire[id] ?? fallback;
 
   const endpointSettingsRef = useRef<Record<string, Partial<{ host: string; port: number; unitId: number; pollMs: number }>>>((() => { try { return JSON.parse(localStorage.getItem('twinaxis-plc-profile-endpoints-v1') ?? '{}'); } catch { return {}; } })());
-  const updateOpenPlcConfig = (field: 'endpointProfile' | 'host' | 'port' | 'unitId' | 'address' | 'pollMs' | 'dataFormat' | 'autoReconnect', value: string | number | boolean) => {
+  const updateOpenPlcConfig = (field: 's7VirtualBench' | 'endpointProfile' | 'host' | 'port' | 'unitId' | 'address' | 'pollMs' | 'dataFormat' | 'autoReconnect', value: string | number | boolean) => {
     setPlcDashboard((current) => {
       if (field === 'endpointProfile') endpointSettingsRef.current[current.openPlc.endpointProfile] = { host: current.openPlc.host, port: current.openPlc.port, unitId: current.openPlc.unitId, pollMs: current.openPlc.pollMs };
       try { localStorage.setItem('twinaxis-plc-profile-endpoints-v1', JSON.stringify(endpointSettingsRef.current)); } catch { /* Storage may be disabled. */ }
@@ -4468,7 +4476,8 @@ export const App = () => {
       localManualActive: field === 'endpointProfile' ? false : current.localManualActive,
       openPlc: {
         ...current.openPlc,
-        [field]: field === 'autoReconnect' ? Boolean(value) : field === 'host' || field === 'dataFormat' || field === 'endpointProfile' ? String(value) : Number(value),
+        [field]: field === 'autoReconnect' || field === 's7VirtualBench' ? Boolean(value) : field === 'host' || field === 'dataFormat' || field === 'endpointProfile' ? String(value) : Number(value),
+        ...(field === 'endpointProfile' ? { s7VirtualBench: false } : {}),
         ...(field === 'endpointProfile' ? {
           address: value === 's7-1200-robot-holding' || value === CYLINDRICAL4_ENDPOINT_PROFILE || value === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE || isFtProfile(value) ? 0 : 100,
           // Controller selection never infers a different implementation from data.
@@ -5084,7 +5093,7 @@ export const App = () => {
       ];
       const startedAt = performance.now();
       try {
-        if (config.endpointProfile === 'openplc-ft511938' && command === 1) {
+        if (command === 1 || command === 2) {
           // The OpenPLC POU starts AUTO on a rising command transition.
           // Drop queued manual targets before transferring motion authority.
           if (ft511938ManualTargetTimerRef.current !== undefined) {
@@ -5093,7 +5102,13 @@ export const App = () => {
           }
           ft511938ManualTargetPendingRef.current = undefined;
           ft511938ManualTargetAwaitingAckRef.current = undefined;
-          await writeFt511938Block(0, [0, 1, 0, 0, 0, encodeFt511938Word(heartbeat)], 'OpenPLC FT AUTO prepare HOLD');
+          await writeFt511938Block(0, [0, 1, 0, 0, 0, encodeFt511938Word(heartbeat)], 'FT511938 AUTO/HOME prepare HOLD');
+          // FC16 acknowledgement precedes the cyclic FB scan. Let the PLC
+          // observe STOP before sending the rising-edge command.
+          await new Promise(resolve => window.setTimeout(resolve, 150));
+          const latest = plcDashboardRef.current.openPlc;
+          if (!latest.enabled || !latest.online || latest.host !== config.host || latest.port !== config.port || latest.unitId !== config.unitId || latest.endpointProfile !== config.endpointProfile)
+            throw new Error('Endpoint changed while preparing AUTO/HOME; command cancelled');
         }
         await writeFt511938Block(0, values, `FT511938 ${labels[command]} command`);
         setPlcDashboard((current) => ({
@@ -5749,7 +5764,8 @@ export const App = () => {
         const heartbeat = nextCylindrical4IntegratedHeartbeat();
         await writeFt511938Block(ft511938Wire['cylindrical-heartbeat'], [encodeFt511938Word(heartbeat)], 'FT511938 heartbeat renewal');
         setPlcDashboard((current) => ({ ...current, openPlc: { ...current.openPlc, sensorPolicy, heartbeatSequence: heartbeat }, message: sensorPolicy === 1 ? 'FT511938 AUTO policy written: run while IoT motion is present. Manual control ignores IoT.' : 'FT511938 AUTO policy written: run after two seconds without IoT motion. Manual control ignores IoT.' }));
-        if (config.endpointProfile === 'openplc-ft511938') {
+        if (config.endpointProfile === 'openplc-ft511938' ||
+            (config.endpointProfile === 'ft511938-unified' && config.s7VirtualBench)) {
           await writeOpenPlcCommand(1);
         }
       } catch (error) {
@@ -6242,7 +6258,7 @@ export const App = () => {
     } catch (error) {
       if (!plcDashboardRef.current.openPlc.enabled || plcDashboardRef.current.localManualActive) return;
       const detail = error instanceof Error ? error.message : 'OpenPLC read failed';
-      const physicalEndpoint = config.endpointProfile === 's7-1200-robot-holding';
+      const physicalEndpoint = config.endpointProfile === 's7-1200-robot-holding' || config.endpointProfile === FT511938_ENDPOINT_PROFILE;
       const cylindrical4LegacyEndpoint = config.endpointProfile === CYLINDRICAL4_ENDPOINT_PROFILE;
       const cylindrical4IntegratedEndpoint = config.endpointProfile === CYLINDRICAL4_INTEGRATED_ENDPOINT_PROFILE;
       const cylindrical4Endpoint = cylindrical4LegacyEndpoint || cylindrical4IntegratedEndpoint;
@@ -6252,7 +6268,7 @@ export const App = () => {
         ? cylindrical4Endpoint
           ? `${cylindrical4IntegratedEndpoint ? 'Cylindrical4 Integrated IoT' : 'Cylindrical4 FB'} PLC ${config.host}:${config.port} is unreachable. Verify the S7 Modbus server and mapped DB.`
           : physicalEndpoint
-          ? `Physical PLC ${config.host}:${config.port} is unreachable. Keep reconnect armed and verify the OT network, S7-1200 IP and MB_SERVER.`
+          ? `S7 ${config.host}:${config.port}: lectura FC03 fallida (${detail}). Comprobar red y MB_SERVER; esto no demuestra que el programa este mal ni que el puerto este cerrado permanentemente.`
           : `OpenPLC Modbus port ${config.host}:${config.port} is closed. Upload the PLC program, set Runtime to RUNNING and verify the Modbus Slave plugin.`
         : /exception 2|illegal data address/i.test(detail)
           ? `${cylindrical4Endpoint ? (cylindrical4IntegratedEndpoint ? 'Cylindrical4 Integrated IoT PLC' : 'Cylindrical4 FB PLC') : physicalEndpoint ? 'Physical PLC' : 'OpenPLC'} answered, but configured register ${jointStart} is not mapped. Review the active process-image adapter.`
@@ -7964,6 +7980,40 @@ export const App = () => {
     setStatus(demoMotionNodeId === selectedNode.id ? 'Motion demo stopped' : 'Motion demo started');
   };
 
+  useEffect(() => {
+    if (plcDashboard.openPlc.enabled) {
+      setOfflineAutoNodeId(undefined);
+      return;
+    }
+    if (!offlineAutoNodeId) return;
+    const node = assetDocumentRef.current.nodes.find(candidate => candidate.id === offlineAutoNodeId);
+    const graph = node ? graphFromGeometry(node.geometry) : undefined;
+    const clip = graph?.motionClips?.find(candidate => /pick|place|ciclo/i.test(candidate.name)) ?? graph?.motionClips?.[0];
+    if (!clip) return;
+    const started = performance.now();
+    const timer = window.setInterval(() => {
+      // Never use the manual forwarding path while a PLC owns the scene.
+      if (plcDashboardRef.current.openPlc.enabled) return;
+      setKinematicJointValuesForNode(offlineAutoNodeId, sampleKinematicMotionClip(clip, (performance.now() - started) / 1000));
+    }, 33);
+    return () => window.clearInterval(timer);
+  }, [offlineAutoNodeId, plcDashboard.openPlc.enabled, setKinematicJointValuesForNode]);
+
+  const toggleOfflineAuto = () => {
+    if (plcDashboardRef.current.openPlc.enabled) return;
+    const node = plcControlledKinematicNode ?? selectedKinematicNode;
+    if (!node || !graphFromGeometry(node.geometry)?.motionClips?.length) {
+      setStatus('El robot no tiene trayectoria local.');
+      return;
+    }
+    clearExternalPlcPose();
+    setDemoMotionNodeId(undefined);
+    setOfflineAutoNodeId(current => current === node.id ? undefined : node.id);
+    setPlcDashboard(current => ({ ...current, platformManualActive: false, localManualActive: false,
+      running: false, externalBridgeEnabled: false,
+      message: 'AUTO local: simulacion sin escrituras Modbus ni dependencia IoT.' }));
+  };
+
   const toggleIndustrialCellCycle = () => {
     if (!hasIndustrialCellNodes) {
       setStatus('Load Industrial Cell first');
@@ -8629,6 +8679,8 @@ export const App = () => {
             onCylindrical4IntegratedGoto={sendCylindrical4IntegratedGoto}
             physicalPlcDemoActive={physicalPlcDemoActive}
             onTogglePhysicalPlcDemo={togglePhysicalPlcStartDemo}
+            offlineAutoActive={!!offlineAutoNodeId && !plcDashboard.openPlc.enabled}
+            onToggleOfflineAuto={toggleOfflineAuto}
             onOpenPlcCommand={writeOpenPlcCommand}
             onActivateManualControl={activateManualControl}
             onOpenPlcSensorPolicy={writeOpenPlcSensorPolicy}
@@ -9902,6 +9954,9 @@ export const App = () => {
           }}
           onPointerUp={(event) => { drawerResizeRef.current = undefined; event.currentTarget.releasePointerCapture(event.pointerId); }}
         />
+        {plcDashboard.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE && <FtBenchPanel
+          host={plcDashboard.openPlc.host} port={plcDashboard.openPlc.port} unitId={plcDashboard.openPlc.unitId}
+          address={plcDashboard.openPlc.address} online={plcDashboard.openPlc.online} enabled={plcDashboard.openPlc.enabled} />}
         {plcLiveExchangeDrawerOpen && (
           <PlcLiveExchangeDashboard
             node={plcControlledKinematicNode ?? selectedKinematicNode}
@@ -10232,10 +10287,12 @@ type PlcModbusDashboardProps = {
   onCylindrical4IntegratedGoto: (targets: [number, number, number, number]) => Promise<void>;
   physicalPlcDemoActive: boolean;
   onTogglePhysicalPlcDemo: () => Promise<void>;
+  offlineAutoActive: boolean;
+  onToggleOfflineAuto: () => void;
   onOpenPlcCommand: (command: 0 | 1 | 2) => void;
   onActivateManualControl: () => void;
   onOpenPlcSensorPolicy: (policy: 0 | 1) => void;
-  onOpenPlcConfigChange: (field: 'endpointProfile' | 'host' | 'port' | 'unitId' | 'address' | 'pollMs' | 'dataFormat' | 'autoReconnect', value: string | number | boolean) => void;
+  onOpenPlcConfigChange: (field: 's7VirtualBench' | 'endpointProfile' | 'host' | 'port' | 'unitId' | 'address' | 'pollMs' | 'dataFormat' | 'autoReconnect', value: string | number | boolean) => void;
   historianRecording: boolean;
   historianRecordCount: number;
   onToggleHistorianRecording: () => void;
@@ -10872,6 +10929,7 @@ const PlcLiveExchangeDashboard = ({ node, state, definitions, onTogglePlatformMa
       </header>
 
       <div className="plc-live-exchange-body">
+        {isFtProfile(state.openPlc.endpointProfile) && <FtRegisterMonitor words={state.openPlc.rawRegisters} online={state.openPlc.online} />}
         <section className="plc-live-source-banner">
           <div><span>Active source</span><strong>{sourceLabel}</strong><code>{state.openPlc.enabled ? `${state.openPlc.host}:${state.openPlc.port} · Unit ${state.openPlc.unitId}` : 'No Modbus transport selected'}</code></div>
           <div><span>Controlled robot</span><strong>{node?.name ?? 'No kinematic robot selected'}</strong><code>{node ? 'KinematicGraph V2' : 'Select a robot in the scenario'}</code></div>
@@ -10911,7 +10969,7 @@ const PlcLiveExchangeDashboard = ({ node, state, definitions, onTogglePlatformMa
   );
 };
 
-const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdvanced, onToggleTerminalBridge, onDisconnectTerminalBridge, onEndpointChange, onWriteRegister, onPlcInputChange, onPlcFaultReset, onPlcScanTargetChange, onToggleOpenPlc, onProbeOpenPlc, onTestPhysicalPlcConnection, onTestPhysicalPlcReaction, onTestPhysicalPlcJog, onTestCylindrical4Fb, onTestCylindrical4Integrated, onTestFt511938, onCylindrical4IntegratedJog, onCylindrical4IntegratedGoto, physicalPlcDemoActive, onTogglePhysicalPlcDemo, onOpenPlcCommand, onActivateManualControl, onOpenPlcSensorPolicy, onOpenPlcConfigChange, historianRecording, historianRecordCount, onToggleHistorianRecording, onClose }: PlcModbusDashboardProps) => {
+const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdvanced, onToggleTerminalBridge, onDisconnectTerminalBridge, onEndpointChange, onWriteRegister, onPlcInputChange, onPlcFaultReset, onPlcScanTargetChange, onToggleOpenPlc, onProbeOpenPlc, onTestPhysicalPlcConnection, onTestPhysicalPlcReaction, onTestPhysicalPlcJog, onTestCylindrical4Fb, onTestCylindrical4Integrated, onTestFt511938, onCylindrical4IntegratedJog, onCylindrical4IntegratedGoto, physicalPlcDemoActive, onTogglePhysicalPlcDemo, offlineAutoActive, onToggleOfflineAuto, onOpenPlcCommand, onActivateManualControl, onOpenPlcSensorPolicy, onOpenPlcConfigChange, historianRecording, historianRecordCount, onToggleHistorianRecording, onClose }: PlcModbusDashboardProps) => {
   const [mirrorHeight, setMirrorHeight] = useState(330);
   const [integratedTargets, setIntegratedTargets] = useState<[number, number, number, number]>([0, 300, 60, 50]);
   const integratedTargetsEditingRef = useRef(false);
@@ -10935,6 +10993,9 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
     setIntegratedTargets(state.openPlc.integratedTargets);
   }, [ft511938Active, state.openPlc.integratedTargets]);
   const registers = (state.frame?.physicalRegisters ?? []).map((register, index) => {
+    if (offlineAutoActive && node && kinematicGeometryWithGraph(node.geometry)) {
+      return { ...register, value: node.geometry.kinematicState?.jointValues[register.jointId] ?? register.value };
+    }
     if (state.openPlc.endpointProfile === 's7-1200-robot-holding') return { ...register, address: 7 + index, displayAddress: String(7 + index) };
     if (cylindrical4IntegratedActive) {
       const offset = index >= 3 ? 38 : 32 + index * 2;
@@ -10974,10 +11035,10 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
     };
   });
   const externalPlcActive = state.openPlc.enabled || state.externalBridgeEnabled;
-  const mirrorRunning = state.openPlc.enabled
-    ? Boolean(state.openPlc.online && state.openPlc.runtimeRunning !== false && state.openPlc.command === 1 && (state.openPlc.conditionState ?? 0) < 2)
-    : state.running;
-  const synchronizedTwinRows = externalPlcActive ? registers : (twinRows.length ? twinRows : registers);
+  const mirrorRunning = offlineAutoActive || (state.openPlc.enabled
+    ? Boolean(state.openPlc.online && state.openPlc.runtimeRunning !== false && ((state.openPlc.command === 1 && (state.openPlc.conditionState ?? 0) < 2) || (state.openPlc.command === 5 && state.openPlc.status === 1)))
+    : state.running);
+  const synchronizedTwinRows = externalPlcActive || offlineAutoActive ? registers : (twinRows.length ? twinRows : registers);
   const ft511938Graph = node ? graphFromGeometry(node.geometry) : undefined;
   const ft511938CommandValues = useMemo(
     () => ft511938Active && ft511938Graph && state.openPlc.integratedTargets
@@ -11179,6 +11240,10 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
               </div>
             </div>
           )}
+          <button type="button" className={offlineAutoActive ? 'active' : ''} disabled={state.openPlc.enabled || !node}
+            title="Trayectoria local sin conexion PLC ni IoT" onClick={onToggleOfflineAuto}>
+            {offlineAutoActive ? <Square size={14} /> : <Play size={14} />}{offlineAutoActive ? 'Detener AUTO local' : 'AUTO local · sin PLC/IoT'}
+          </button>
           {ft511938Active && (
             <div className="physical-plc-test-panel cylindrical4-integrated-test-panel ft511938-test-panel">
               <div className={`physical-plc-link-state ${state.openPlc.online ? 'connected' : 'disconnected'}`}>
@@ -11240,8 +11305,19 @@ const PlcModbusDashboard = ({ node, state, onStart, onStop, onStep, onToggleAdva
             </button>
             <button type="button" className={state.openPlc.command === 1 ? 'active auto' : ''} disabled={!state.openPlc.enabled} title={ft511938Active ? 'Command 1: the FT511938 PLC runs AUTO only when its selected IoT policy allows it.' : 'Command 1: execute the automatic robot sequence continuously'} onClick={() => onOpenPlcCommand(1)}><Play size={13} />Auto</button>
             <button type="button" className={state.openPlc.command === 2 ? 'active home' : ''} disabled={!state.openPlc.enabled} title={ft511938Active ? 'Command 2: move and hold the FT511938 robot at its PLC Home pose. IoT does not gate Home.' : 'Command 2: move and hold the robot at its configured Home pose'} onClick={() => onOpenPlcCommand(2)}><RotateCw size={13} />Home</button>
-            <code>{state.openPlc.command} · {state.openPlc.command === 0 ? 'manual hold' : state.openPlc.command === 1 ? 'automatic cycle' : 'home pose'}</code>
+            <button type="button" disabled={!state.openPlc.enabled || !state.openPlc.online} title="STOP/HOLD: detiene la orden y reconoce fallos del controlador" onClick={() => onOpenPlcCommand(0)}><Square size={13} />STOP / HOLD</button>
+            <code>Cmd {state.openPlc.command ?? '--'} · modo PLC {state.openPlc.activeMode ?? '--'} · paso {state.openPlc.activeStep ?? '--'} · alarma {state.openPlc.alarmCode ?? '--'}</code>
           </div>
+          {ft511938Active && <div role="status" style={{ whiteSpace: 'normal', overflowWrap: 'anywhere', lineHeight: 1.5 }}>
+            <strong>{state.openPlc.simulationMode === 1 ? 'Feedback simulado' : 'Feedback fisico'}</strong>
+            <div>Manual/HOME: {ft511938MotionPermitted ? 'permisos de movimiento presentes' : ft511938MotionPermissionReasons(state.openPlc).join('; ')}</div>
+            <div>AUTO: SensorPolicy={state.openPlc.sensorPolicy ?? '--'} · condicion={state.openPlc.conditionState ?? '--'} · alarma IoT={state.openPlc.ioTAlarmCode ?? '--'} · heartbeat={state.openPlc.commFresh ? 'vigente' : 'no vigente'}</div>
+            <div>Ordenes PLC: marcha={state.openPlc.runMask ?? '--'} · sentido={state.openPlc.directionMask ?? '--'} · Q virtual/logica={state.openPlc.cmdQMask ?? '--'}</div>
+          </div>}
+          {state.openPlc.endpointProfile === FT511938_ENDPOINT_PROFILE && <label style={{ display: 'flex', gap: 8, alignItems: 'center', whiteSpace: 'normal' }}>
+            <input type="checkbox" disabled={state.openPlc.enabled} checked={state.openPlc.s7VirtualBench === true} onChange={event => onOpenPlcConfigChange('s7VirtualBench', event.target.checked)} />
+            Banco virtual en S7 · programa alternativo, sin motores (seleccionar desconectado)
+          </label>}
           {!cylindrical4Active && <div className={`openplc-iot-reaction condition-${state.openPlc.conditionState ?? 3}`}>
             <div>
               <span>PLC reaction · {state.openPlc.endpointProfile === 's7-1200-robot-holding' ? 'HR4..6' : '%QW94..96'}</span>

@@ -1,0 +1,811 @@
+// Alternative virtual FB: exact production interface and static variables.
+FUNCTION_BLOCK "RobotArmVirtualCommissioning"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+VAR_INPUT
+   SafetyOK : Bool;
+   DrivesReady : Bool;
+   WiringVerified : Bool;
+   PhysicalOutputEnable : Bool;
+   FeedbackValid : Bool;
+   Homed : Array[1..4] of Bool;
+   MinLimit : Array[1..4] of Bool;
+   MaxLimit : Array[1..4] of Bool;
+   PosMeasured : Array[1..4] of Real;
+END_VAR
+VAR_OUTPUT
+   CmdQ1toQ8 : Array[1..8] of Bool;
+   Run : Array[1..4] of Bool;
+   DirectionPositive : Array[1..4] of Bool;
+END_VAR
+VAR
+   ModeState : Int := 0;
+   LastCmd : Int := 0;
+   Step : Int := 0;
+   ManualPhase : Int := 0;
+   Fault : Int := 0;
+   ActiveAxis : Int := 0;
+   i : Int;
+   q : Int;
+   Delta : Real;
+   Target : Array[1..4] of Real;
+   CapturedTarget : Array[1..4] of Real;
+   MinPos : Array[1..4] of Real;
+   MaxPos : Array[1..4] of Real;
+   Tol : Array[1..4] of Real;
+   AllHomed : Bool;
+   PosValid : Bool;
+   PhysicalPermitted : Bool;
+   ManualPermitted : Bool;
+   AutoPermitted : Bool;
+   AutoMotionAllowed : Bool;
+   Permitted : Bool;
+   MotionPresent : Bool;
+   IoTBlock : Bool;
+   IoTDegraded : Bool;
+   AnyMoving : Bool;
+   AtTarget : Bool;
+   ManualTargetValid : Bool;
+   ManualRequiresSafeHeight : Bool;
+   ManualBaseReady : Bool;
+   ManualHeightReady : Bool;
+   ManualExtensionReady : Bool;
+   ManualGripperReady : Bool;
+   OutputGate : Bool;
+   HeartbeatChanged : Bool;
+   HeartbeatSeen : Bool := FALSE;
+   LastHeartbeat : UInt := UINT#0;
+   TemperatureC : Real;
+   HumidityRH : Real;
+   GyroDps : Real;
+   SettleEnable : Bool;
+   TimeoutEnable : Bool;
+   TimeoutReset : Bool;
+   MotionKey : DInt;
+   LastMotionKey : DInt := DINT#-1;
+   MotionIdleTimer : TON;
+   HeartbeatWatchdog : TON;
+   SettleTimer : TON;
+   MotionTimeout : TON;
+END_VAR
+
+
+
+
+BEGIN
+// VIRTUAL ONLY. Same existing FB variables and HR0..60; no hardware outputs.
+// MinPos is reused as persistent virtual feedback ONLY in this alternative.
+// Virtual integration follows changed platform heartbeat; no new timer/variable.
+IF NOT #HeartbeatSeen THEN
+    #MinPos[1] := 0.0;
+    #MinPos[2] := 300.0;
+    #MinPos[3] := 60.0;
+    #MinPos[4] := 50.0;
+END_IF;
+IF ("RobotHolding".Struct.HeartbeatSequence <> #LastHeartbeat) AND
+   ("RobotHolding".Struct.Enable <> UINT#0) AND
+   ("RobotHolding".Struct.Cmd = #LastCmd) AND
+   ("RobotHolding".Struct.Cmd <> 0) AND (#Fault = 0) AND
+   ((#ModeState <> 1) OR
+    (("RobotHolding".Struct.SensorValid <> UINT#0) AND
+     (("RobotHolding".Struct.SensorQualityBits AND UINT#17) = UINT#17) AND
+     ("RobotHolding".Struct.SensorAgeMs <= UINT#2500) AND
+     ("RobotHolding".Struct.TemperatureCx100 < 4500) AND
+     ("RobotHolding".Struct.HumidityRHx100 < UINT#7500) AND
+     ("RobotHolding".Struct.GyroDpsx100 < UINT#12000) AND
+     ((("RobotHolding".Struct.SensorPolicy = UINT#0) AND
+       ("RobotHolding".Struct.GyroDpsx100 < UINT#300) AND #MotionIdleTimer.Q) OR
+      (("RobotHolding".Struct.SensorPolicy = UINT#1) AND
+       ("RobotHolding".Struct.GyroDpsx100 >= UINT#300))))) THEN
+    FOR #i := 1 TO 4 DO
+        IF #Run[#i] THEN
+            CASE #i OF
+                1: #Delta := 5.0;
+                2: #Delta := 10.0;
+                3: #Delta := 10.0;
+                4: #Delta := 3.0;
+            END_CASE;
+            IF #ModeState <> 3 THEN
+                #Delta := MIN(IN1 := #Delta, IN2 := ABS(#Target[#i] - #MinPos[#i]));
+            END_IF;
+            IF NOT #DirectionPositive[#i] THEN #Delta := -#Delta; END_IF;
+            #MinPos[#i] := #MinPos[#i] + #Delta;
+        END_IF;
+    END_FOR;
+END_IF;
+#MinPos[1] := LIMIT(MN := -171.0, IN := #MinPos[1], MX := 171.0);
+#MinPos[2] := LIMIT(MN := 130.0, IN := #MinPos[2], MX := 360.0);
+#MinPos[3] := LIMIT(MN := 0.0, IN := #MinPos[3], MX := 180.0);
+#MinPos[4] := LIMIT(MN := 12.0, IN := #MinPos[4], MX := 70.0);
+IF ("RobotHolding".Struct.Cmd < 0) OR ("RobotHolding".Struct.Cmd > 4) THEN
+    "RobotHolding".Struct.Cmd := 0;
+    "RobotHolding".Struct.Enable := UINT#0;
+END_IF;
+// IoT telemetry HR15..20 comes from the platform; never fabricate validity.
+// HR14 selects AUTO: 0 = still for 2 s, 1 = motion (gyro >= 3 deg/s).
+// Manual control and the virtual position plant remain independent of IoT.
+"RobotHolding".Struct.SafetyOK := UINT#0;
+    IF TRUE THEN
+        "RobotHolding".Struct.SafetyOK := UINT#1;
+    END_IF;
+    "RobotHolding".Struct.DrivesReady := UINT#0;
+    IF TRUE THEN
+        "RobotHolding".Struct.DrivesReady := UINT#1;
+    END_IF;
+    "RobotHolding".Struct.WiringVerified := UINT#0;
+    IF TRUE THEN
+        "RobotHolding".Struct.WiringVerified := UINT#1;
+    END_IF;
+    "RobotHolding".Struct.PhysicalOutputEnable := UINT#0;
+    IF TRUE THEN
+        "RobotHolding".Struct.PhysicalOutputEnable := UINT#1;
+    END_IF;
+    "RobotHolding".Struct.SimulationMode := UINT#0;
+    "RobotHolding".Struct.StartupReady := UINT#1;
+    
+    "RobotHolding".Struct.HomedMask := UINT#0;
+    "RobotHolding".Struct.MinLimitMask := UINT#0;
+    "RobotHolding".Struct.MaxLimitMask := UINT#0;
+    IF TRUE THEN
+        "RobotHolding".Struct.HomedMask := "RobotHolding".Struct.HomedMask OR UINT#1;
+    END_IF;
+    IF TRUE THEN
+        "RobotHolding".Struct.HomedMask := "RobotHolding".Struct.HomedMask OR UINT#2;
+    END_IF;
+    IF TRUE THEN
+        "RobotHolding".Struct.HomedMask := "RobotHolding".Struct.HomedMask OR UINT#4;
+    END_IF;
+    IF TRUE THEN
+        "RobotHolding".Struct.HomedMask := "RobotHolding".Struct.HomedMask OR UINT#8;
+    END_IF;
+    IF FALSE THEN
+        "RobotHolding".Struct.MinLimitMask := "RobotHolding".Struct.MinLimitMask OR UINT#1;
+    END_IF;
+    IF FALSE THEN
+        "RobotHolding".Struct.MinLimitMask := "RobotHolding".Struct.MinLimitMask OR UINT#2;
+    END_IF;
+    IF FALSE THEN
+        "RobotHolding".Struct.MinLimitMask := "RobotHolding".Struct.MinLimitMask OR UINT#4;
+    END_IF;
+    IF FALSE THEN
+        "RobotHolding".Struct.MinLimitMask := "RobotHolding".Struct.MinLimitMask OR UINT#8;
+    END_IF;
+    IF FALSE THEN
+        "RobotHolding".Struct.MaxLimitMask := "RobotHolding".Struct.MaxLimitMask OR UINT#1;
+    END_IF;
+    IF FALSE THEN
+        "RobotHolding".Struct.MaxLimitMask := "RobotHolding".Struct.MaxLimitMask OR UINT#2;
+    END_IF;
+    IF FALSE THEN
+        "RobotHolding".Struct.MaxLimitMask := "RobotHolding".Struct.MaxLimitMask OR UINT#4;
+    END_IF;
+    IF FALSE THEN
+        "RobotHolding".Struct.MaxLimitMask := "RobotHolding".Struct.MaxLimitMask OR UINT#8;
+    END_IF;
+    
+    "RobotHolding".Struct.Pos1 := #MinPos[1];
+    "RobotHolding".Struct.Pos2 := #MinPos[2];
+    "RobotHolding".Struct.Pos3 := #MinPos[3];
+    "RobotHolding".Struct.Pos4 := #MinPos[4];
+
+    #MaxPos[1] := 171.0;
+    #Tol[1] := 1.0;
+
+    #MaxPos[2] := 360.0;
+    #Tol[2] := 2.0;
+
+    #MaxPos[3] := 180.0;
+    #Tol[3] := 2.0;
+
+    #MaxPos[4] := 70.0;
+    #Tol[4] := 2.0;
+    
+    #AllHomed := TRUE;
+    #PosValid := TRUE;
+    FOR #i := 1 TO 4 DO
+        IF NOT TRUE THEN
+            #AllHomed := FALSE;
+        END_IF;
+        IF (#MinPos[#i] <> #MinPos[#i]) OR
+            (NOT (((#i = 1) AND (#MinPos[#i] >= -173.0)) OR ((#i = 2) AND (#MinPos[#i] >= 128.0)) OR ((#i = 3) AND (#MinPos[#i] >= -2.0)) OR ((#i = 4) AND (#MinPos[#i] >= 10.0)))) OR
+            (#MinPos[#i] > (#MaxPos[#i] + 2.0)) THEN
+            #PosValid := FALSE;
+        END_IF;
+    END_FOR;
+    "RobotHolding".Struct.SensorOK := UINT#0;
+    IF #PosValid THEN
+        "RobotHolding".Struct.SensorOK := UINT#1;
+    END_IF;
+    
+    #HeartbeatChanged := "RobotHolding".Struct.HeartbeatSequence <> #LastHeartbeat;
+    #HeartbeatWatchdog(IN := NOT #HeartbeatChanged,
+                       PT := T#2500ms);
+    IF #HeartbeatChanged THEN
+        #LastHeartbeat := "RobotHolding".Struct.HeartbeatSequence;
+        #HeartbeatSeen := TRUE;
+    END_IF;
+    "RobotHolding".Struct.HeartbeatEcho := #LastHeartbeat;
+    "RobotHolding".Struct.CommFresh := UINT#0;
+    IF #HeartbeatSeen AND NOT #HeartbeatWatchdog.Q THEN
+        "RobotHolding".Struct.CommFresh := UINT#1;
+    END_IF;
+    
+    #TemperatureC := INT_TO_REAL("RobotHolding".Struct.TemperatureCx100) / 100.0;
+    #HumidityRH := UINT_TO_REAL("RobotHolding".Struct.HumidityRHx100) / 100.0;
+    #GyroDps := UINT_TO_REAL("RobotHolding".Struct.GyroDpsx100) / 100.0;
+    #MotionPresent := #GyroDps >= 3.0;
+    #MotionIdleTimer(IN := NOT #MotionPresent,
+                     PT := T#2s);
+    
+    "RobotHolding".Struct.ConditionState := UINT#0;
+    "RobotHolding".Struct.IoTAlarmCode := UINT#0;
+    "RobotHolding".Struct.SpeedPermille := UINT#1000;
+    IF ("RobotHolding".Struct.SensorPolicy <> UINT#0) AND
+        ("RobotHolding".Struct.SensorPolicy <> UINT#1) THEN
+        "RobotHolding".Struct.ConditionState := UINT#3;
+        "RobotHolding".Struct.IoTAlarmCode := UINT#6;
+        "RobotHolding".Struct.SpeedPermille := UINT#0;
+    ELSIF ("RobotHolding".Struct.SensorValid = UINT#0) OR
+        (("RobotHolding".Struct.SensorQualityBits AND UINT#1) = UINT#0) OR
+        ("RobotHolding".Struct.SensorAgeMs > UINT#2500) THEN
+        "RobotHolding".Struct.ConditionState := UINT#3;
+        "RobotHolding".Struct.IoTAlarmCode := UINT#4;
+        "RobotHolding".Struct.SpeedPermille := UINT#0;
+    ELSIF (("RobotHolding".Struct.SensorPolicy = UINT#0) OR ("RobotHolding".Struct.SensorPolicy = UINT#1)) AND
+        (("RobotHolding".Struct.SensorQualityBits AND UINT#16) = UINT#0) THEN
+        "RobotHolding".Struct.ConditionState := UINT#3;
+        "RobotHolding".Struct.IoTAlarmCode := UINT#6;
+        "RobotHolding".Struct.SpeedPermille := UINT#0;
+    ELSIF (#TemperatureC >= 55.0) OR (#HumidityRH >= 85.0) OR (#GyroDps >= 220.0) THEN
+        "RobotHolding".Struct.ConditionState := UINT#2;
+        "RobotHolding".Struct.SpeedPermille := UINT#0;
+        IF #TemperatureC >= 55.0 THEN
+            "RobotHolding".Struct.IoTAlarmCode := UINT#1;
+        ELSIF #HumidityRH >= 85.0 THEN
+            "RobotHolding".Struct.IoTAlarmCode := UINT#2;
+        ELSE
+            "RobotHolding".Struct.IoTAlarmCode := UINT#3;
+        END_IF;
+    ELSIF (#TemperatureC >= 45.0) OR (#HumidityRH >= 75.0) OR (#GyroDps >= 120.0) THEN
+        "RobotHolding".Struct.ConditionState := UINT#1;
+        "RobotHolding".Struct.SpeedPermille := UINT#550;
+    ELSIF ("RobotHolding".Struct.SensorPolicy = UINT#0) AND #MotionPresent THEN
+        "RobotHolding".Struct.ConditionState := UINT#2;
+        "RobotHolding".Struct.IoTAlarmCode := UINT#5;
+        "RobotHolding".Struct.SpeedPermille := UINT#0;
+    ELSIF ("RobotHolding".Struct.SensorPolicy = UINT#0) AND NOT #MotionIdleTimer.Q THEN
+        "RobotHolding".Struct.ConditionState := UINT#2;
+        "RobotHolding".Struct.IoTAlarmCode := UINT#5;
+        "RobotHolding".Struct.SpeedPermille := UINT#0;
+    ELSIF ("RobotHolding".Struct.SensorPolicy = UINT#1) AND NOT #MotionPresent THEN
+        "RobotHolding".Struct.ConditionState := UINT#2;
+        "RobotHolding".Struct.IoTAlarmCode := UINT#5;
+        "RobotHolding".Struct.SpeedPermille := UINT#0;
+    END_IF;
+    
+    #IoTBlock := "RobotHolding".Struct.ConditionState >= UINT#2;
+    #IoTDegraded := "RobotHolding".Struct.ConditionState = UINT#1;
+    #PhysicalPermitted := ("RobotHolding".Struct.Enable <> UINT#0) AND TRUE AND TRUE AND
+    TRUE AND TRUE;
+    // Manual ignores IoT policy, but remote motion still requires the PLC
+    // heartbeat watchdog so a lost client cannot leave JOG energized.
+    #ManualPermitted := #PhysicalPermitted AND #AllHomed AND #PosValid AND
+    ("RobotHolding".Struct.CommFresh <> UINT#0);
+    #AutoMotionAllowed := FALSE;
+    IF "RobotHolding".Struct.SensorPolicy = UINT#0 THEN
+        #AutoMotionAllowed := (NOT #MotionPresent) AND #MotionIdleTimer.Q;
+    ELSIF "RobotHolding".Struct.SensorPolicy = UINT#1 THEN
+        #AutoMotionAllowed := #MotionPresent;
+    END_IF;
+    #AutoPermitted := #ManualPermitted AND ("RobotHolding".Struct.CommFresh <> UINT#0) AND
+    ("RobotHolding".Struct.SensorOK <> UINT#0) AND ("RobotHolding".Struct.SensorValid <> UINT#0) AND
+    (("RobotHolding".Struct.SensorQualityBits AND UINT#1) <> UINT#0) AND
+    (("RobotHolding".Struct.SensorQualityBits AND UINT#16) <> UINT#0) AND
+    ("RobotHolding".Struct.SensorAgeMs <= UINT#2500) AND NOT #IoTBlock AND
+    NOT #IoTDegraded AND #AutoMotionAllowed;
+    
+    // Retain faults until the operator explicitly selects STOP/HOLD.
+    #AnyMoving := FALSE;
+    #AtTarget := FALSE;
+    #ActiveAxis := 0;
+    "RobotHolding".Struct.Done := UINT#0;
+    // Inicializacion explicita de todas las salidas en cada ciclo.
+    // TIA Portal puede no reconocer el bucle FOR como inicializacion completa.
+    #Run[1] := FALSE;
+    #Run[2] := FALSE;
+    #Run[3] := FALSE;
+    #Run[4] := FALSE;
+    #DirectionPositive[1] := FALSE;
+    #DirectionPositive[2] := FALSE;
+    #DirectionPositive[3] := FALSE;
+    #DirectionPositive[4] := FALSE;
+    #CmdQ1toQ8[1] := FALSE;
+    #CmdQ1toQ8[2] := FALSE;
+    #CmdQ1toQ8[3] := FALSE;
+    #CmdQ1toQ8[4] := FALSE;
+    #CmdQ1toQ8[5] := FALSE;
+    #CmdQ1toQ8[6] := FALSE;
+    #CmdQ1toQ8[7] := FALSE;
+    #CmdQ1toQ8[8] := FALSE;
+    FOR #i := 1 TO 4 DO
+        #Target[#i] := #MinPos[#i];
+    END_FOR;
+    
+    IF #ModeState = 1 THEN
+        #Permitted := #AutoPermitted;
+    ELSE
+        #Permitted := #ManualPermitted;
+    END_IF;
+    
+    IF "RobotHolding".Struct.Cmd = 0 THEN
+        #Fault := 0;
+        #ModeState := 0;
+        #Step := 0;
+        #ManualPhase := 0;
+    ELSIF #Fault <> 0 THEN
+        #ModeState := 0;
+        #Step := 0;
+        #ManualPhase := 0;
+    ELSIF ("RobotHolding".Struct.Cmd = 1) AND (#LastCmd <> 1) THEN
+        IF #ManualPermitted THEN
+            #ModeState := 1;
+            #Step := 1;
+        ELSE
+            IF NOT #PhysicalPermitted THEN
+                #Fault := 1;
+            ELSIF NOT #AllHomed THEN
+                #Fault := 2;
+            ELSIF NOT #PosValid THEN
+                #Fault := 3;
+            ELSE
+                #Fault := 6;
+            END_IF;
+        END_IF;
+    ELSIF ("RobotHolding".Struct.Cmd = 2) AND (#LastCmd <> 2) THEN
+        IF #ManualPermitted THEN
+            #ModeState := 2;
+            #Step := 0;
+        ELSE
+            #Fault := 1;
+        END_IF;
+    ELSIF "RobotHolding".Struct.Cmd = 4 THEN
+        #ManualTargetValid := ("RobotHolding".Struct.ManualTarget1 >= -171.0) AND ("RobotHolding".Struct.ManualTarget1 <= 171.0) AND
+        ("RobotHolding".Struct.ManualTarget2 >= 130.0) AND ("RobotHolding".Struct.ManualTarget2 <= 360.0) AND
+        ("RobotHolding".Struct.ManualTarget3 >= 0.0) AND ("RobotHolding".Struct.ManualTarget3 <= 180.0) AND
+        ("RobotHolding".Struct.ManualTarget4 >= 12.0) AND ("RobotHolding".Struct.ManualTarget4 <= 70.0);
+        IF #ManualPermitted AND #ManualTargetValid THEN
+            IF (#LastCmd <> 4) OR
+                (ABS("RobotHolding".Struct.ManualTarget1 - #CapturedTarget[1]) > 0.01) OR
+                (ABS("RobotHolding".Struct.ManualTarget2 - #CapturedTarget[2]) > 0.01) OR
+                (ABS("RobotHolding".Struct.ManualTarget3 - #CapturedTarget[3]) > 0.01) OR
+                (ABS("RobotHolding".Struct.ManualTarget4 - #CapturedTarget[4]) > 0.01) THEN
+                #CapturedTarget[1] := "RobotHolding".Struct.ManualTarget1;
+                #CapturedTarget[2] := "RobotHolding".Struct.ManualTarget2;
+                #CapturedTarget[3] := "RobotHolding".Struct.ManualTarget3;
+                #CapturedTarget[4] := "RobotHolding".Struct.ManualTarget4;
+                #ManualRequiresSafeHeight := (#CapturedTarget[2] < 280.0) AND
+                ((ABS(#MinPos[1] - #CapturedTarget[1]) > #Tol[1]) OR
+                (ABS(#MinPos[3] - #CapturedTarget[3]) > #Tol[3]));
+                #ManualPhase := 1;
+                #ModeState := 4;
+                #Step := 0;
+            END_IF;
+        ELSE
+            #Fault := 4;
+        END_IF;
+    ELSIF "RobotHolding".Struct.Cmd = 3 THEN
+        IF (#LastCmd <> 3) AND #ManualPermitted AND
+            ("RobotHolding".Struct.JogAxis >= 1) AND ("RobotHolding".Struct.JogAxis <= 4) AND
+            (("RobotHolding".Struct.JogDirection = -1) OR ("RobotHolding".Struct.JogDirection = 1)) THEN
+            #ModeState := 3;
+            #Step := 0;
+        ELSIF #LastCmd <> 3 THEN
+            #Fault := 7;
+        END_IF;
+    END_IF;
+    #LastCmd := "RobotHolding".Struct.Cmd;
+    
+    IF (#ModeState = 3) AND (("RobotHolding".Struct.Cmd <> 3) OR ("RobotHolding".Struct.JogEnable = UINT#0)) THEN
+        #ModeState := 0;
+        #Step := 0;
+    END_IF;
+    
+    IF #ModeState = 1 THEN
+        #Permitted := #AutoPermitted;
+    ELSE
+        #Permitted := #ManualPermitted;
+    END_IF;
+    IF (#ModeState <> 0) AND NOT #ManualPermitted THEN
+        #Fault := 1;
+        #ModeState := 0;
+        #Step := 0;
+        #ManualPhase := 0;
+    END_IF;
+    
+    // Same 17-pose Smart Demo used by the OpenPLC adapter and main dashboard.
+    IF #ModeState = 1 THEN
+        CASE #Step OF
+            1:
+                #Target[1] := -68.754936;
+                #Target[2] := 300.0;
+                #Target[3] := 180.0;
+                #Target[4] := 60.0;
+            2:
+                #Target[1] := -68.754936;
+                #Target[2] := 150.0;
+                #Target[3] := 180.0;
+                #Target[4] := 60.0;
+            3:
+                #Target[1] := -68.754936;
+                #Target[2] := 150.0;
+                #Target[3] := 180.0;
+                #Target[4] := 25.0;
+            4:
+                #Target[1] := -68.754936;
+                #Target[2] := 320.0;
+                #Target[3] := 180.0;
+                #Target[4] := 25.0;
+            5:
+                #Target[1] := 80.214088;
+                #Target[2] := 320.0;
+                #Target[3] := 0.0;
+                #Target[4] := 25.0;
+            6:
+                #Target[1] := 80.214088;
+                #Target[2] := 180.0;
+                #Target[3] := 0.0;
+                #Target[4] := 25.0;
+            7:
+                #Target[1] := 80.214088;
+                #Target[2] := 180.0;
+                #Target[3] := 0.0;
+                #Target[4] := 60.0;
+            8:
+                #Target[1] := 80.214088;
+                #Target[2] := 300.0;
+                #Target[3] := 0.0;
+                #Target[4] := 60.0;
+            9:
+                #Target[1] := 80.214088;
+                #Target[2] := 180.0;
+                #Target[3] := 0.0;
+                #Target[4] := 60.0;
+            10:
+                #Target[1] := 80.214088;
+                #Target[2] := 180.0;
+                #Target[3] := 0.0;
+                #Target[4] := 25.0;
+            11:
+                #Target[1] := 80.214088;
+                #Target[2] := 320.0;
+                #Target[3] := 0.0;
+                #Target[4] := 25.0;
+            12:
+                #Target[1] := -68.754936;
+                #Target[2] := 320.0;
+                #Target[3] := 180.0;
+                #Target[4] := 25.0;
+            13:
+                #Target[1] := -68.754936;
+                #Target[2] := 150.0;
+                #Target[3] := 180.0;
+                #Target[4] := 25.0;
+            14:
+                #Target[1] := -68.754936;
+                #Target[2] := 150.0;
+                #Target[3] := 180.0;
+                #Target[4] := 60.0;
+            15:
+                #Target[1] := -68.754936;
+                #Target[2] := 300.0;
+                #Target[3] := 180.0;
+                #Target[4] := 60.0;
+            16:
+                #Target[1] := 0.0;
+                #Target[2] := 300.0;
+                #Target[3] := 60.0;
+                #Target[4] := 50.0;
+            ELSE
+                #Fault := 7;
+        END_CASE;
+        #AtTarget := TRUE;
+        FOR #i := 1 TO 4 DO
+            #Delta := #Target[#i] - #MinPos[#i];
+            IF ABS(#Delta) > #Tol[#i] THEN
+                #AtTarget := FALSE;
+                IF ((#Delta > 0.0) AND FALSE) OR ((#Delta < 0.0) AND FALSE) THEN
+                    #Fault := 4;
+                ELSE
+                    #Run[#i] := TRUE;
+                    #DirectionPositive[#i] := #Delta > 0.0;
+                    #AnyMoving := TRUE;
+                END_IF;
+            END_IF;
+        END_FOR;
+        
+    ELSIF #ModeState = 2 THEN
+        #Target[1] := 0.0;
+        #Target[2] := 300.0;
+        #Target[3] := 60.0;
+        #Target[4] := 50.0;
+        #AtTarget := TRUE;
+        // Establish clearance before base or extension motion.
+        IF ABS(#Target[2] - #MinPos[2]) > #Tol[2] THEN
+            #ActiveAxis := 2;
+        ELSIF ABS(#Target[1] - #MinPos[1]) > #Tol[1] THEN
+            #ActiveAxis := 1;
+        ELSIF ABS(#Target[3] - #MinPos[3]) > #Tol[3] THEN
+            #ActiveAxis := 3;
+        ELSIF ABS(#Target[4] - #MinPos[4]) > #Tol[4] THEN
+            #ActiveAxis := 4;
+        END_IF;
+        #AtTarget := #ActiveAxis = 0;
+        IF #ActiveAxis <> 0 THEN
+            #Delta := #Target[#ActiveAxis] - #MinPos[#ActiveAxis];
+            IF ((#Delta > 0.0) AND FALSE) OR ((#Delta < 0.0) AND FALSE) THEN
+                #Fault := 4;
+            ELSE
+                #Run[#ActiveAxis] := TRUE;
+                #DirectionPositive[#ActiveAxis] := #Delta > 0.0;
+                #AnyMoving := TRUE;
+            END_IF;
+        END_IF;
+        
+    ELSIF #ModeState = 4 THEN
+        #ManualBaseReady := ABS(#MinPos[1] - #CapturedTarget[1]) <= #Tol[1];
+        #ManualHeightReady := ABS(#MinPos[2] - #CapturedTarget[2]) <= #Tol[2];
+        #ManualExtensionReady := ABS(#MinPos[3] - #CapturedTarget[3]) <= #Tol[3];
+        #ManualGripperReady := ABS(#MinPos[4] - #CapturedTarget[4]) <= #Tol[4];
+        IF #ManualPhase = 1 THEN
+            #Target[2] := #CapturedTarget[2];
+            IF #ManualRequiresSafeHeight THEN
+                #Target[2] := 300.0;
+            END_IF;
+            IF ABS(#MinPos[2] - #Target[2]) <= #Tol[2] THEN
+                #ManualPhase := 2;
+            END_IF;
+        END_IF;
+        IF (#ManualPhase = 2) AND #ManualBaseReady THEN
+            #ManualPhase := 3;
+        END_IF;
+        IF (#ManualPhase = 3) AND #ManualExtensionReady THEN
+            IF #ManualRequiresSafeHeight THEN
+                #ManualPhase := 4;
+            ELSE
+                #ManualPhase := 5;
+            END_IF;
+        END_IF;
+        IF (#ManualPhase = 4) AND #ManualHeightReady THEN
+            #ManualPhase := 5;
+        END_IF;
+        IF (#ManualPhase = 5) AND #ManualGripperReady THEN
+            #ManualPhase := 6;
+        END_IF;
+        
+        IF #ManualPhase = 1 THEN
+            #Target[2] := #CapturedTarget[2];
+            IF #ManualRequiresSafeHeight THEN
+                #Target[2] := 300.0;
+            END_IF;
+            IF ABS(#MinPos[2] - #Target[2]) > #Tol[2] THEN
+                #ActiveAxis := 2;
+            END_IF;
+        ELSIF #ManualPhase = 2 THEN
+            IF NOT #ManualBaseReady THEN
+                #ActiveAxis := 1;
+            END_IF;
+        ELSIF #ManualPhase = 3 THEN
+            IF NOT #ManualExtensionReady THEN
+                #ActiveAxis := 3;
+            END_IF;
+        ELSIF #ManualPhase = 4 THEN
+            #Target[2] := #CapturedTarget[2];
+            IF NOT #ManualHeightReady THEN
+                #ActiveAxis := 2;
+            END_IF;
+        ELSIF #ManualPhase = 5 THEN
+            IF NOT #ManualGripperReady THEN
+                #ActiveAxis := 4;
+            END_IF;
+        END_IF;
+        #Target[1] := #CapturedTarget[1];
+        #Target[3] := #CapturedTarget[3];
+        #Target[4] := #CapturedTarget[4];
+        IF (#ManualPhase <> 1) AND (#ManualPhase <> 4) THEN
+            #Target[2] := #CapturedTarget[2];
+        END_IF;
+        IF #ActiveAxis <> 0 THEN
+            #Delta := #Target[#ActiveAxis] - #MinPos[#ActiveAxis];
+            IF ((#Delta > 0.0) AND FALSE) OR ((#Delta < 0.0) AND FALSE) THEN
+                #Fault := 4;
+            ELSE
+                #Run[#ActiveAxis] := TRUE;
+                #DirectionPositive[#ActiveAxis] := #Delta > 0.0;
+                #AnyMoving := TRUE;
+            END_IF;
+        END_IF;
+        #AtTarget := (#ManualPhase = 6) AND #ManualBaseReady AND #ManualHeightReady AND
+        #ManualExtensionReady AND #ManualGripperReady;
+        
+    ELSIF (#ModeState = 3) AND ("RobotHolding".Struct.Cmd = 3) AND ("RobotHolding".Struct.JogEnable <> UINT#0) THEN
+        #ActiveAxis := "RobotHolding".Struct.JogAxis;
+        IF (#ActiveAxis < 1) OR (#ActiveAxis > 4) OR
+            (("RobotHolding".Struct.JogDirection <> -1) AND ("RobotHolding".Struct.JogDirection <> 1)) THEN
+            #Fault := 7;
+        ELSIF (((#ActiveAxis = 1) OR (#ActiveAxis = 3)) AND (#MinPos[2] < 280.0)) OR
+            (("RobotHolding".Struct.JogDirection > 0) AND (FALSE OR (#MinPos[#ActiveAxis] >= #MaxPos[#ActiveAxis]))) OR
+            (("RobotHolding".Struct.JogDirection < 0) AND (FALSE OR (((#ActiveAxis = 1) AND (#MinPos[1] <= -171.0)) OR ((#ActiveAxis = 2) AND (#MinPos[2] <= 130.0)) OR ((#ActiveAxis = 3) AND (#MinPos[3] <= 0.0)) OR ((#ActiveAxis = 4) AND (#MinPos[4] <= 12.0))))) THEN
+            #Fault := 4;
+        ELSE
+            #Run[#ActiveAxis] := TRUE;
+            #DirectionPositive[#ActiveAxis] := "RobotHolding".Struct.JogDirection > 0;
+            #AnyMoving := TRUE;
+        END_IF;
+    END_IF;
+    
+    IF NOT #Permitted OR (#Fault <> 0) THEN
+        FOR #i := 1 TO 4 DO
+            #Run[#i] := FALSE;
+        END_FOR;
+        #AnyMoving := FALSE;
+    END_IF;
+    
+    #SettleEnable := ((#ModeState = 1) OR (#ModeState = 2) OR (#ModeState = 4)) AND
+    #AtTarget AND #Permitted AND (#Fault = 0);
+    #SettleTimer(IN := #SettleEnable,
+                 PT := T#200ms);
+    IF #SettleTimer.Q AND (#Fault = 0) THEN
+        "RobotHolding".Struct.Done := UINT#1;
+        "RobotHolding".Struct.DoneCounter := "RobotHolding".Struct.DoneCounter + UINT#1;
+        IF #ModeState = 1 THEN
+            IF #Step < 16 THEN
+                #Step := #Step + 1;
+            ELSE
+                #Step := 1;
+            END_IF;
+        ELSE
+            #ModeState := 0;
+            #Step := 0;
+            #ManualPhase := 0;
+        END_IF;
+    END_IF;
+    
+    #MotionKey := INT_TO_DINT(#ModeState) * DINT#100;
+    IF #ModeState = 4 THEN
+        #MotionKey := #MotionKey + INT_TO_DINT(#ManualPhase);
+    ELSE
+        #MotionKey := #MotionKey + INT_TO_DINT(#Step);
+    END_IF;
+    #TimeoutReset := #MotionKey <> #LastMotionKey;
+    #TimeoutEnable := #AnyMoving AND #Permitted AND (#Fault = 0) AND NOT #TimeoutReset;
+    #MotionTimeout(IN := #TimeoutEnable,
+                   PT := T#30s);
+    #LastMotionKey := #MotionKey;
+    IF #MotionTimeout.Q THEN
+        #Fault := 5;
+    END_IF;
+    
+    "RobotHolding".Struct.RunMask := UINT#0;
+    "RobotHolding".Struct.DirectionMask := UINT#0;
+    IF #Run[1] THEN
+        "RobotHolding".Struct.RunMask := "RobotHolding".Struct.RunMask OR UINT#1;
+    END_IF;
+    IF #Run[2] THEN
+        "RobotHolding".Struct.RunMask := "RobotHolding".Struct.RunMask OR UINT#2;
+    END_IF;
+    IF #Run[3] THEN
+        "RobotHolding".Struct.RunMask := "RobotHolding".Struct.RunMask OR UINT#4;
+    END_IF;
+    IF #Run[4] THEN
+        "RobotHolding".Struct.RunMask := "RobotHolding".Struct.RunMask OR UINT#8;
+    END_IF;
+    IF #Run[1] AND #DirectionPositive[1] THEN
+        "RobotHolding".Struct.DirectionMask := "RobotHolding".Struct.DirectionMask OR UINT#1;
+    END_IF;
+    IF #Run[2] AND #DirectionPositive[2] THEN
+        "RobotHolding".Struct.DirectionMask := "RobotHolding".Struct.DirectionMask OR UINT#2;
+    END_IF;
+    IF #Run[3] AND #DirectionPositive[3] THEN
+        "RobotHolding".Struct.DirectionMask := "RobotHolding".Struct.DirectionMask OR UINT#4;
+    END_IF;
+    IF #Run[4] AND #DirectionPositive[4] THEN
+        "RobotHolding".Struct.DirectionMask := "RobotHolding".Struct.DirectionMask OR UINT#8;
+    END_IF;
+    
+    #OutputGate := #Permitted AND (#Fault = 0) AND #AllHomed AND #PosValid AND
+    TRUE AND TRUE;
+    IF #OutputGate THEN
+        IF #Run[4] THEN
+            #CmdQ1toQ8[1] := #DirectionPositive[4];
+            #CmdQ1toQ8[2] := NOT #DirectionPositive[4];
+        END_IF;
+        IF #Run[3] THEN
+            #CmdQ1toQ8[3] := #DirectionPositive[3];
+            #CmdQ1toQ8[4] := NOT #DirectionPositive[3];
+        END_IF;
+        IF #Run[2] THEN
+            #CmdQ1toQ8[5] := NOT #DirectionPositive[2];
+            #CmdQ1toQ8[6] := #DirectionPositive[2];
+        END_IF;
+        IF #Run[1] THEN
+            #CmdQ1toQ8[7] := NOT #DirectionPositive[1];
+            #CmdQ1toQ8[8] := #DirectionPositive[1];
+        END_IF;
+    END_IF;
+    IF (#CmdQ1toQ8[1] AND #CmdQ1toQ8[2]) OR (#CmdQ1toQ8[3] AND #CmdQ1toQ8[4]) OR
+        (#CmdQ1toQ8[5] AND #CmdQ1toQ8[6]) OR (#CmdQ1toQ8[7] AND #CmdQ1toQ8[8]) THEN
+        #Fault := 10;
+    END_IF;
+    IF #Fault <> 0 THEN
+        FOR #q := 1 TO 8 DO
+            #CmdQ1toQ8[#q] := FALSE;
+        END_FOR;
+        FOR #i := 1 TO 4 DO
+            #Run[#i] := FALSE;
+        END_FOR;
+        "RobotHolding".Struct.RunMask := UINT#0;
+        "RobotHolding".Struct.DirectionMask := UINT#0;
+        #ModeState := 0;
+        #Step := 0;
+        #ManualPhase := 0;
+    END_IF;
+    
+    "RobotHolding".Struct.CmdQ1toQ8Mask := UINT#0;
+    IF #CmdQ1toQ8[1] THEN
+        "RobotHolding".Struct.CmdQ1toQ8Mask := "RobotHolding".Struct.CmdQ1toQ8Mask OR UINT#1;
+    END_IF;
+    IF #CmdQ1toQ8[2] THEN
+        "RobotHolding".Struct.CmdQ1toQ8Mask := "RobotHolding".Struct.CmdQ1toQ8Mask OR UINT#2;
+    END_IF;
+    IF #CmdQ1toQ8[3] THEN
+        "RobotHolding".Struct.CmdQ1toQ8Mask := "RobotHolding".Struct.CmdQ1toQ8Mask OR UINT#4;
+    END_IF;
+    IF #CmdQ1toQ8[4] THEN
+        "RobotHolding".Struct.CmdQ1toQ8Mask := "RobotHolding".Struct.CmdQ1toQ8Mask OR UINT#8;
+    END_IF;
+    IF #CmdQ1toQ8[5] THEN
+        "RobotHolding".Struct.CmdQ1toQ8Mask := "RobotHolding".Struct.CmdQ1toQ8Mask OR UINT#16;
+    END_IF;
+    IF #CmdQ1toQ8[6] THEN
+        "RobotHolding".Struct.CmdQ1toQ8Mask := "RobotHolding".Struct.CmdQ1toQ8Mask OR UINT#32;
+    END_IF;
+    IF #CmdQ1toQ8[7] THEN
+        "RobotHolding".Struct.CmdQ1toQ8Mask := "RobotHolding".Struct.CmdQ1toQ8Mask OR UINT#64;
+    END_IF;
+    IF #CmdQ1toQ8[8] THEN
+        "RobotHolding".Struct.CmdQ1toQ8Mask := "RobotHolding".Struct.CmdQ1toQ8Mask OR UINT#128;
+    END_IF;
+    
+    "RobotHolding".Struct.Target1 := #Target[1];
+    "RobotHolding".Struct.Target2 := #Target[2];
+    "RobotHolding".Struct.Target3 := #Target[3];
+    "RobotHolding".Struct.Target4 := #Target[4];
+    "RobotHolding".Struct.AlarmCode := INT_TO_UINT(#Fault);
+    "RobotHolding".Struct.ActiveMode := INT_TO_UINT(#ModeState);
+    IF #ModeState = 4 THEN
+        "RobotHolding".Struct.ActiveStep := INT_TO_UINT(#ManualPhase);
+    ELSE
+        "RobotHolding".Struct.ActiveStep := INT_TO_UINT(#Step);
+    END_IF;
+    IF #Fault <> 0 THEN
+        "RobotHolding".Struct.Status := UINT#3;
+    ELSIF "RobotHolding".Struct.Done <> UINT#0 THEN
+        "RobotHolding".Struct.Status := UINT#2;
+    ELSIF (#ModeState <> 0) AND #AnyMoving AND #Permitted THEN
+        "RobotHolding".Struct.Status := UINT#1;
+    ELSE
+        "RobotHolding".Struct.Status := UINT#0;
+    END_IF;
+"RobotHolding".Struct.SimulationMode := UINT#1;
+"RobotHolding".Struct.PhysicalOutputEnable := UINT#0;
+// HR54 retains VIRTUAL decisions only. Actual FB output pins always FALSE.
+#CmdQ1toQ8[1] := FALSE;
+#CmdQ1toQ8[2] := FALSE;
+#CmdQ1toQ8[3] := FALSE;
+#CmdQ1toQ8[4] := FALSE;
+#CmdQ1toQ8[5] := FALSE;
+#CmdQ1toQ8[6] := FALSE;
+#CmdQ1toQ8[7] := FALSE;
+#CmdQ1toQ8[8] := FALSE;
+
+END_FUNCTION_BLOCK

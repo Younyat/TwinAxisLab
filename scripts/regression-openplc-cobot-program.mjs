@@ -108,9 +108,6 @@ if (/\bPROGRAM\b|\bCONFIGURATION\b|\bFUNCTION\b/.test(iotProgram)) throw new Err
 if (iotProgram.includes('T#12s') || iotProgram.includes('TargetJ1 := -90.0')) throw new Error('IoT OpenPLC POU still contains the obsolete amplified trajectory');
 if (/J[234]Raw AT %QW10[123] : INT := (?!0;)/.test(iotProgram)) throw new Error('IoT OpenPLC Home registers must be zero in KinematicGraph-relative coordinates');
 
-const physicalProgram = await readFile(new URL('../openplc/cobot-6dof-smart-demo/cobot_6dof_iot_condition_monitoring_s7_1200.scl', import.meta.url), 'utf8');
-for (const token of ['RobotHolding".Struct.ProgramSignature := 2101;', 'HR7..HR12', '#SegmentStartJ1 := #J1Deg;', '#ProgressDelta := #P - #PreviousP;', '#J1Deg := #J1Deg + ((#TargetJ1 - #SegmentStartJ1) * #ProgressDelta * #MotionScale);']) {
-  if (!physicalProgram.includes(token)) throw new Error(`S7-1200 physical program is missing ${token}`);
-}
+// Physical Siemens sources have their own test:s7:ft511938 validation.
 
 console.log('OpenPLC cobot programs regression passed: standard, amplified and IoT condition-monitoring profiles are valid.');

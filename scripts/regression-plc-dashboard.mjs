@@ -323,18 +323,27 @@ try {
     );
     const manualBefore = await canvasSample(page, twinCanvas);
     const controls = page.locator('.plc-register-control input');
-    await controls.nth(0).fill('2.65');
+    const physicalManualControls = controls.nth(0);
+    const twinManualControls = controls.nth(6);
+    if (!await twinManualControls.isEnabled()) throw new Error('Digital Twin mirror did not expose the manual write control.');
+    await twinManualControls.fill('2.65');
     await page.waitForTimeout(350);
-    await controls.nth(2).fill('-2.05');
+    await controls.nth(8).fill('-2.05');
     await page.waitForTimeout(350);
-    await controls.nth(3).fill('2.65');
+    await controls.nth(9).fill('2.65');
     await page.waitForTimeout(1800);
     const manualAfter = await canvasSample(page, twinCanvas);
     const manualChanged = sampleDiff(manualBefore, manualAfter);
-    const physicalJ1 = Number(await controls.nth(0).inputValue());
+    const physicalJ1 = Number(await physicalManualControls.inputValue());
     const twinJ1 = Number(await controls.nth(6).inputValue());
     if (Math.abs(physicalJ1 - 2.65) > 0.011 || Math.abs(twinJ1 - physicalJ1) > 0.011) {
       throw new Error(`Manual PLC register did not propagate exactly to the twin: physical=${physicalJ1}, twin=${twinJ1}, pixels=${manualChanged}.`);
+    }
+    await page.waitForTimeout(900);
+    const heldPhysicalJ1 = Number(await physicalManualControls.inputValue());
+    const heldTwinJ1 = Number(await controls.nth(6).inputValue());
+    if (Math.abs(heldPhysicalJ1 - physicalJ1) > 0.011 || Math.abs(heldTwinJ1 - twinJ1) > 0.011) {
+      throw new Error(`Manual pose was not held after release: physical=${heldPhysicalJ1}, twin=${heldTwinJ1}.`);
     }
 
     const text = await page.locator('.plc-dashboard').textContent();
